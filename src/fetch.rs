@@ -78,3 +78,36 @@ pub async fn fetch_all_feed_zips(client: &Client) -> Result<BTreeMap<String, Vec
 pub async fn fetch_all_archive_feed_zips(client: &Client) -> Result<BTreeMap<String, Vec<String>>> {
     fetch_zips_for_urls(client, DEFAULT_ARCHIVE_FEED_URLS).await
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use anyhow::Result;
+
+    #[tokio::test]
+    async fn test_fetch_all_feed_zips_returns_urls() -> Result<()> {
+        // Build a real HTTP client
+        let client = Client::builder()
+            .cookie_store(true)
+            .build()
+            .context("building HTTP client for tests")?;
+
+        // Call the function under test
+        let result = fetch_all_feed_zips(&client).await?;
+
+        // We should get a map containing each feed URL
+        assert_eq!(result.len(), DEFAULT_FEED_URLS.len());
+
+        // And each entry should have at least zero or more URL strings
+        for (feed, urls) in result {
+            // Ensure the key matches our feed
+            assert!(DEFAULT_FEED_URLS.contains(&feed.as_str()));
+            // Ensure each URL starts with the feed URL
+            for url in urls {
+                assert!(url.starts_with(&feed));
+            }
+        }
+
+        Ok(())
+    }
+}
