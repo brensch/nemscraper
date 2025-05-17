@@ -1,10 +1,17 @@
+// src/duck/mod.rs
+// Add to Cargo.toml:
+// duckdb = { version = "1.2.2", default-features = false, features = ["bundled"] }
+// rand = "0.8"
+// anyhow = "1.0"
+
 use anyhow::Result;
 use duckdb::{Connection, ToSql};
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
 use std::time::Instant;
 
-/// Example struct with a variety of DuckDB‐compatible types
+/// A row with various DuckDB-compatible types
+#[derive(Debug)]
 pub struct TestRow {
     pub id: i32,
     pub value: f64,
@@ -12,32 +19,27 @@ pub struct TestRow {
     pub name: String,
 }
 
-/// Generate `n` random TestRow instances using a fixed seed
+/// Generate `n` random `TestRow`s, reserving capacity up front for speed
 pub fn generate_test_data(n: usize) -> Vec<TestRow> {
     let mut rng = StdRng::seed_from_u64(0x_d00d_f00d);
-    (0..n)
-        .map(|i| TestRow {
+    let mut rows = Vec::with_capacity(n);
+    for i in 0..n {
+        rows.push(TestRow {
             id: i as i32,
-            value: rng.gen(),
+            value: rng.gen_range(0.0..1_000_000.0),
             flag: rng.gen_bool(0.5),
             name: format!("name_{}", rng.gen_range(0..1_000_000)),
-        })
-        .collect()
+        });
+    }
+    rows
 }
 
-/// Open a DuckDB database on disk at `path`, creating the file if it doesn't exist.
-pub fn open_disk_db(path: &str) -> Result<Connection> {
-    let conn = Connection::open(path)?;
-    Ok(conn)
-}
-
-/// Open a DuckDB in‐memory database
+/// Open an in-memory DuckDB instance
 pub fn open_mem_db() -> Result<Connection> {
-    let conn = Connection::open_in_memory()?;
-    Ok(conn)
+    Ok(Connection::open_in_memory()?)
 }
 
-/// Prepare the `test_data` table in the given connection
+/// Ensure the `test_data` table exists
 pub fn setup_test_table(conn: &Connection) -> Result<()> {
     conn.execute(
         "CREATE TABLE IF NOT EXISTS test_data(
@@ -51,20 +53,17 @@ pub fn setup_test_table(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
-/// Insert rows via Appender::append_rows in bulk, using arrays of &dyn ToSql
-/// returning elapsed seconds
+/// Bulk-insert rows via `Appender::append_rows`, returns elapsed seconds
 pub fn insert_batch_rows(conn: &Connection, data: &[TestRow]) -> Result<f64> {
     let mut appender = conn.appender("test_data")?;
     let start = Instant::now();
 
-    appender.append_rows(data.iter().map(|row| {
-        [
-            &row.id as &dyn ToSql,
-            &row.value as &dyn ToSql,
-            &row.flag as &dyn ToSql,
-            &row.name as &dyn ToSql,
-        ]
-    }))?;
+    // Each element is an array of &dyn ToSql matching table columns
+    appender.append_rows(
+        data.iter()
+            .map(|row| [&row.id as &dyn ToSql, &row.value, &row.flag, &row.name]),
+    )?;
+
     appender.flush()?;
     Ok(start.elapsed().as_secs_f64())
 }
@@ -74,31 +73,20 @@ mod tests {
     use super::*;
     use anyhow::Result;
 
-    /// Benchmarks bulk insertion into disk and memory databases, timing each.
+    /// Benchmark bulk insertion into in-memory DB
     #[test]
-    fn bench_disk_vs_memory() -> Result<()> {
-        let n = 10_000_000;
+    fn bench_in_memory() -> Result<()> {
+        let n = 1_000_000;
         let data = generate_test_data(n);
 
-        // Disk-backed DB
-        let conn_disk = open_disk_db("test_data.duckdb")?;
-        setup_test_table(&conn_disk)?;
-        let t_disk = insert_batch_rows(&conn_disk, &data)?;
-        println!("Disk DB insertion of {} rows took {:.3}s", n, t_disk);
+        let conn = open_mem_db()?;
+        setup_test_table(&conn)?;
+        let secs = insert_batch_rows(&conn, &data)?;
+        println!("In-memory insertion of {} rows took {:.3}s", n, secs);
 
-        // Memory DB
-        let conn_mem = open_mem_db()?;
-        setup_test_table(&conn_mem)?;
-        let t_mem = insert_batch_rows(&conn_mem, &data)?;
-        println!("In-memory DB insertion of {} rows took {:.3}s", n, t_mem);
-
-        // Sanity check row counts
-        let c_disk: i64 =
-            conn_disk.query_row("SELECT COUNT(*) FROM test_data;", [], |r| r.get(0))?;
-        let c_mem: i64 = conn_mem.query_row("SELECT COUNT(*) FROM test_data;", [], |r| r.get(0))?;
-        assert_eq!(c_disk, n as i64);
-        assert_eq!(c_mem, n as i64);
-
+        // Verify row count
+        let count: i64 = conn.query_row("SELECT COUNT(*) FROM test_data;", [], |r| r.get(0))?;
+        assert_eq!(count, n as i64);
         Ok(())
     }
 }

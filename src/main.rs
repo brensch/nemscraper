@@ -1,34 +1,15 @@
-// src/main.rs
-
+mod duck;
 mod fetch;
 
-use anyhow::{Context, Result}; // <— need Context here
-use fetch::{fetch_all_archive_feed_zips, fetch_all_feed_zips};
-mod duck; // loads src/duck/mod.rs
-          // use duck::{create_and_populate_db, read_all_numbers};
+use fetch::urls;
+use fetch::zips;
 use reqwest::Client;
 
 #[tokio::main]
-async fn main() -> Result<()> {
-    let client = Client::builder()
-        .cookie_store(true)
-        .build()
-        .context("building HTTP client")?;
-
-    let current = fetch_all_feed_zips(&client).await?;
-    let archive = fetch_all_archive_feed_zips(&client).await?;
-
-    println!("number of feeds: {}", current.len());
-    println!(
-        "number of zips: {}",
-        current.values().map(|v| v.len()).sum::<usize>()
-    );
-
-    println!("number of archives: {}", archive.len());
-    println!(
-        "number of archive zips: {}",
-        archive.values().map(|v| v.len()).sum::<usize>()
-    );
-
+async fn main() -> anyhow::Result<()> {
+    let client = Client::new();
+    let feeds = urls::fetch_current_zip_urls(&client).await?;
+    let some_zip = &feeds["https://nemweb.com.au/Reports/Current/FPP/"][0];
+    zips::download_zip(&client, some_zip, "latest_fpp.zip").await?;
     Ok(())
 }
