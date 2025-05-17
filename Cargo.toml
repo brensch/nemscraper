@@ -9,3 +9,6 @@ reqwest = { version = "0.11", features = ["rustls-tls", "cookies"] }
 scraper = "0.14"
 url = "2.2"
 anyhow = "1.0"
+rand = "0.8"
+duckdb = { version = "1.2.2", default-features = false, features = ["bundled"] }
+arrow = "55.1.0"

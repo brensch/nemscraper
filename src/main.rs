@@ -4,6 +4,8 @@ mod fetch;
 
 use anyhow::{Context, Result}; // <— need Context here
 use fetch::{fetch_all_archive_feed_zips, fetch_all_feed_zips};
+mod duck; // loads src/duck/mod.rs
+          // use duck::{create_and_populate_db, read_all_numbers};
 use reqwest::Client;
 
 #[tokio::main]

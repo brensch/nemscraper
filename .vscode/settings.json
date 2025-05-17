@@ -1,0 +1,8 @@
+{
+  // limit Cargo’s own parallelism
+  "rust-analyzer.server.extraEnv": {
+    "CARGO_BUILD_JOBS": "8",
+    // also throttle any make‐based build scripts
+    "MAKEFLAGS": "-j8"
+  }
+}
