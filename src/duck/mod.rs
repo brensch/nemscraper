@@ -1,9 +1,3 @@
-// src/duck/mod.rs
-// Add to Cargo.toml:
-// duckdb = { version = "1.2.2", default-features = false, features = ["bundled"] }
-// rand = "0.8"
-// anyhow = "1.0"
-
 use anyhow::Result;
 use duckdb::{Connection, ToSql};
 use rand::rngs::StdRng;
@@ -83,7 +77,7 @@ mod tests {
     /// Benchmarks bulk insertion into disk and memory databases, timing each.
     #[test]
     fn bench_disk_vs_memory() -> Result<()> {
-        let n = 1_000_000;
+        let n = 10_000_000;
         let data = generate_test_data(n);
 
         // Disk-backed DB
