@@ -48,15 +48,18 @@ pub mod urls {
         client: &Client,
         feeds: &[&str],
     ) -> Result<BTreeMap<String, Vec<String>>> {
-        // Parse a CSS selector for links ending with ".zip"
-        let selector = Selector::parse(r#"a[href$=".zip"]"#)
-            .expect("CSS selector for ZIP links should be valid");
-        let mut handles = Vec::with_capacity(feeds.len());
+        // CSS selector to match <a href="... .zip"> links
+        let selector = {
+            let sel_str = r#"a[href$=".zip"]"#;
+            Selector::parse(sel_str)
+                .unwrap_or_else(|e| panic!("Invalid CSS selector '{}': {}", sel_str, e))
+        };
 
+        let mut handles = Vec::with_capacity(feeds.len());
         for &feed in feeds {
             let client = client.clone();
             let feed_url = feed.to_string();
-            let selector = selector.clone();
+            let sel = selector.clone();
             handles.push(task::spawn(async move {
                 let base = Url::parse(&feed_url)?;
                 let html = client
@@ -68,7 +71,7 @@ pub mod urls {
                     .await?;
                 let doc = Html::parse_document(&html);
                 let links = doc
-                    .select(&selector)
+                    .select(&sel)
                     .filter_map(|e| e.value().attr("href"))
                     .filter_map(|href| base.join(href).ok())
                     .map(|u| u.to_string())
@@ -82,21 +85,39 @@ pub mod urls {
             let (feed, links) = handle.await??;
             map.insert(feed, links);
         }
-
         Ok(map)
     }
 }
 
-/// Module for downloading a single ZIP to disk
+/// Module for downloading ZIP files to disk
 pub mod zips {
     use super::*;
-    use std::path::Path;
+    use std::path::{Path, PathBuf};
 
-    /// Download the given ZIP URL and save it to the specified file path.
-    pub async fn download_zip(client: &Client, url: &str, dest: impl AsRef<Path>) -> Result<()> {
-        let resp = client.get(url).send().await?.error_for_status()?;
+    /// Download the given ZIP URL and save it under `dest_dir` using the original filename.
+    /// Returns the full path of the saved file.
+    pub async fn download_zip(
+        client: &Client,
+        url_str: &str,
+        dest_dir: impl AsRef<Path>,
+    ) -> Result<PathBuf> {
+        let dest_dir = dest_dir.as_ref();
+        let url = Url::parse(url_str)?;
+        let filename = url
+            .path_segments()
+            .and_then(|segments| segments.last())
+            .filter(|name| !name.is_empty())
+            .unwrap_or("download.zip");
+        let dest_path = dest_dir.join(filename);
+
+        if let Some(parent) = dest_path.parent() {
+            fs::create_dir_all(parent).await?;
+        }
+
+        let resp = client.get(url.as_str()).send().await?.error_for_status()?;
         let bytes = resp.bytes().await?;
-        fs::write(dest, &bytes).await?;
-        Ok(())
+        fs::write(&dest_path, &bytes).await?;
+
+        Ok(dest_path)
     }
 }

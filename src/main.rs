@@ -1,5 +1,6 @@
 mod duck;
 mod fetch;
+mod process;
 
 use fetch::urls;
 use fetch::zips;
@@ -10,6 +11,6 @@ async fn main() -> anyhow::Result<()> {
     let client = Client::new();
     let feeds = urls::fetch_current_zip_urls(&client).await?;
     let some_zip = &feeds["https://nemweb.com.au/Reports/Current/FPP/"][0];
-    zips::download_zip(&client, some_zip, "latest_fpp.zip").await?;
+    zips::download_zip(&client, some_zip, "zips").await?;
     Ok(())
 }

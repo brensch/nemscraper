@@ -72,8 +72,10 @@ pub fn insert_batch_rows(conn: &Connection, data: &[TestRow]) -> Result<f64> {
 mod tests {
     use super::*;
     use anyhow::Result;
+    use duckdb::ToSql;
+    use std::time::Instant;
 
-    /// Benchmark bulk insertion into in-memory DB
+    /// Benchmark bulk insertion into in-memory DB using our helper
     #[test]
     fn bench_in_memory() -> Result<()> {
         let n = 1_000_000;
@@ -83,6 +85,34 @@ mod tests {
         setup_test_table(&conn)?;
         let secs = insert_batch_rows(&conn, &data)?;
         println!("In-memory insertion of {} rows took {:.3}s", n, secs);
+
+        // Verify row count
+        let count: i64 = conn.query_row("SELECT COUNT(*) FROM test_data;", [], |r| r.get(0))?;
+        assert_eq!(count, n as i64);
+        Ok(())
+    }
+
+    /// Same benchmark, but inlines the &dyn ToSql dispatch
+    #[test]
+    fn bench_in_memory_dyn() -> Result<()> {
+        let n = 1_000_000;
+        let data = generate_test_data(n);
+
+        let conn = open_mem_db()?;
+        setup_test_table(&conn)?;
+
+        let mut appender = conn.appender("test_data")?;
+        let start = Instant::now();
+
+        // Inline dynamic dispatch of each row
+        appender.append_rows(
+            data.iter()
+                .map(|row| [&row.id as &dyn ToSql, &row.value, &row.flag, &row.name]),
+        )?;
+        appender.flush()?;
+
+        let secs = start.elapsed().as_secs_f64();
+        println!("Inline dynamic insertion of {} rows took {:.3}s", n, secs);
 
         // Verify row count
         let count: i64 = conn.query_row("SELECT COUNT(*) FROM test_data;", [], |r| r.get(0))?;
