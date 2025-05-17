@@ -81,7 +81,7 @@ pub struct Column {
     pub format: Option<String>,
 }
 
-/// The extracted schema for one CTL file
+/// The extracted schema for one CTL file.
 #[derive(Debug, PartialEq, Serialize)]
 pub struct CtlSchema {
     pub table: String,
@@ -91,8 +91,9 @@ pub struct CtlSchema {
 
 /// Parses a CTL file’s contents into a `CtlSchema`.
 pub fn parse_ctl(contents: &str) -> Result<CtlSchema> {
-    // 1) Capture YYYYMM by finding any 12-digit timestamp before .csv/.CSV
-    let month_re = Regex::new(r"(?mi)^INFILE\s+\S*?(\d{6})\d{6}\.(?:csv)$")?;
+    // 1) Capture YYYYMM by finding any 12-digit timestamp in the INFILE line.
+    //    Allows leading whitespace, any variation of .csv/.CSV, and extra chars.
+    let month_re = Regex::new(r"(?mi)^\s*INFILE\s+.*?(\d{6})\d{6}\.[cC][sS][vV]")?;
     let month = month_re
         .captures(contents)
         .and_then(|cap| cap.get(1).map(|m| m.as_str().to_string()))
@@ -143,12 +144,51 @@ pub fn parse_ctl(contents: &str) -> Result<CtlSchema> {
     })
 }
 
+fn main() -> Result<()> {
+    // 1) Prepare HTTP client
+    let client = Client::builder()
+        .timeout(std::time::Duration::from_secs(60))
+        .build()?;
+
+    // 2) Gather all CTL URLs
+    let ctl_urls = get_all_ctl_urls(&client)?;
+    if ctl_urls.is_empty() {
+        println!("No CTL files found.");
+        return Ok(());
+    }
+
+    // 3) Download, parse, and bucket by month
+    use std::collections::HashMap;
+    let mut by_month: HashMap<String, Vec<CtlSchema>> = HashMap::new();
+
+    for url in ctl_urls {
+        let text = client.get(url.clone()).send()?.text()?;
+        let schema = parse_ctl(&text).unwrap_or_else(|e| panic!("Failed to parse {}: {}", url, e));
+        by_month
+            .entry(schema.month.clone())
+            .or_default()
+            .push(schema);
+    }
+
+    // 4) Ensure output directory exists
+    std::fs::create_dir_all("schemas")?;
+
+    // 5) Write one JSON file per month
+    for (month, schemas) in by_month {
+        let path = format!("schemas/{}.json", month);
+        let file = std::fs::File::create(&path)?;
+        serde_json::to_writer_pretty(file, &schemas)?;
+        println!("Wrote {} schemas to {}", schemas.len(), path);
+    }
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::time::Duration;
 
-    /// ensure our existing URL code still compiles & runs
     fn test_client() -> Client {
         Client::builder()
             .user_agent("test-client")
@@ -205,6 +245,30 @@ TRAILING NULLCOLS
 )
 "#;
 
+    const EX3: &str = r#"-- ************************************************************ 
+-- Title:	PUBLIC_DVD_ANCILLARY_RECOVERY_SPLIT_200907.ctl 
+-- ************************************************************  
+...
+INFILE PUBLIC_DVD_ANCILLARY_RECOVERY_SPLIT_200907010000.csv  
+APPEND INTO TABLE ANCILLARY_RECOVERY_SPLIT  
+WHEN (1:1) = 'D'  
+FIELDS TERMINATED BY ','  
+OPTIONALLY ENCLOSED BY '"'  
+TRAILING NULLCOLS	
+(
+  row_type FILLER, 
+  report_type FILLER, 
+  report_subtype FILLER, 
+  report_version FILLER, 
+  EFFECTIVEDATE DATE "yyyy/mm/dd hh24:mi:ss", 
+  VERSIONNO FLOAT EXTERNAL, 
+  SERVICE CHAR(10), 
+  PAYMENTTYPE CHAR(20), 
+  CUSTOMER_PORTION FLOAT EXTERNAL, 
+  LASTCHANGED DATE "yyyy/mm/dd hh24:mi:ss"
+)
+"#;
+
     #[test]
     fn test_parse_example1() {
         let schema = parse_ctl(EX1).unwrap();
@@ -250,44 +314,12 @@ TRAILING NULLCOLS
             .unwrap()
             .contains("YYYY/MM/DD HH24:MI:SS"));
     }
-}
 
-fn main() -> Result<()> {
-    // 1) Prepare HTTP client
-    let client = Client::builder()
-        .timeout(std::time::Duration::from_secs(60))
-        .build()?;
-
-    // 2) Gather all CTL URLs
-    let ctl_urls = get_all_ctl_urls(&client)?;
-    if ctl_urls.is_empty() {
-        println!("No CTL files found.");
-        return Ok(());
+    #[test]
+    fn test_parse_example3() {
+        let schema = parse_ctl(EX3).expect("parse_ctl failed on EX3");
+        assert_eq!(schema.month, "200907");
+        assert_eq!(schema.table, "ANCILLARY_RECOVERY_SPLIT");
+        assert!(schema.columns.iter().any(|c| c.name == "EFFECTIVEDATE"));
     }
-
-    // 3) For each URL: download, parse, and bucket by month
-    use std::collections::HashMap;
-    let mut by_month: HashMap<String, Vec<CtlSchema>> = HashMap::new();
-
-    for url in ctl_urls {
-        let text = client.get(url.clone()).send()?.text()?;
-        let schema = parse_ctl(&text).unwrap_or_else(|e| panic!("Failed to parse {}: {}", url, e));
-        by_month
-            .entry(schema.month.clone())
-            .or_default()
-            .push(schema);
-    }
-
-    // 4) Ensure output directory exists
-    std::fs::create_dir_all("schemas")?;
-
-    // 5) Write one JSON file per month
-    for (month, schemas) in by_month {
-        let path = format!("schemas/{}.json", month);
-        let file = std::fs::File::create(&path)?;
-        serde_json::to_writer_pretty(file, &schemas)?;
-        println!("Wrote {} schemas to {}", schemas.len(), path);
-    }
-
-    Ok(())
 }
