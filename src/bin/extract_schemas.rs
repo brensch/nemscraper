@@ -1,79 +1,26 @@
-use anyhow::{bail, Result};
+//! extract_schemas.rs
+//!
+//! Downloads and parses NEM `.ctl` control-files month-by-month,
+//! writing `schemas/YYYYMM.json` as soon as each month is finished.
+//!
+//! ── How it works ──
+//!  • At start-up we list any `schemas/*.json` that already exist and
+//!    skip those months entirely.
+//!  • We walk years → months → ctl-files **sequentially** (no huge
+//!    in-memory list).
+//!  • As soon as all `.ctl`s for one month are parsed we write one
+//!    pretty-printed JSON file to disk and proceed to the next month.
+
+use anyhow::{bail, Context, Result};
 use regex::Regex;
 use reqwest::blocking::Client;
 use scraper::{Html, Selector};
 use serde::Serialize;
+use std::{collections::HashSet, fs, path::Path};
 use url::Url;
 
-/// Fetches and parses all sub-directory URLs from a directory listing.
-fn list_dirs(client: &Client, dir_url: &Url) -> Result<Vec<Url>> {
-    let body = client.get(dir_url.clone()).send()?.text()?;
-    let doc = Html::parse_document(&body);
-    let sel = Selector::parse("a[href]").unwrap();
+/* ────────────────────────── structures ───────────────────────── */
 
-    let mut urls = Vec::new();
-    for elem in doc.select(&sel) {
-        let href = match elem.value().attr("href") {
-            Some(h) => h,
-            None => continue,
-        };
-        let text = elem.text().collect::<String>();
-
-        if href.ends_with('/') && !text.contains("Parent Directory") {
-            let full_url = dir_url.join(href)?;
-            urls.push(full_url);
-        }
-    }
-    Ok(urls)
-}
-
-/// Lists all `.ctl` URLs in a given directory.
-fn list_ctl_urls(client: &Client, month_url: &Url) -> Result<Vec<Url>> {
-    let body = client.get(month_url.clone()).send()?.text()?;
-    let doc = Html::parse_document(&body);
-    let sel = Selector::parse("a[href]").unwrap();
-    let ctl_regex = Regex::new(r"(?i)\.ctl$").unwrap();
-
-    let mut urls = Vec::new();
-    for element in doc.select(&sel) {
-        if let Some(href) = element.value().attr("href") {
-            if ctl_regex.is_match(href) {
-                let full = month_url.join(href)?;
-                urls.push(full);
-            }
-        }
-    }
-    Ok(urls)
-}
-
-/// For each month directory, descend into `CTL/` and collect all `.ctl` URLs.
-pub fn get_all_ctl_urls(client: &Client) -> Result<Vec<Url>> {
-    let base = Url::parse("https://nemweb.com.au/Data_Archive/Wholesale_Electricity/MMSDM/")?;
-
-    let years = list_dirs(client, &base)?;
-    if years.is_empty() {
-        bail!("No monthly directories found under {}", base);
-    }
-
-    let months = years
-        .iter()
-        .filter_map(|year_url| list_dirs(client, year_url).ok())
-        .flatten();
-
-    let ctl_urls = months
-        .filter_map(|month_url| {
-            let ctl_dir = month_url
-                .join("MMSDM_Historical_Data_SQLLoader/CTL/")
-                .ok()?;
-            list_ctl_urls(client, &ctl_dir).ok()
-        })
-        .flatten()
-        .collect();
-
-    Ok(ctl_urls)
-}
-
-/// Represents a single column from the CTL file.
 #[derive(Debug, PartialEq, Serialize)]
 pub struct Column {
     pub name: String,
@@ -81,7 +28,6 @@ pub struct Column {
     pub format: Option<String>,
 }
 
-/// The extracted schema for one CTL file.
 #[derive(Debug, PartialEq, Serialize)]
 pub struct CtlSchema {
     pub table: String,
@@ -89,51 +35,55 @@ pub struct CtlSchema {
     pub columns: Vec<Column>, // in definition order
 }
 
-/// Parses a CTL file’s contents into a `CtlSchema`.
+/* ─────────────────────────── parsing ─────────────────────────── */
+
+/// Parse a CTL file’s contents into a `CtlSchema`.
 pub fn parse_ctl(contents: &str) -> Result<CtlSchema> {
-    // 1) Capture YYYYMM by finding any 12-digit timestamp in the INFILE line.
-    //    Allows leading whitespace, any variation of .csv/.CSV, and extra chars.
-    let month_re = Regex::new(r"(?mi)^\s*INFILE\s+.*?(\d{6})\d{6}\.[cC][sS][vV]")?;
+    // Month: tolerate weird delimiters, ignore case on .csv
+    let month_re = Regex::new(r"(?mi)INFILE[^\n]*?(\d{6})\D*\d{6}[^\n]*\.[cC][sS][vV]")?;
     let month = month_re
         .captures(contents)
-        .and_then(|cap| cap.get(1).map(|m| m.as_str().to_string()))
+        .and_then(|c| c.get(1).map(|m| m.as_str().to_owned()))
         .ok_or_else(|| anyhow::anyhow!("Failed to find month in INFILE"))?;
 
-    // 2) Table name after APPEND INTO TABLE
     let table_re = Regex::new(r"(?mi)^APPEND INTO TABLE\s+(\w+)")?;
     let table = table_re
         .captures(contents)
-        .and_then(|cap| cap.get(1).map(|m| m.as_str().to_string()))
+        .and_then(|c| c.get(1).map(|m| m.as_str().to_owned()))
         .ok_or_else(|| anyhow::anyhow!("Failed to find table name"))?;
 
-    // 3) Grab the block inside TRAILING NULLCOLS(...)
     let cols_re = Regex::new(r"(?s)TRAILING NULLCOLS\s*\(\s*(.*?)\s*\)\s*(?:--|$)")?;
     let cols_block = cols_re
         .captures(contents)
-        .and_then(|cap| cap.get(1).map(|m| m.as_str()))
+        .and_then(|c| c.get(1).map(|m| m.as_str()))
         .ok_or_else(|| anyhow::anyhow!("Failed to find column list"))?;
 
-    // 4) Split on commas, skip FILLER, record name/type/[format]
     let mut columns = Vec::new();
     for raw in cols_block.split(',') {
         let s = raw.trim();
         if s.is_empty() {
             continue;
         }
-        let parts: Vec<&str> = s.split_whitespace().collect();
-        if parts.len() < 2 {
-            bail!("Unexpected column definition: {}", s);
-        }
-        let name = parts[0].to_string();
-        let ty = parts[1].to_string();
+        let mut parts = s.split_whitespace();
+        let name = parts
+            .next()
+            .ok_or_else(|| anyhow::anyhow!("Bad column: {s}"))?
+            .to_owned();
+        let ty = parts
+            .next()
+            .ok_or_else(|| anyhow::anyhow!("Bad column: {s}"))?
+            .to_owned();
         if ty.eq_ignore_ascii_case("FILLER") {
             continue;
         }
-        let format = if parts.len() > 2 {
-            Some(parts[2..].join(" "))
-        } else {
-            None
-        };
+        let format = parts.next().map(|rest| {
+            let mut s = rest.to_owned();
+            for p in parts {
+                s.push(' ');
+                s.push_str(p);
+            }
+            s
+        });
         columns.push(Column { name, ty, format });
     }
 
@@ -144,50 +94,160 @@ pub fn parse_ctl(contents: &str) -> Result<CtlSchema> {
     })
 }
 
+/* ─────────────────────── directory helpers ───────────────────── */
+
+fn list_dirs(client: &Client, dir: &Url) -> Result<Vec<Url>> {
+    let body = client.get(dir.clone()).send()?.text()?;
+    let doc = Html::parse_document(&body);
+    let sel = Selector::parse("a[href]").unwrap();
+    Ok(doc
+        .select(&sel)
+        .filter_map(|e| {
+            let href = e.value().attr("href")?;
+            if !href.ends_with('/') {
+                return None;
+            }
+            let txt = e.text().collect::<String>();
+            if txt.contains("Parent Directory") {
+                return None;
+            }
+            dir.join(href).ok()
+        })
+        .collect())
+}
+
+fn list_ctl_urls(client: &Client, ctl_dir: &Url) -> Result<Vec<Url>> {
+    let body = client.get(ctl_dir.clone()).send()?.text()?;
+    let doc = Html::parse_document(&body);
+    let sel = Selector::parse("a[href]").unwrap();
+    let re = Regex::new(r"(?i)\.ctl$").unwrap();
+    Ok(doc
+        .select(&sel)
+        .filter_map(|e| {
+            let h = e.value().attr("href")?;
+            if re.is_match(h) {
+                ctl_dir.join(h).ok()
+            } else {
+                None
+            }
+        })
+        .collect())
+}
+
+/// Extract `YYYYMM` from a month directory URL such as
+/// `.../MMSDM_2009_07/`.
+fn month_code_from_month_url(u: &Url) -> Option<String> {
+    let re = Regex::new(r"MMSDM_(\d{4})_(\d{2})/?$").ok()?;
+    let caps = re.captures(u.path())?;
+    Some(format!("{}{}", &caps[1], &caps[2]))
+}
+
+/* ──────────────────────────── main ──────────────────────────── */
+
 fn main() -> Result<()> {
-    // 1) Prepare HTTP client
+    let output_dir = Path::new("schemas");
+    fs::create_dir_all(output_dir)?;
+
+    // 0) Record which months we already have
+    let mut done: HashSet<String> = fs::read_dir(output_dir)?
+        .filter_map(|e| e.ok())
+        .filter_map(|e| e.file_name().into_string().ok())
+        .filter_map(|name| {
+            if name.ends_with(".json") && name.len() == 11 {
+                Some(name[..6].to_owned()) // strip ".json"
+            } else {
+                None
+            }
+        })
+        .collect();
+
     let client = Client::builder()
         .timeout(std::time::Duration::from_secs(60))
         .build()?;
 
-    // 2) Gather all CTL URLs
-    let ctl_urls = get_all_ctl_urls(&client)?;
-    if ctl_urls.is_empty() {
-        println!("No CTL files found.");
-        return Ok(());
-    }
+    let base = Url::parse("https://nemweb.com.au/Data_Archive/Wholesale_Electricity/MMSDM/")?;
+    let years = list_dirs(&client, &base).context("listing years")?;
 
-    // 3) Download, parse, and bucket by month
-    use std::collections::HashMap;
-    let mut by_month: HashMap<String, Vec<CtlSchema>> = HashMap::new();
+    for year in years {
+        let months = list_dirs(&client, &year).with_context(|| format!("months in {year}"))?;
 
-    for url in ctl_urls {
-        let text = client.get(url.clone()).send()?.text()?;
-        let schema = parse_ctl(&text).unwrap_or_else(|e| panic!("Failed to parse {}: {}", url, e));
-        by_month
-            .entry(schema.month.clone())
-            .or_default()
-            .push(schema);
-    }
+        for month_url in months {
+            let code = match month_code_from_month_url(&month_url) {
+                Some(c) => c,
+                None => continue,
+            };
 
-    // 4) Ensure output directory exists
-    std::fs::create_dir_all("schemas")?;
+            if done.contains(&code) {
+                println!("Skipping {code} (already done)");
+                continue;
+            }
 
-    // 5) Write one JSON file per month
-    for (month, schemas) in by_month {
-        let path = format!("schemas/{}.json", month);
-        let file = std::fs::File::create(&path)?;
-        serde_json::to_writer_pretty(file, &schemas)?;
-        println!("Wrote {} schemas to {}", schemas.len(), path);
+            let ctl_dir = match month_url.join("MMSDM_Historical_Data_SQLLoader/CTL/") {
+                Ok(u) => u,
+                Err(e) => {
+                    eprintln!("Bad ctl dir for {month_url}: {e}");
+                    continue;
+                }
+            };
+
+            println!("Processing month {code} …");
+            let ctl_urls = match list_ctl_urls(&client, &ctl_dir) {
+                Ok(v) if !v.is_empty() => v,
+                Ok(_) => {
+                    eprintln!("No CTLs in {ctl_dir}");
+                    continue;
+                }
+                Err(e) => {
+                    eprintln!("Failed listing CTLs for {ctl_dir}: {e}");
+                    continue;
+                }
+            };
+
+            let mut schemas = Vec::new();
+            for url in ctl_urls {
+                match client.get(url.clone()).send().and_then(|r| r.text()) {
+                    Ok(text) => match parse_ctl(&text) {
+                        Ok(s) => schemas.push(s),
+                        Err(e) => eprintln!("Parse error {url}: {e}"),
+                    },
+                    Err(e) => eprintln!("Download error {url}: {e}"),
+                }
+            }
+
+            if schemas.is_empty() {
+                eprintln!("No valid schemas for {code}");
+                continue;
+            }
+
+            // write immediately
+            let file_path = output_dir.join(format!("{code}.json"));
+            let file = fs::File::create(&file_path)?;
+            serde_json::to_writer_pretty(file, &schemas)?;
+            println!(
+                "  → wrote {} schemas to {}",
+                schemas.len(),
+                file_path.display()
+            );
+
+            done.insert(code); // mark as done for rest of run
+        }
     }
 
     Ok(())
 }
 
+/* ───────────────────────────── tests ───────────────────────────── */
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::time::Duration;
+
+    #[test]
+    fn test_month_code_extraction() {
+        let u = Url::parse("https://example.com/2009/MMSDM_2009_07/").unwrap();
+        assert_eq!(month_code_from_month_url(&u), Some("200907".into()));
+    }
 
     fn test_client() -> Client {
         Client::builder()
