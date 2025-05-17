@@ -1,255 +1,293 @@
 use anyhow::{bail, Result};
-use chrono::{DateTime, FixedOffset};
 use regex::Regex;
 use reqwest::blocking::Client;
 use scraper::{Html, Selector};
 use serde::Serialize;
-use std::{
-    collections::BTreeMap,
-    io::{Cursor, Read},
-};
 use url::Url;
-use zip::ZipArchive;
 
-#[derive(Debug, Serialize, Clone, PartialEq)]
-struct FieldDef {
-    name: String,
-    data_type: String,
-    is_nullable: bool,
-    is_primary: bool,
-}
-
-#[derive(Debug, Serialize, Clone, PartialEq)]
-struct TableSchema {
-    table: String,
-    fields: Vec<FieldDef>,
-}
-
-struct Release {
-    name: String,
-    url: Url,
-    published: DateTime<FixedOffset>,
-}
-
-struct Version {
-    name: String,
-    url: Url,
-}
-
-/// List `<a>` links from a directory index
-fn list_links(client: &Client, dir: &Url) -> Result<Vec<(String, Url)>> {
-    let body = client.get(dir.clone()).send()?.text()?;
+/// Fetches and parses all sub-directory URLs from a directory listing.
+fn list_dirs(client: &Client, dir_url: &Url) -> Result<Vec<Url>> {
+    let body = client.get(dir_url.clone()).send()?.text()?;
     let doc = Html::parse_document(&body);
-    let sel = Selector::parse("a").unwrap();
-    let mut out = Vec::new();
-    for a in doc.select(&sel) {
-        if let Some(href) = a.value().attr("href") {
-            let text = a.text().collect::<String>().trim().to_string();
-            if let Ok(abs) = dir.join(href) {
-                out.push((text, abs));
+    let sel = Selector::parse("a[href]").unwrap();
+
+    let mut urls = Vec::new();
+    for elem in doc.select(&sel) {
+        let href = match elem.value().attr("href") {
+            Some(h) => h,
+            None => continue,
+        };
+        let text = elem.text().collect::<String>();
+
+        if href.ends_with('/') && !text.contains("Parent Directory") {
+            let full_url = dir_url.join(href)?;
+            urls.push(full_url);
+        }
+    }
+    Ok(urls)
+}
+
+/// Lists all `.ctl` URLs in a given directory.
+fn list_ctl_urls(client: &Client, month_url: &Url) -> Result<Vec<Url>> {
+    let body = client.get(month_url.clone()).send()?.text()?;
+    let doc = Html::parse_document(&body);
+    let sel = Selector::parse("a[href]").unwrap();
+    let ctl_regex = Regex::new(r"(?i)\.ctl$").unwrap();
+
+    let mut urls = Vec::new();
+    for element in doc.select(&sel) {
+        if let Some(href) = element.value().attr("href") {
+            if ctl_regex.is_match(href) {
+                let full = month_url.join(href)?;
+                urls.push(full);
             }
         }
     }
-    Ok(out)
+    Ok(urls)
 }
 
-/// Discover MMSDM releases by year directories
-fn get_releases(client: &Client) -> Result<Vec<Release>> {
+/// For each month directory, descend into `CTL/` and collect all `.ctl` URLs.
+pub fn get_all_ctl_urls(client: &Client) -> Result<Vec<Url>> {
     let base = Url::parse("https://nemweb.com.au/Data_Archive/Wholesale_Electricity/MMSDM/")?;
-    let mut rels = Vec::new();
-    // First fetch year directories (e.g., "2025/")
-    let years = list_links(client, &base)?
-        .into_iter()
-        .filter(|(text, url)| {
-            url.as_str().ends_with('/') && text.chars().all(|c| c.is_ascii_digit())
+
+    let years = list_dirs(client, &base)?;
+    if years.is_empty() {
+        bail!("No monthly directories found under {}", base);
+    }
+
+    let months = years
+        .iter()
+        .filter_map(|year_url| list_dirs(client, year_url).ok())
+        .flatten();
+
+    let ctl_urls = months
+        .filter_map(|month_url| {
+            let ctl_dir = month_url
+                .join("MMSDM_Historical_Data_SQLLoader/CTL/")
+                .ok()?;
+            list_ctl_urls(client, &ctl_dir).ok()
         })
-        .collect::<Vec<_>>();
+        .flatten()
+        .collect();
 
-    // Within each year, find subdirectories named "MMSDM_<year>_XX/"
-    for (year, year_url) in years {
-        for (text, url) in list_links(client, &year_url)? {
-            if text.starts_with(&format!("MMSDM_{}", year)) && url.as_str().ends_with('/') {
-                let head = client.head(url.clone()).send()?;
-                let lm = head
-                    .headers()
-                    .get("last-modified")
-                    .and_then(|v| v.to_str().ok())
-                    .unwrap_or("");
-                let published = DateTime::parse_from_rfc2822(lm)?;
-                rels.push(Release {
-                    name: text,
-                    url,
-                    published,
-                });
-            }
-        }
-    }
-    rels.sort_by_key(|r| r.published);
-    Ok(rels)
+    Ok(ctl_urls)
 }
 
-/// Find version folders under a release
-fn get_versions(client: &Client, release: &Release) -> Result<Vec<Version>> {
-    let docs = release
-        .url
-        .join("MMSDM_Historical_Data_SQLLoader/DOCUMENTATION/MMS%20Data%20Model/")?;
-    let mut vers = Vec::new();
-    for (text, url) in list_links(client, &docs)? {
-        if text.starts_with('v') && url.as_str().ends_with('/') {
-            vers.push(Version { name: text, url });
-        }
-    }
-    Ok(vers)
+/// Represents a single column from the CTL file.
+#[derive(Debug, PartialEq, Serialize)]
+pub struct Column {
+    pub name: String,
+    pub ty: String,
+    pub format: Option<String>,
 }
 
-/// Identify the create ZIP within a version directory by inspecting links
-fn find_zip(client: &Client, version: &Version) -> Result<Url> {
-    for (_, url) in list_links(client, &version.url)? {
-        let path = url.path().to_lowercase();
-        if path.contains("mmsdm_create_") && path.ends_with(".zip") {
-            return Ok(url);
-        }
-    }
-    bail!("no create zip found in {}", version.url);
+/// The extracted schema for one CTL file
+#[derive(Debug, PartialEq, Serialize)]
+pub struct CtlSchema {
+    pub table: String,
+    pub month: String,        // e.g. "200907"
+    pub columns: Vec<Column>, // in definition order
 }
 
-/// Download ZIP, extract Postgres DDL, parse schemas
-fn download_and_parse_zip(client: &Client, zip_url: &Url) -> Result<Vec<TableSchema>> {
-    let resp = client.get(zip_url.clone()).send()?;
-    if !resp.status().is_success() {
-        bail!("{} -> HTTP {}", zip_url, resp.status());
-    }
-    let bytes = resp.bytes()?;
-    let mut zip = ZipArchive::new(Cursor::new(bytes))?;
+/// Parses a CTL file’s contents into a `CtlSchema`.
+pub fn parse_ctl(contents: &str) -> Result<CtlSchema> {
+    // 1) Capture YYYYMM by finding any 12-digit timestamp before .csv/.CSV
+    let month_re = Regex::new(r"(?mi)^INFILE\s+\S*?(\d{6})\d{6}\.(?:csv)$")?;
+    let month = month_re
+        .captures(contents)
+        .and_then(|cap| cap.get(1).map(|m| m.as_str().to_string()))
+        .ok_or_else(|| anyhow::anyhow!("Failed to find month in INFILE"))?;
 
-    let names: Vec<String> = zip.file_names().map(|s| s.to_string()).collect();
-    let target = names
-        .into_iter()
-        .find(|n| {
-            n.to_lowercase().contains("postgresql") && n.ends_with("create_mms_data_model.sql")
-        })
-        .ok_or_else(|| anyhow::anyhow!("no Postgres DDL in {}", zip_url))?;
+    // 2) Table name after APPEND INTO TABLE
+    let table_re = Regex::new(r"(?mi)^APPEND INTO TABLE\s+(\w+)")?;
+    let table = table_re
+        .captures(contents)
+        .and_then(|cap| cap.get(1).map(|m| m.as_str().to_string()))
+        .ok_or_else(|| anyhow::anyhow!("Failed to find table name"))?;
 
-    let mut f = zip.by_name(&target)?;
-    let mut sql = String::new();
-    f.read_to_string(&mut sql)?;
-    Ok(parse_sql(&sql))
-}
+    // 3) Grab the block inside TRAILING NULLCOLS(...)
+    let cols_re = Regex::new(r"(?s)TRAILING NULLCOLS\s*\(\s*(.*?)\s*\)\s*(?:--|$)")?;
+    let cols_block = cols_re
+        .captures(contents)
+        .and_then(|cap| cap.get(1).map(|m| m.as_str()))
+        .ok_or_else(|| anyhow::anyhow!("Failed to find column list"))?;
 
-/// Parse `CREATE TABLE` blocks to TableSchema
-fn parse_sql(sql: &str) -> Vec<TableSchema> {
-    let create_re = Regex::new(r"(?i)create\s+table\s+([A-Z0-9_]+)\s*\(").unwrap();
-    let col_re =
-        Regex::new(r"(?i)^\s*([A-Z0-9_]+)\s+([A-Z0-9\(\), ]+?)(?:\s+(NOT NULL|null))?[,)]")
-            .unwrap();
-    let pk_re = Regex::new(r"(?i)primary key\s*\(([^)]+)\)").unwrap();
-
-    let mut pks = BTreeMap::new();
-    for caps in pk_re.captures_iter(sql) {
-        let cols = caps[1]
-            .split(',')
-            .map(|s| s.trim().to_string())
-            .collect::<Vec<_>>();
-        pks.insert(String::new(), cols);
-    }
-
-    let mut tables = Vec::new();
-    for caps in create_re.captures_iter(sql) {
-        let tbl = caps[1].to_string();
-        if let Some(start) = caps.get(0).map(|m| m.start()) {
-            if let Some(end) = sql[start..].find(");") {
-                let block = &sql[start..start + end];
-                let mut fields = Vec::new();
-                for line in block.lines() {
-                    if let Some(c) = col_re.captures(line) {
-                        let name = c[1].to_string();
-                        let dtype = c[2].to_string();
-                        let nullable = c
-                            .get(3)
-                            .map_or(true, |m| m.as_str().eq_ignore_ascii_case("null"));
-                        let is_primary =
-                            pks.get(&String::new()).map_or(false, |v| v.contains(&name));
-                        fields.push(FieldDef {
-                            name,
-                            data_type: dtype,
-                            is_nullable: nullable,
-                            is_primary,
-                        });
-                    }
-                }
-                tables.push(TableSchema { table: tbl, fields });
-            }
+    // 4) Split on commas, skip FILLER, record name/type/[format]
+    let mut columns = Vec::new();
+    for raw in cols_block.split(',') {
+        let s = raw.trim();
+        if s.is_empty() {
+            continue;
         }
-    }
-    tables
-}
-
-fn main() -> Result<()> {
-    let client = Client::builder()
-        .user_agent("Mozilla/5.0 (compatible; mmsdm-debug)")
-        .build()?;
-
-    let releases = get_releases(&client)?;
-    println!(
-        "Releases: {:?}",
-        releases.iter().map(|r| &r.name).collect::<Vec<_>>()
-    );
-
-    if let Some(first) = releases.first() {
-        let versions = get_versions(&client, first)?;
-        println!(
-            "Versions in {}: {:?}",
-            first.name,
-            versions.iter().map(|v| &v.name).collect::<Vec<_>>()
-        );
-
-        if let Some(v0) = versions.first() {
-            let zip_url = find_zip(&client, v0)?;
-            println!("ZIP: {}", zip_url);
-            let schemas = download_and_parse_zip(&client, &zip_url)?;
-            println!("Parsed {} tables", schemas.len());
+        let parts: Vec<&str> = s.split_whitespace().collect();
+        if parts.len() < 2 {
+            bail!("Unexpected column definition: {}", s);
         }
+        let name = parts[0].to_string();
+        let ty = parts[1].to_string();
+        if ty.eq_ignore_ascii_case("FILLER") {
+            continue;
+        }
+        let format = if parts.len() > 2 {
+            Some(parts[2..].join(" "))
+        } else {
+            None
+        };
+        columns.push(Column { name, ty, format });
     }
-    Ok(())
+
+    Ok(CtlSchema {
+        table,
+        month,
+        columns,
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
 
-    fn real_client() -> Client {
+    /// ensure our existing URL code still compiles & runs
+    fn test_client() -> Client {
         Client::builder()
-            .user_agent("Mozilla/5.0 (compatible; mmsdm-test)")
+            .user_agent("test-client")
+            .timeout(Duration::from_secs(30))
             .build()
             .unwrap()
     }
 
     #[test]
-    fn test_get_releases() {
-        let client = real_client();
-        let rels = get_releases(&client).unwrap();
-        assert!(!rels.is_empty(), "Expected at least one release");
-        // ensure names look like MMSDM_<year>_
-        assert!(rels.iter().any(|r| r.name.starts_with("MMSDM_")));
+    fn test_list_hrefs_from_known_year() {
+        let client = test_client();
+        let year_url =
+            Url::parse("https://nemweb.com.au/Data_Archive/Wholesale_Electricity/MMSDM/2009/")
+                .unwrap();
+        let hrefs = list_dirs(&client, &year_url).unwrap();
+        assert!(!hrefs.is_empty());
     }
 
     #[test]
-    fn test_get_versions() {
-        let client = real_client();
-        let first = get_releases(&client).unwrap().into_iter().next().unwrap();
-        let vers = get_versions(&client, &first).unwrap();
-        assert!(!vers.is_empty(), "Expected at least one version");
-        assert!(vers[0].name.starts_with('v'));
+    fn test_list_ctl_urls_from_known_month() {
+        let client = test_client();
+        let month_url = Url::parse(
+            "https://nemweb.com.au/Data_Archive/Wholesale_Electricity/MMSDM/\
+             2009/MMSDM_2009_07/MMSDM_Historical_Data_SQLLoader/CTL/",
+        )
+        .unwrap();
+        let ctl_urls = list_ctl_urls(&client, &month_url).unwrap();
+        assert!(ctl_urls.iter().any(|u| u.as_str().ends_with(".ctl")));
+    }
+
+    const EX1: &str = r#"-- ... example 1 ...
+LOAD DATA
+INFILE PUBLIC_DVD_SETFCASREGIONRECOVERY_200907010000.csv
+APPEND INTO TABLE SETFCASREGIONRECOVERY
+TRAILING NULLCOLS
+(
+  row_type FILLER,
+  SETTLEMENTDATE DATE "yyyy/mm/dd hh24:mi:ss",
+  VERSIONNO FLOAT EXTERNAL,
+  BIDTYPE CHAR(10),
+  LASTCHANGED DATE "yyyy/mm/dd hh24:mi:ss"
+)
+"#;
+
+    const EX2: &str = r#"-- ... example 2 ...
+LOAD DATA
+INFILE PUBLIC_ARCHIVE#STPASA_CASESOLUTION#FILE01#202503010000.CSV
+APPEND INTO TABLE STPASA_CASESOLUTION
+TRAILING NULLCOLS
+(
+  row_type FILLER,
+  RUN_DATETIME DATE "YYYY/MM/DD HH24:MI:SS",
+  PASAVERSION CHAR(10)
+)
+"#;
+
+    #[test]
+    fn test_parse_example1() {
+        let schema = parse_ctl(EX1).unwrap();
+        assert_eq!(schema.month, "200907");
+        assert_eq!(schema.table, "SETFCASREGIONRECOVERY");
+        assert_eq!(
+            schema
+                .columns
+                .iter()
+                .map(|c| &c.name[..])
+                .collect::<Vec<_>>(),
+            &["SETTLEMENTDATE", "VERSIONNO", "BIDTYPE", "LASTCHANGED"]
+        );
+        assert_eq!(
+            schema
+                .columns
+                .iter()
+                .find(|c| c.name == "SETTLEMENTDATE")
+                .unwrap()
+                .format
+                .as_deref(),
+            Some("\"yyyy/mm/dd hh24:mi:ss\"")
+        );
     }
 
     #[test]
-    fn test_find_zip_and_download() {
-        let client = real_client();
-        let first = get_releases(&client).unwrap().into_iter().next().unwrap();
-        let vers = get_versions(&client, &first).unwrap();
-        let zip_url = find_zip(&client, &vers[0]).unwrap();
-        assert!(zip_url.as_str().to_lowercase().contains("create_"));
-        let schemas = download_and_parse_zip(&client, &zip_url).unwrap();
-        assert!(!schemas.is_empty(), "Expected to parse some tables");
+    fn test_parse_example2() {
+        let schema = parse_ctl(EX2).unwrap();
+        assert_eq!(schema.month, "202503");
+        assert_eq!(schema.table, "STPASA_CASESOLUTION");
+        assert!(schema
+            .columns
+            .iter()
+            .any(|c| c.name == "PASAVERSION" && c.ty == "CHAR(10)"));
+        let run_dt_fmt = &schema
+            .columns
+            .iter()
+            .find(|c| c.name == "RUN_DATETIME")
+            .unwrap()
+            .format;
+        assert!(run_dt_fmt
+            .as_ref()
+            .unwrap()
+            .contains("YYYY/MM/DD HH24:MI:SS"));
     }
+}
+
+fn main() -> Result<()> {
+    // 1) Prepare HTTP client
+    let client = Client::builder()
+        .timeout(std::time::Duration::from_secs(60))
+        .build()?;
+
+    // 2) Gather all CTL URLs
+    let ctl_urls = get_all_ctl_urls(&client)?;
+    if ctl_urls.is_empty() {
+        println!("No CTL files found.");
+        return Ok(());
+    }
+
+    // 3) For each URL: download, parse, and bucket by month
+    use std::collections::HashMap;
+    let mut by_month: HashMap<String, Vec<CtlSchema>> = HashMap::new();
+
+    for url in ctl_urls {
+        let text = client.get(url.clone()).send()?.text()?;
+        let schema = parse_ctl(&text).unwrap_or_else(|e| panic!("Failed to parse {}: {}", url, e));
+        by_month
+            .entry(schema.month.clone())
+            .or_default()
+            .push(schema);
+    }
+
+    // 4) Ensure output directory exists
+    std::fs::create_dir_all("schemas")?;
+
+    // 5) Write one JSON file per month
+    for (month, schemas) in by_month {
+        let path = format!("schemas/{}.json", month);
+        let file = std::fs::File::create(&path)?;
+        serde_json::to_writer_pretty(file, &schemas)?;
+        println!("Wrote {} schemas to {}", schemas.len(), path);
+    }
+
+    Ok(())
 }
