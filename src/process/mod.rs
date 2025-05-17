@@ -22,7 +22,7 @@ pub fn load_aemo_zip<P: AsRef<Path>>(zip_path: P) -> Result<BTreeMap<String, Raw
     let mut current: Option<String> = None;
 
     for i in 0..archive.len() {
-        let mut f = archive.by_index(i)?;
+        let f = archive.by_index(i)?;
         if f.is_file() && f.name().ends_with(".csv") {
             let mut rdr = ReaderBuilder::new()
                 .has_headers(false)

@@ -95,7 +95,7 @@ mod tests {
     /// Same benchmark, but inlines the &dyn ToSql dispatch
     #[test]
     fn bench_in_memory_dyn() -> Result<()> {
-        let n = 1_000_000;
+        let n = 10_000_000;
         let data = generate_test_data(n);
 
         let conn = open_mem_db()?;
