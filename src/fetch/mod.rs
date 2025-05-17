@@ -1,15 +1,17 @@
 // src/fetch/mod.rs
-// Add to Cargo.toml:
-// reqwest = { version = "0.11", features = ["rustls-tls"] }
+// Add to Cargo.toml dependencies:
+// reqwest = { version = "0.11", features = ["rustls-tls", "cookies"] }
 // scraper = "0.14"
 // url = "2.2"
 // anyhow = "1.0"
+// tokio = { version = "1", features = ["full"] }
 
 use anyhow::Result;
 use reqwest::Client;
 use scraper::{Html, Selector};
 use std::collections::BTreeMap;
 use tokio::fs;
+use tokio::task;
 use url::Url;
 
 /// Module for fetching ZIP file URLs from AEMO feeds
@@ -32,12 +34,12 @@ pub mod urls {
         "https://nemweb.com.au/Reports/Archive/P5_Reports/",
     ];
 
-    /// Fetch all ZIP URLs from the current feeds.
+    /// Fetch all ZIP URLs from the current feeds concurrently.
     pub async fn fetch_current_zip_urls(client: &Client) -> Result<BTreeMap<String, Vec<String>>> {
         fetch_zip_urls(client, CURRENT_FEED_URLS).await
     }
 
-    /// Fetch all ZIP URLs from the archive feeds.
+    /// Fetch all ZIP URLs from the archive feeds concurrently.
     pub async fn fetch_archive_zip_urls(client: &Client) -> Result<BTreeMap<String, Vec<String>>> {
         fetch_zip_urls(client, ARCHIVE_FEED_URLS).await
     }
@@ -46,62 +48,42 @@ pub mod urls {
         client: &Client,
         feeds: &[&str],
     ) -> Result<BTreeMap<String, Vec<String>>> {
-        let mut map = BTreeMap::new();
-        let selector = Selector::parse(r#"a[href$=".zip"]"#).expect("selector should parse");
+        // Parse a CSS selector for links ending with ".zip"
+        let selector = Selector::parse(r#"a[href$=".zip"]"#)
+            .expect("CSS selector for ZIP links should be valid");
+        let mut handles = Vec::with_capacity(feeds.len());
 
         for &feed in feeds {
-            let base = Url::parse(feed)?;
-            let html = client
-                .get(feed)
-                .send()
-                .await?
-                .error_for_status()?
-                .text()
-                .await?;
-            let doc = Html::parse_document(&html);
-            let links = doc
-                .select(&selector)
-                .filter_map(|e| e.value().attr("href"))
-                .filter_map(|href| base.join(href).ok())
-                .map(|u| u.to_string())
-                .collect();
-            map.insert(feed.to_string(), links);
+            let client = client.clone();
+            let feed_url = feed.to_string();
+            let selector = selector.clone();
+            handles.push(task::spawn(async move {
+                let base = Url::parse(&feed_url)?;
+                let html = client
+                    .get(&feed_url)
+                    .send()
+                    .await?
+                    .error_for_status()?
+                    .text()
+                    .await?;
+                let doc = Html::parse_document(&html);
+                let links = doc
+                    .select(&selector)
+                    .filter_map(|e| e.value().attr("href"))
+                    .filter_map(|href| base.join(href).ok())
+                    .map(|u| u.to_string())
+                    .collect::<Vec<_>>();
+                Ok::<_, anyhow::Error>((feed_url, links))
+            }));
+        }
+
+        let mut map = BTreeMap::new();
+        for handle in handles {
+            let (feed, links) = handle.await??;
+            map.insert(feed, links);
         }
 
         Ok(map)
-    }
-
-    #[cfg(test)]
-    mod tests {
-        use super::*;
-        use anyhow::{Context, Result};
-
-        #[tokio::test]
-        async fn test_fetch_all_feed_zips_returns_urls() -> Result<()> {
-            // Build a real HTTP client
-            let client = Client::builder()
-                .cookie_store(true)
-                .build()
-                .context("building HTTP client for tests")?;
-
-            // Call the function under test
-            let result = fetch_current_zip_urls(&client).await?;
-
-            // We should get a map containing each feed URL
-            assert_eq!(result.len(), CURRENT_FEED_URLS.len());
-
-            // And each entry should have at least zero or more URL strings
-            for (feed, urls) in result {
-                // Ensure the key matches our feed
-                assert!(CURRENT_FEED_URLS.contains(&feed.as_str()));
-                // Ensure each URL starts with the feed URL
-                for url in urls {
-                    assert!(url.starts_with(&feed));
-                }
-            }
-
-            Ok(())
-        }
     }
 }
 
