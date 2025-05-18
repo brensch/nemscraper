@@ -103,8 +103,6 @@ pub fn load_aemo_zip<P: AsRef<Path>>(zip_path: P) -> Result<BTreeMap<String, Raw
                                     "Could not parse effective month from 'C' row date field."
                                 );
                             }
-                        } else {
-                            warn!("'C' row found but date field (index 6) is missing.");
                         }
                     }
                     Some("I") => {

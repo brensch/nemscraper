@@ -16,6 +16,15 @@ pub fn map_schema_type_to_duckdb_type(
 ) -> String {
     let u_type = schema_col_type.to_uppercase();
     match u_type.as_str() {
+        // ADDED: Handle schema types starting with "TIMESTAMP"
+        s if s.starts_with("TIMESTAMP") => {
+            // DuckDB's "TIMESTAMP" type is suitable for general timestamp inputs,
+            // including those with precision like "TIMESTAMP(3)" (milliseconds).
+            // If more specific DuckDB types like TIMESTAMPTZ, TIMESTAMP_NS, TIMESTAMP_US, TIMESTAMP_S
+            // are needed based on variations of the input schema_col_type (e.g. "TIMESTAMP WITH TIME ZONE"),
+            // further conditions could be added here.
+            "TIMESTAMP".to_string()
+        }
         s if s.starts_with("DATE") => {
             if let Some(fmt) = schema_col_format {
                 if fmt.contains("hh24:mi:ss")
@@ -34,7 +43,7 @@ pub fn map_schema_type_to_duckdb_type(
         s if s.starts_with("FLOAT") || s.starts_with("NUMBER") || s.starts_with("DECIMAL") => {
             "DOUBLE".to_string()
         }
-        s if s.starts_with("INT") => "INTEGER".to_string(),
+        s if s.starts_with("INT") => "INTEGER".to_string(), // Covers "INT" and "INTEGER"
         s if s.starts_with("BIGINT") => "BIGINT".to_string(),
         s if s.starts_with("SMALLINT") => "SMALLINT".to_string(),
         s if s.starts_with("TINYINT") => "TINYINT".to_string(),
@@ -45,11 +54,11 @@ pub fn map_schema_type_to_duckdb_type(
         {
             "VARCHAR".to_string()
         }
-        s if s.starts_with("BOOL") => "BOOLEAN".to_string(),
+        s if s.starts_with("BOOL") => "BOOLEAN".to_string(), // Covers "BOOL" and "BOOLEAN"
         s if s.starts_with("BLOB") || s.starts_with("BYTEA") => "BLOB".to_string(),
         _ => {
             tracing::warn!(
-                unknown_type = schema_col_type,
+                unknown_type = schema_col_type, // Log original case of unknown type
                 "Unknown schema type. Defaulting to VARCHAR."
             );
             "VARCHAR".to_string()

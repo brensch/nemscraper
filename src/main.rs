@@ -191,31 +191,42 @@ async fn main() -> anyhow::Result<()> {
         let semaphore_clone = Arc::clone(&download_semaphore);
 
         let handle = tokio::spawn(async move {
+            let zip_filename_from_url = Path::new(&zip_url)
+                .file_name()
+                .map(|s| s.to_string_lossy().into_owned())
+                .unwrap_or_else(|| zip_url.clone());
+
             let permit = match semaphore_clone.acquire().await {
                 Ok(p) => p,
                 Err(e) => {
                     let err_msg = format!("Semaphore acquisition failed: {}", e);
-                    tracing::error!(url = %zip_url, error = %err_msg);
+                    tracing::error!(url = %zip_url, zip_filename = %zip_filename_from_url, error = %err_msg, "Semaphore acquisition failed for download task.");
                     let _ = tx_clone.send(Err((zip_url, err_msg))).await; // Report error
                     return;
                 }
             };
-            tracing::debug!(url = %zip_url, "Acquired permit, starting download...");
+            tracing::debug!(url = %zip_url, zip_filename = %zip_filename_from_url, "Acquired permit, starting download...");
             // CORRECTED LINE: Dereference Arc to get &PathBuf for AsRef<Path>
             match fetch::zips::download_zip(&client_clone, &zip_url, &*zips_output_dir_clone).await
             {
                 Ok(path) => {
-                    tracing::info!(url = %zip_url, file_path = %path.display(), "Download successful.");
+                    let downloaded_zip_filename = path
+                        .file_name()
+                        .map(|s| s.to_string_lossy().into_owned())
+                        .unwrap_or_else(|| path.to_string_lossy().into_owned());
+                    tracing::info!(url = %zip_url, zip_filename = %downloaded_zip_filename, file_path = %path.display(), "Download successful.");
+
                     if tx_clone.send(Ok(path)).await.is_err() {
                         // zip_url is still valid here as it wasn't consumed by Ok(path)
-                        tracing::error!(url = %zip_url, "Failed to send downloaded path to channel (receiver dropped).");
+                        // 'path' is moved, use 'downloaded_zip_filename' which was captured before move.
+                        tracing::error!(url = %zip_url, original_zip_filename = %zip_filename_from_url, attempted_file_sent = %downloaded_zip_filename, "Failed to send downloaded path to channel (receiver dropped).");
                     }
                 }
                 Err(e) => {
                     // Error during fetch::zips::download_zip
                     let download_failure_message = e.to_string();
                     // Log the primary download failure. zip_url is borrowed here and is still valid.
-                    tracing::error!(url = %zip_url, error = %download_failure_message, "Failed to download ZIP.");
+                    tracing::error!(url = %zip_url, zip_filename = %zip_filename_from_url, error = %download_failure_message, "Failed to download ZIP.");
 
                     // Clone zip_url for the tuple that will be sent through the channel.
                     // The original zip_url (in this task's scope) remains valid for logging the send failure.
@@ -227,7 +238,7 @@ async fn main() -> anyhow::Result<()> {
                         .is_err()
                     {
                         // If sending the error fails, log this failure using the original zip_url.
-                        tracing::error!(url = %zip_url, "Failed to send details of download error to channel (receiver likely dropped).");
+                        tracing::error!(url = %zip_url, zip_filename = %zip_filename_from_url, "Failed to send details of download error to channel (receiver likely dropped).");
                     }
                 }
             }
@@ -256,12 +267,16 @@ async fn main() -> anyhow::Result<()> {
         let processor_task_handle = tokio::spawn(async move {
             match received_item_result {
                 Ok(zip_path) => {
-                    // Successfully downloaded ZIP
-                    tracing::info!(file = %zip_path.display(), "Processor picked up downloaded file.");
+                    let current_zip_filename = zip_path
+                        .file_name()
+                        .map(|s| s.to_string_lossy().into_owned())
+                        .unwrap_or_else(|| zip_path.to_string_lossy().into_owned());
+
+                    tracing::info!(zip_filename = %current_zip_filename, file_path = %zip_path.display(), "Processor picked up downloaded file.");
                     let conn = match duck::open_file_db(duckdb_file_path_clone.as_str()) {
                         Ok(c) => c,
                         Err(e) => {
-                            tracing::error!(file = %zip_path.display(), error = %e, "Processor: Failed to open DuckDB connection. Skipping file.");
+                            tracing::error!(zip_filename = %current_zip_filename, file_path = %zip_path.display(), error = %e, "Processor: Failed to open DuckDB connection. Skipping file.");
                             drop(permit); // Release permit early
                             return;
                         }
@@ -280,58 +295,62 @@ async fn main() -> anyhow::Result<()> {
                                         "{}_{}",
                                         evolution.table_name, evolution.fields_hash
                                     );
-                                    tracing::debug!(source_csv = %aemo_table_name, target_duckdb = %duckdb_target_table_name, rows = raw_table_data.rows.len(), "Inserting data.");
+                                    tracing::debug!(zip_filename = %current_zip_filename, source_csv = %aemo_table_name, target_duckdb = %duckdb_target_table_name, rows = raw_table_data.rows.len(), "Inserting data.");
                                     if let Err(e) = duck::insert_raw_table_data(
                                         &conn,
                                         &duckdb_target_table_name,
                                         raw_table_data,
                                         &evolution,
                                     ) {
-                                        tracing::error!(error = %e, duckdb_table = %duckdb_target_table_name, source_zip = %zip_path.display(), "Failed to insert data.");
+                                        tracing::error!(zip_filename = %current_zip_filename, error = %e, duckdb_table = %duckdb_target_table_name, source_zip_path = %zip_path.display(), "Failed to insert data.");
                                         all_tables_in_zip_processed_successfully = false;
                                     }
                                 } else {
-                                    tracing::warn!(aemo_table = %aemo_table_name, month = %raw_table_data.effective_month, source_zip = %zip_path.display(), "No matching schema evolution found. Skipping table insertion.");
+                                    tracing::warn!(zip_filename = %current_zip_filename, aemo_table = %aemo_table_name, month = %raw_table_data.effective_month, source_zip_path = %zip_path.display(), "No matching schema evolution found. Skipping table insertion.");
                                     all_tables_in_zip_processed_successfully = false;
                                 }
                             }
 
                             if all_tables_in_zip_processed_successfully {
-                                tracing::info!(file = %zip_path.display(), "All tables from ZIP processed, recording history.");
+                                tracing::info!(zip_filename = %current_zip_filename, file_path = %zip_path.display(), "All tables from ZIP processed, recording history.");
                                 if let Err(e) = history::record_processed_csv_data(
                                     &conn,
                                     &zip_path,
                                     &loaded_data_map,
                                 ) {
-                                    tracing::error!(error = %e, zip_file = %zip_path.display(), "Failed to record processed CSV data. File will not be deleted.");
+                                    tracing::error!(zip_filename = %current_zip_filename, error = %e, zip_file_path = %zip_path.display(), "Failed to record processed CSV data. File will not be deleted.");
                                 } else {
-                                    tracing::info!(file = %zip_path.display(), "History recorded. Attempting to delete ZIP file.");
+                                    tracing::info!(zip_filename = %current_zip_filename, file_path = %zip_path.display(), "History recorded. Attempting to delete ZIP file.");
                                     if let Err(e) = fs::remove_file(&zip_path) {
-                                        tracing::error!(error = %e, file = %zip_path.display(), "Failed to delete processed ZIP file.");
+                                        tracing::error!(zip_filename = %current_zip_filename, error = %e, file_path = %zip_path.display(), "Failed to delete processed ZIP file.");
                                     } else {
-                                        tracing::info!(file = %zip_path.display(), "Successfully deleted processed ZIP file.");
+                                        tracing::info!(zip_filename = %current_zip_filename, file_path = %zip_path.display(), "Successfully deleted processed ZIP file.");
                                     }
                                 }
                             } else {
-                                tracing::warn!(file = %zip_path.display(), "Skipping history record and deletion for ZIP due to internal processing errors or missing schemas.");
+                                tracing::warn!(zip_filename = %current_zip_filename, file_path = %zip_path.display(), "Skipping history record and deletion for ZIP due to internal processing errors or missing schemas.");
                             }
                         }
                         Ok(_) => {
                             // loaded_data_map is empty
-                            tracing::info!(file = %zip_path.display(), "ZIP contained no data tables to process. Deleting file.");
+                            tracing::info!(zip_filename = %current_zip_filename, file_path = %zip_path.display(), "ZIP contained no data tables to process. Deleting file.");
                             if let Err(e) = fs::remove_file(&zip_path) {
-                                tracing::error!(error = %e, file = %zip_path.display(), "Failed to delete empty ZIP file.");
+                                tracing::error!(zip_filename = %current_zip_filename, error = %e, file_path = %zip_path.display(), "Failed to delete empty ZIP file.");
                             }
                         }
                         Err(e) => {
                             // Error from process::load_aemo_zip
-                            tracing::error!(error = %e, file = %zip_path.display(), "Failed to load/process AEMO ZIP. File may remain.");
+                            tracing::error!(zip_filename = %current_zip_filename, error = %e, file_path = %zip_path.display(), "Failed to load/process AEMO ZIP. File may remain.");
                         }
                     }
                 }
                 Err((url, download_err_msg)) => {
+                    let failed_zip_filename_from_url = Path::new(&url)
+                        .file_name()
+                        .map(|s| s.to_string_lossy().into_owned())
+                        .unwrap_or_else(|| url.clone());
                     // Error during download stage
-                    tracing::error!(url = %url, error = %download_err_msg, "Download for this URL failed. It will not be processed.");
+                    tracing::error!(zip_filename = %failed_zip_filename_from_url, url = %url, error = %download_err_msg, "Download for this URL failed. It will not be processed.");
                 }
             }
             drop(permit); // Release processing permit
@@ -347,7 +366,7 @@ async fn main() -> anyhow::Result<()> {
     for handle in download_handles {
         // These tasks finish once they've sent to the channel
         if let Err(e) = handle.await {
-            tracing::error!("A download task panicked: {:?}", e);
+            tracing::error!("A download task panicked: {:?}", e); // Note: zip_filename not easily available here without more context on panic.
         }
     }
     tracing::info!("All download tasks have completed their dispatches.");
