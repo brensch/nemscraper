@@ -11,7 +11,9 @@ use regex::Regex;
 use reqwest::Client;
 use scraper::{Html, Selector};
 use serde::{Deserialize, Serialize}; // Added Deserialize
-use sha2::{Digest, Sha256}; // For hashing
+use sha2::{Digest, Sha256};
+use std::sync::Arc;
+// For hashing
 use std::time::{Duration, Instant};
 use std::{
     collections::{HashMap, HashSet}, // Added BTreeMap and HashMap
@@ -763,6 +765,37 @@ pub fn extract_schema_evolutions<P: AsRef<Path>>(input_dir: P) -> Result<Vec<Sch
         "Schema evolution extraction completed."
     );
     Ok(evolutions)
+}
+
+// Helper function to find the correct schema evolution for a given table and month
+pub fn find_schema_evolution(
+    schema_lookup: &HashMap<String, Vec<Arc<SchemaEvolution>>>,
+    table_name: &str, // Base AEMO table name, e.g., "DISPATCHPRICE"
+    effective_month: &str,
+) -> Option<Arc<SchemaEvolution>> {
+    if let Some(evolutions_for_table) = schema_lookup.get(table_name) {
+        for evo in evolutions_for_table {
+            // Ensure the month falls within the schema's valid range
+            // CORRECTED LINE: Compare &str with &str using .as_str()
+            if effective_month >= evo.start_month.as_str()
+                && effective_month <= evo.end_month.as_str()
+            {
+                return Some(evo.clone());
+            }
+        }
+        tracing::warn!(
+            table_name,
+            effective_month,
+            available_evolutions = ?evolutions_for_table.iter().map(|e| format!("{}-{}", e.start_month, e.end_month)).collect::<Vec<_>>(),
+            "No schema evolution found for the given month."
+        );
+    } else {
+        tracing::warn!(
+            table_name,
+            "No schema evolutions found for this table name in the lookup map."
+        );
+    }
+    None
 }
 
 /* ───────────────────────────── tests ───────────────────────────── */
