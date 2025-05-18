@@ -1,30 +1,28 @@
 // These are your existing module declarations
-mod duck;
-mod fetch;
-mod process;
-mod schema; // This is the module we've been working on
+// Ensure src/lib.rs exists and declares these modules publicly:
+// pub mod duck;
+// pub mod fetch;
+// pub mod process;
+// pub mod schema;
 
-use fetch::urls;
-use fetch::zips;
-use reqwest::Client;
-use std::fs; // For creating the output directory for schema evolutions if needed
-use std::path::Path; // For path manipulation
-
-// Add necessary imports for tracing and tracing-subscriber
-// This `fmt` here refers to `tracing_subscriber::fmt`
+use nemscraper::{duck, fetch, schema};
+use reqwest::Client; // Use crate name to access library modules
+                     // HashSet is no longer needed here as each evolution gets its own table
+use std::fs;
+use std::path::Path;
 use tracing_subscriber::{fmt, EnvFilter};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     // Initialize the tracing subscriber
-    let env_filter = EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| EnvFilter::new("info,schema=debug,main=info")); // Added main=info
+    let env_filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| {
+        EnvFilter::new("info,nemscraper::schema=debug,nemscraper::duck=debug,main=info")
+    }); // Adjusted log levels
 
-    // This line requires the "fmt" feature of tracing-subscriber
     fmt::Subscriber::builder()
-        .with_env_filter(env_filter) // Requires "env-filter" feature
-        .with_span_events(fmt::format::FmtSpan::CLOSE) // Optional: Uncomment to log span open/close times more verbosely
-        .init(); // Initialize the global logger
+        .with_env_filter(env_filter)
+        .with_span_events(fmt::format::FmtSpan::CLOSE)
+        .init();
 
     tracing::info!("Application starting up. Logger initialized.");
 
@@ -32,6 +30,7 @@ async fn main() -> anyhow::Result<()> {
     let schemas_output_dir = Path::new("schemas");
     let schema_evolutions_output_file = Path::new("schema_evolutions.json");
     let zips_output_dir = Path::new("zips");
+    let duckdb_file_path = "nem_data.duckdb";
 
     // Ensure output directories exist
     fs::create_dir_all(schemas_output_dir)?;
@@ -47,12 +46,12 @@ async fn main() -> anyhow::Result<()> {
         }
         Err(e) => {
             tracing::error!(error = %e, "Schema fetch process failed.");
-            // Depending on requirements, you might want to exit here or attempt to continue
-            // For now, we'll let it proceed to schema evolution if fetch_all failed partially or if old files exist
         }
     }
 
     tracing::info!(input_dir = %schemas_output_dir.display(), "Starting schema evolution extraction...");
+    let mut processed_evolutions: Vec<schema::SchemaEvolution> = Vec::new(); // Store evolutions for DuckDB step
+
     match schema::extract_schema_evolutions(schemas_output_dir) {
         Ok(evolutions) => {
             tracing::info!(
@@ -60,7 +59,8 @@ async fn main() -> anyhow::Result<()> {
                 output_file = %schema_evolutions_output_file.display(),
                 "Schema evolution extraction completed successfully."
             );
-            // Optionally, save the evolutions to a file
+            processed_evolutions = evolutions.clone(); // Clone for later use
+
             match serde_json::to_string_pretty(&evolutions) {
                 Ok(json_data) => {
                     if let Err(e) = fs::write(schema_evolutions_output_file, json_data) {
@@ -73,33 +73,77 @@ async fn main() -> anyhow::Result<()> {
                     tracing::warn!(error = %e, "Failed to serialize schema evolutions to JSON.");
                 }
             }
-            // For verbose logging, you could log the evolutions themselves:
-            // for (i, evolution) in evolutions.iter().take(5).enumerate() { // Log first 5 as an example
-            //     tracing::debug!(index = i, evolution = ?evolution, "Schema Evolution Detail");
-            // }
         }
         Err(e) => {
-            tracing::error!(error = %e, "Schema evolution extraction failed.");
+            tracing::error!(error = %e, "Schema evolution extraction failed. Skipping DuckDB table creation.");
         }
     }
 
+    // --- Create DuckDB tables for each distinct schema version ---
+    if !processed_evolutions.is_empty() {
+        tracing::info!(duckdb_file = %duckdb_file_path, "Attempting to create tables in DuckDB for each schema version.");
+        match duck::open_file_db(duckdb_file_path) {
+            Ok(conn) => {
+                let mut tables_created_count = 0;
+                let mut tables_failed_count = 0;
+
+                // Each evolution represents a distinct schema version for a table over a period.
+                // We will create a unique DuckDB table for each evolution.
+                for evolution in &processed_evolutions {
+                    // Construct a unique table name for this specific schema version.
+                    // Using a simple concatenation. Ensure this naming convention is valid for DuckDB.
+                    // Hashes can be long; consider a prefix or a shorter unique ID if necessary,
+                    // but for now, hash ensures uniqueness.
+                    // DuckDB table names are case-insensitive by default unless quoted.
+                    // Let's keep it simple and rely on the schema module to quote if needed,
+                    // or ensure names are valid. The create_table_from_schema function already quotes.
+                    let duckdb_table_name =
+                        format!("{}_{}", evolution.table_name, evolution.fields_hash);
+
+                    tracing::debug!(duckdb_table = %duckdb_table_name, original_table = %evolution.table_name, hash = %evolution.fields_hash, "Defining schema version table in DuckDB.");
+
+                    match duck::create_table_from_schema(
+                        &conn,
+                        &duckdb_table_name, // Use the version-specific name
+                        &evolution.columns,
+                    ) {
+                        Ok(_) => {
+                            tables_created_count += 1;
+                            // Table for this specific schema version created (or already existed)
+                        }
+                        Err(e) => {
+                            tables_failed_count += 1;
+                            tracing::error!(duckdb_table = %duckdb_table_name, error = %e, "Failed to create schema version table in DuckDB.");
+                        }
+                    }
+                }
+                tracing::info!(
+                    created_count = tables_created_count,
+                    failed_count = tables_failed_count,
+                    total_evolutions_processed = processed_evolutions.len(),
+                    "DuckDB schema version table creation process finished."
+                );
+            }
+            Err(e) => {
+                tracing::error!(error = %e, duckdb_file = %duckdb_file_path, "Failed to open DuckDB database. Skipping table creation.");
+            }
+        }
+    } else {
+        tracing::info!("No schema evolutions processed, skipping DuckDB table creation.");
+    }
+
+    // --- Existing ZIP fetching logic ---
     tracing::info!("Fetching current ZIP URLs...");
-    match urls::fetch_current_zip_urls(&client).await {
+    match fetch::urls::fetch_current_zip_urls(&client).await {
+        // Corrected path to urls module
         Ok(feeds) => {
             tracing::info!(feed_count = feeds.len(), "Current ZIP URLs fetched.");
-
             let fpp_key = "https://nemweb.com.au/Reports/Current/FPP/";
             if let Some(zip_files) = feeds.get(fpp_key) {
                 if let Some(some_zip_url) = zip_files.get(0) {
-                    // Assuming zip_files is Vec<Url> or Vec<String>
                     tracing::info!(zip_url = %some_zip_url, output_dir = %zips_output_dir.display(), "Downloading specific ZIP...");
-                    // Assuming zips::download_zip expects a Url or something convertible
-                    // If some_zip_url is already a reqwest::Url, great. If it's a string, parse it.
-                    // For simplicity, let's assume it can be passed directly or your `download_zip` handles it.
-                    // If `zips::download_zip` takes a &str for the URL:
-                    // let url_to_download = some_zip_url.as_str(); // If it's a String or Url
-                    // Or if it's a Url from your `Workspace_current_zip_urls`
-                    match zips::download_zip(&client, some_zip_url, zips_output_dir).await {
+                    match fetch::zips::download_zip(&client, some_zip_url, zips_output_dir).await {
+                        // Corrected path to zips module
                         Ok(_) => tracing::info!("Specific ZIP downloaded successfully."),
                         Err(e) => tracing::error!(error = %e, "Failed to download specific ZIP."),
                     }
