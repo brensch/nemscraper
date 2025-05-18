@@ -1,6 +1,7 @@
 // src/process/mod.rs
 use anyhow::{Context, Result};
 use csv::ReaderBuilder;
+
 use std::{collections::BTreeMap, fs::File, path::Path};
 use tracing::{debug, trace, warn}; // Added tracing
 use zip::ZipArchive;
@@ -40,7 +41,7 @@ fn parse_date_to_yyyymm(date_str: &str) -> Option<String> {
 /// - On “D” rows: pushes the data row into the current schema's table.
 ///
 /// Returns a BTreeMap mapping schema names (e.g., "FORECAST_DEFAULT_CF") to RawTable data.
-#[tracing::instrument(level = "debug", skip(zip_path), fields(path = %zip_path.as_ref().display()))]
+#[tracing::instrument(level = "info", skip(zip_path), fields(path = %zip_path.as_ref().display()))]
 pub fn load_aemo_zip<P: AsRef<Path>>(zip_path: P) -> Result<BTreeMap<String, RawTable>> {
     let path_display = zip_path.as_ref().display().to_string();
     debug!("Opening ZIP file");
@@ -239,7 +240,9 @@ fn clean_file_type(file_name: &str) -> String {
 mod tests {
     use super::*;
     use anyhow::Result;
+    use std::env;
     use std::io::{Cursor, Write};
+    use std::time::Instant;
     use tempfile::NamedTempFile;
     use tracing_subscriber::{EnvFilter, FmtSubscriber};
     use zip::write::FileOptions;
@@ -250,7 +253,7 @@ mod tests {
         let subscriber = FmtSubscriber::builder()
             .with_env_filter(
                 EnvFilter::try_from_default_env()
-                    .unwrap_or_else(|_| EnvFilter::new("info,nemscraper::process=trace")),
+                    .unwrap_or_else(|_| EnvFilter::new("info,nemscraper::process=debug")),
             )
             .with_test_writer() // Redirect logs to the test output
             .finish();
@@ -334,6 +337,31 @@ D,FPP,FORECAST_RESIDUAL_DCF,1,F_I+LREG_0210,"2024/12/22 00:05:00","2024/12/29 00
         );
         assert_eq!(residual_dcf.rows.len(), 2); // Updated count
 
+        Ok(())
+    }
+
+    /// Benchmark test: set ZIP_PATH to your real file and run with `-- --nocapture`
+    #[test]
+    fn bench_load_aemo_zip() -> Result<()> {
+        init_test_logging();
+
+        // ZIP_PATH should point to an actual AEMO ZIP on your filesystem:
+        let zip_path_str =
+            env::var("ZIP_PATH").expect("Please set ZIP_PATH env var to the path of your ZIP file");
+        let zip_path = std::path::Path::new(&zip_path_str);
+
+        println!("→ Loading ZIP: {}", zip_path.display());
+        let start = Instant::now();
+        let tables = load_aemo_zip(zip_path)
+            .with_context(|| format!("Failed to load ZIP at {}", zip_path.display()))?;
+        let elapsed = start.elapsed();
+
+        println!(
+            "✔ load_aemo_zip({}) extracted {} tables in {:?}",
+            zip_path.display(),
+            tables.len(),
+            elapsed
+        );
         Ok(())
     }
 }
