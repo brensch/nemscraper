@@ -68,7 +68,7 @@ pub fn load_aemo_zip<P: AsRef<Path>>(zip_path: P) -> Result<BTreeMap<String, Raw
                 .flexible(true) // Handles varying numbers of fields if any
                 .from_reader(file_in_zip); // file_in_zip is consumed here
 
-            let mut current_schema_name: Option<String> = None;
+            let mut current_schema_identifier: Option<String> = None;
             let mut file_effective_month: Option<String> = None;
 
             for (record_idx, result) in rdr.records().enumerate() {
@@ -107,7 +107,19 @@ pub fn load_aemo_zip<P: AsRef<Path>>(zip_path: P) -> Result<BTreeMap<String, Raw
                     }
                     Some("I") => {
                         // "I" row: Schema definition.
-                        // record[2] is schema name, record[4..] are column names.
+                        // record[1]_record[2] is the schema name, record[4..] are column names.
+
+                        // get the schema name by concatenating record[1] and record[2]
+                        // record[1] is the schema type (e.g., "FPP")
+                        let schema_type =
+                            record.get(1).map(|s| s.trim().to_string()).ok_or_else(|| {
+                                warn!("'I' row missing schema type at index 1.");
+                                anyhow::anyhow!(
+                                    "'I' row missing schema type (index 1) in {}",
+                                    file_name
+                                )
+                            })?;
+                        // record[2] is the schema name (e.g., "FORECAST_DEFAULT_CF")
                         let schema_name =
                             record.get(2).map(|s| s.trim().to_string()).ok_or_else(|| {
                                 warn!("'I' row missing schema name at index 2.");
@@ -117,36 +129,39 @@ pub fn load_aemo_zip<P: AsRef<Path>>(zip_path: P) -> Result<BTreeMap<String, Raw
                                 )
                             })?;
 
+                        let schema_identifier = format!("{}_{}", schema_type, schema_name);
+
                         let cols: Vec<String> = record
                             .iter()
                             .skip(4)
                             .map(|s| s.trim().to_string())
                             .collect();
-                        trace!(schema_name, num_cols = cols.len(), "Parsed 'I' row.");
+                        trace!(schema_identifier, num_cols = cols.len(), "Parsed 'I' row.");
 
                         if file_effective_month.is_none() {
-                            warn!(schema_name, "'I' row encountered before a 'C' row or 'C' row date was unparsable. Effective month for this table is unknown.");
+                            warn!(schema_identifier, "'I' row encountered before a 'C' row or 'C' row date was unparsable. Effective month for this table is unknown.");
                             // Decide on a fallback or skip. For now, we'll use a placeholder.
                             // This situation should be rare if files are well-formed.
                         }
 
                         let table_effective_month = file_effective_month.clone().unwrap_or_else(|| {
-                            warn!(schema_name, "Using placeholder for effective_month due to missing 'C' row date.");
+                            warn!(schema_identifier, "Using placeholder for effective_month due to missing 'C' row date.");
                             "UNKNOWN_MONTH".to_string()
                         });
 
-                        let table_entry = tables.entry(schema_name.clone()).or_insert_with(|| {
-                            debug!(
-                                schema_name,
-                                effective_month = table_effective_month,
-                                "Creating new RawTable entry."
-                            );
-                            RawTable {
-                                headers: Vec::new(), // Will be set below
-                                rows: Vec::new(),
-                                effective_month: table_effective_month,
-                            }
-                        });
+                        let table_entry =
+                            tables.entry(schema_identifier.clone()).or_insert_with(|| {
+                                debug!(
+                                    schema_identifier,
+                                    effective_month = table_effective_month,
+                                    "Creating new RawTable entry."
+                                );
+                                RawTable {
+                                    headers: Vec::new(), // Will be set below
+                                    rows: Vec::new(),
+                                    effective_month: table_effective_month,
+                                }
+                            });
                         table_entry.headers = cols; // Overwrite/set headers
 
                         // If the effective_month was determined *after* a previous 'I' row for the same schema name
@@ -157,7 +172,7 @@ pub fn load_aemo_zip<P: AsRef<Path>>(zip_path: P) -> Result<BTreeMap<String, Raw
                                 || table_entry.effective_month != *month
                             {
                                 trace!(
-                                    schema_name,
+                                    schema_identifier,
                                     old_month = table_entry.effective_month,
                                     new_month = month,
                                     "Updating effective_month for existing table entry."
@@ -166,11 +181,11 @@ pub fn load_aemo_zip<P: AsRef<Path>>(zip_path: P) -> Result<BTreeMap<String, Raw
                             }
                         }
 
-                        current_schema_name = Some(schema_name);
+                        current_schema_identifier = Some(schema_identifier);
                     }
                     Some("D") => {
                         // "D" row: Data row.
-                        if let Some(ref current_name) = current_schema_name {
+                        if let Some(ref current_name) = current_schema_identifier {
                             if let Some(table_entry) = tables.get_mut(current_name) {
                                 let row_data: Vec<String> =
                                     record.iter().skip(4).map(|s| s.to_string()).collect(); // Keep original strings, don't trim yet
@@ -275,11 +290,11 @@ D,FPP,FORECAST_RESIDUAL_DCF,1,F_I+LREG_0210,"2024/12/22 00:05:00","2024/12/29 00
         // we should get two schemas
         assert_eq!(tables.len(), 2);
         let default_cf = tables
-            .get("FORECAST_DEFAULT_CF")
-            .expect("FORECAST_DEFAULT_CF table not found");
+            .get("FPP_FORECAST_DEFAULT_CF")
+            .expect("FPP_FORECAST_DEFAULT_CF table not found");
         let residual_dcf = tables
-            .get("FORECAST_RESIDUAL_DCF")
-            .expect("FORECAST_RESIDUAL_DCF table not found");
+            .get("FPP_FORECAST_RESIDUAL_DCF")
+            .expect("FPP_FORECAST_RESIDUAL_DCF table not found");
 
         // Check effective month (from "C" row)
         assert_eq!(default_cf.effective_month, "202412");
