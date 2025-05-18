@@ -1,4 +1,4 @@
-use nemscraper::{duck, fetch, schema};
+use nemscraper::{duck, fetch, history, schema};
 use reqwest::Client; // Use crate name to access library modules
                      // HashSet is no longer needed here as each evolution gets its own table
 use std::fs;
@@ -125,6 +125,17 @@ async fn main() -> anyhow::Result<()> {
         tracing::info!("No schema evolutions processed, skipping DuckDB table creation.");
     }
 
+    // open a DuckDB connection
+    let conn = duck::open_file_db(duckdb_file_path).expect("Failed to open DuckDB database");
+    history::ensure_history_table_exists(&conn).expect("failed to ensure history table exists");
+
+    let already_processed = history::get_distinct_processed_csv_identifiers(&conn)
+        .expect("failed to get already processed identifiers");
+
+    tracing::debug!(
+        count = already_processed.len(),
+        "Already processed identifiers fetched."
+    );
     // --- Existing ZIP fetching logic ---
     tracing::info!("Fetching current ZIP URLs...");
     match fetch::urls::fetch_current_zip_urls(&client).await {

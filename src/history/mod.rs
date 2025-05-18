@@ -25,7 +25,7 @@ pub struct CsvDownloadRecord {
 }
 
 /// Ensures the history table exists in the DuckDB database.
-fn ensure_history_table_exists(conn: &Connection) -> Result<()> {
+pub fn ensure_history_table_exists(conn: &Connection) -> Result<()> {
     conn.execute(
         &format!(
             "CREATE TABLE IF NOT EXISTS {} (
@@ -55,8 +55,6 @@ pub fn record_processed_csv_data<P: AsRef<Path>>(
     source_zip_path: P,
     processed_tables_data: &BTreeMap<String, RawTable>,
 ) -> Result<()> {
-    ensure_history_table_exists(conn)?;
-
     let zip_filename_str = source_zip_path
         .as_ref()
         .file_name()
@@ -116,8 +114,6 @@ pub fn record_processed_csv_data<P: AsRef<Path>>(
 /// Retrieves a unique, alphabetically sorted list of table schema names
 /// that have been recorded in the processing history.
 pub fn get_distinct_processed_csv_identifiers(conn: &Connection) -> Result<Vec<String>> {
-    ensure_history_table_exists(conn)?;
-
     let mut query_stmt = conn
         .prepare(&format!(
             "SELECT DISTINCT table_schema_name FROM {} ORDER BY table_schema_name;",
@@ -161,18 +157,18 @@ mod tests {
 
     use duckdb::{
         params,
+        // Import Type for error construction, ValueRef and TimeUnit for retrieval
         types::{TimeUnit, Type, ValueRef},
         Error as DuckDbError,
     };
     use std::path::PathBuf;
     use tracing_subscriber::{EnvFilter, FmtSubscriber};
-    // duckdb::ErrorResponse is not used
 
     fn init_test_logging() {
         let subscriber = FmtSubscriber::builder()
             .with_env_filter(
                 EnvFilter::try_from_default_env()
-                    .unwrap_or_else(|_| EnvFilter::new("info,nemscraper::history=trace")),
+                    .unwrap_or_else(|_| EnvFilter::new("info,nemscraper::history=trace")), // Adjust crate name if necessary
             )
             .with_test_writer()
             .finish();
@@ -191,6 +187,7 @@ mod tests {
     fn test_record_and_retrieve_with_appender() -> Result<()> {
         init_test_logging();
         let conn = open_mem_db()?;
+        ensure_history_table_exists(&conn)?;
 
         // 1. Initial insertion
         let mut processed_data1 = BTreeMap::new();
@@ -199,7 +196,7 @@ mod tests {
         let zip_path1 = PathBuf::from("test_zip_01.zip");
 
         let time_before_insert1 = Utc::now();
-        std::thread::sleep(std::time::Duration::from_micros(50));
+        std::thread::sleep(std::time::Duration::from_micros(50)); // Ensure time progresses
         record_processed_csv_data(&conn, &zip_path1, &processed_data1)?;
         std::thread::sleep(std::time::Duration::from_micros(50));
         let time_after_insert1 = Utc::now();
@@ -215,7 +212,6 @@ mod tests {
             HISTORY_TABLE_NAME
         ))?;
 
-        // Closure to map a row to CsvDownloadRecord
         let map_row_to_record = |row: &duckdb::Row<'_>| -> Result<CsvDownloadRecord, DuckDbError> {
             let value_ref = row.get_ref(4)?;
             let ts_micros: i64 = match value_ref {
@@ -228,11 +224,15 @@ mod tests {
                     unit.to_micros(other_val)
                 }
                 _ => {
-                    let actual_type = value_ref.data_type();
+                    let actual_type_display = format!("{:?}", value_ref.data_type()); // Use Debug format of private DataType
                     return Err(DuckDbError::FromSqlConversionFailure(
                         4,
-                        Type::Timestamp, // Use ::Timestamp here
-                        format!("Expected Timestamp ValueRef, got {:?}", actual_type).into(),
+                        Type::Timestamp, // Correctly using duckdb::types::Type
+                        format!(
+                            "Expected Timestamp ValueRef, got internal type {}",
+                            actual_type_display
+                        )
+                        .into(),
                     ));
                 }
             };
@@ -241,7 +241,7 @@ mod tests {
                 DateTime::from_timestamp_micros(ts_micros).ok_or_else(|| {
                     DuckDbError::FromSqlConversionFailure(
                         4,
-                        Type::Timestamp, // Use DataType::Timestamp here
+                        Type::Timestamp, // Correctly using duckdb::types::Type
                         "Invalid microsecond value for DateTime conversion".into(),
                     )
                 })?;
@@ -267,40 +267,46 @@ mod tests {
         assert_eq!(record_a1.row_count, 1);
         assert_eq!(record_a1.effective_month, "202301");
         assert!(
-            record_a1.processed_at > time_before_insert1
-                && record_a1.processed_at < time_after_insert1,
-            "Timestamp for record_a1 out of expected range"
+            record_a1.processed_at >= time_before_insert1 // Use >= and <= for broader compatibility with time resolution
+                && record_a1.processed_at <= time_after_insert1,
+            "Timestamp for record_a1 out of expected range (recorded: {}, window: {} to {})",
+            record_a1.processed_at,
+            time_before_insert1,
+            time_after_insert1
         );
 
         // 2. Attempt to reprocess (expect PK violation)
         let result_reprocessing_same =
             record_processed_csv_data(&conn, &zip_path1, &processed_data1);
+
         assert!(
             result_reprocessing_same.is_err(),
-            "Reprocessing should fail due to PK violation"
+            "Reprocessing should have failed due to PK violation, but it succeeded."
         );
 
         if let Err(e) = result_reprocessing_same {
-            match e.root_cause().downcast_ref::<DuckDbError>() {
-                // duckdb::ffi::duckdb_state is not pub, so we can't match its variants easily if we don't know them.
-                // Matching on the presence of the message string is more robust here.
-                Some(DuckDbError::DuckDBFailure(_, Some(message))) => {
-                    let lower_message = message.to_lowercase();
-                    assert!(
-                        lower_message.contains("constraint")
-                            || lower_message.contains("primary key"),
-                        "Error message should indicate a constraint violation. Actual message: {}",
-                        message
-                    );
-                }
-                _ => {
-                    panic!(
-                        "Expected a DuckDBFailure with a message for PK violation, but got: {:?}",
-                        e
-                    );
+            let mut is_constraint_violation = false;
+            for cause in e.chain() {
+                // Iterate through the anyhow::Error cause chain
+                if let Some(duckdb_error) = cause.downcast_ref::<DuckDbError>() {
+                    if let DuckDbError::DuckDBFailure(_, Some(message)) = duckdb_error {
+                        let lower_message = message.to_lowercase();
+                        if lower_message.contains("constraint")
+                            || lower_message.contains("primary key")
+                        {
+                            is_constraint_violation = true;
+                            break;
+                        }
+                    }
                 }
             }
+            assert!(
+                is_constraint_violation,
+                "Expected a DuckDB constraint violation, but got error: {:?}",
+                e
+            );
         }
+        // The else branch for panic! if result_reprocessing_same.is_ok() is implicitly handled by the assert!(is_err()) above.
 
         // 3. Insert data from a new zip
         let mut processed_data2 = BTreeMap::new();
