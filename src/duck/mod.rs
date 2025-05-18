@@ -317,7 +317,7 @@ fn parse_string_to_duckdb_value(value_str: &str, target_column: &NemSchemaColumn
 /// Inserts data from a `RawTable` into the specified DuckDB table,
 /// but first verifies that the on‐disk schema matches the expected schema.
 #[tracing::instrument(
-    level = "debug",
+    level = "info",
     skip(conn, raw_table_data, schema_definition),
     fields(target_table = %duckdb_table_name, num_raw_rows = raw_table_data.rows.len())
 )]
