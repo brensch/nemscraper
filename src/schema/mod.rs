@@ -550,6 +550,7 @@ fn calculate_fields_hash(columns: &[Column]) -> String {
 ///
 /// Reads all `<YYYYMM>.json` files from the `input_dir`, processes them in chronological order,
 /// and identifies periods where table schemas remain consistent.
+/// The last evolution period for each table is extended one year into the future.
 ///
 /// # Arguments
 /// * `input_dir` - The directory containing the `<YYYYMM>.json` files.
@@ -732,21 +733,35 @@ pub fn extract_schema_evolutions<P: AsRef<Path>>(input_dir: P) -> Result<Vec<Sch
     }
 
     // After iterating through all month files, close any remaining active schemas
-    // Their end_month will be the last processed month_code
+    // Their end_month will be extended 1 year into the future from the last processed month
     if let Some(last_month_code) = previous_month_code {
+        // Calculate a date 1 year in the future
+        let year = last_month_code[0..4].parse::<u32>().unwrap_or(2025);
+        let month = last_month_code[4..6].parse::<u32>().unwrap_or(1);
+
+        // Add 1 year to the date
+        let future_year = year + 1;
+        let future_month_code = format!("{}{:02}", future_year, month);
+
+        debug!(
+            last_month = last_month_code,
+            future_month = future_month_code,
+            "Extending final schema versions one year into the future"
+        );
+
         for (table_name, (hash, start_month, columns)) in active_schemas {
             debug!(
                 table = table_name,
                 hash = hash,
                 start_month = start_month,
-                end_month = last_month_code,
-                "Closing active schema at end of processing"
+                end_month = future_month_code,
+                "Closing active schema with extended end date"
             );
             evolutions.push(SchemaEvolution {
                 table_name,
                 fields_hash: hash,
                 start_month,
-                end_month: last_month_code.clone(),
+                end_month: future_month_code.clone(),
                 columns,
             });
         }

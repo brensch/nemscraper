@@ -1,7 +1,8 @@
 // src/duck/mod.rs
 
 use anyhow::{anyhow, Context, Result};
-use chrono::{DateTime, FixedOffset, NaiveDateTime, TimeZone, Utc}; // Added DateTime, Utc
+use chrono::{DateTime, FixedOffset, NaiveDateTime, TimeZone, Utc}; use duckdb::types::TimeUnit;
+// Added DateTime, Utc
 use duckdb::{types::Value, Appender, Connection, ToSql};
 use tracing;
 
@@ -88,6 +89,7 @@ pub fn create_table_from_schema(
     columns: &[NemSchemaColumn],
 ) -> Result<()> {
     tracing::Span::current().record("table_name", &table_name);
+    tracing::debug!(?columns, "Creating table from schema.");
     if columns.is_empty() {
         return Err(anyhow!(
             "Cannot create table '{}': no columns defined.",
@@ -117,6 +119,18 @@ pub fn create_table_from_schema(
         )
     })?;
 
+    // debug: dump the on‐disk columns
+    let mut info = Vec::new();
+    let mut stmt = conn.prepare(&format!("PRAGMA table_info(\"{}\")", table_name))?;
+    let mut rows = stmt.query([])?;
+    while let Some(r) = rows.next()? {
+        let cid: i32 = r.get(0)?;
+        let name: String = r.get(1)?;
+        let dtype: String = r.get(2)?;
+        info.push((cid, name, dtype));
+    }
+    tracing::debug!(?info, "Actual columns for table");
+
     tracing::debug!(
         "Table '{}' created successfully or already exists.",
         table_name
@@ -129,6 +143,9 @@ pub fn create_table_from_schema(
 /// Parses a string value into a DuckDB `Value` based on the target schema column type.
 /// Handles empty strings as NULL.
 /// For timestamp-like fields, assumes input string is in NEM time (+10:00) and converts to an ISO string.
+/// Parses a string value into a DuckDB `Value` based on the target schema column type.
+/// Handles empty strings as NULL.
+/// For timestamp-like fields, assumes input string is in NEM time (+10:00) and converts to native timestamp.
 fn parse_string_to_duckdb_value(value_str: &str, target_column: &NemSchemaColumn) -> Result<Value> {
     let trimmed_value = value_str.trim();
 
@@ -147,14 +164,24 @@ fn parse_string_to_duckdb_value(value_str: &str, target_column: &NemSchemaColumn
                 .as_deref()
                 // Default to a common ISO-like format if specific NEM format isn't there,
                 // though NEM usually provides one for timestamps.
-                .unwrap_or("%Y/%m/%d %H:%M:%S");
+                .unwrap_or("YYYY/MM/DD HH24:MI:SS");
             let chrono_format_str = nem_format_to_chrono_format(format_str);
 
             match NaiveDateTime::parse_from_str(trimmed_value, &chrono_format_str) {
                 Ok(naive_dt) => {
                     let nem_offset = FixedOffset::east_opt(10 * 3600).unwrap(); // +10 hours
                     match nem_offset.from_local_datetime(&naive_dt).single() {
-                        Some(dt_with_offset) => Ok(Value::Text(dt_with_offset.to_rfc3339())),
+                        Some(dt_with_offset) => {
+                            // Convert to UTC timestamp with microsecond precision
+                            let utc_dt: DateTime<Utc> = dt_with_offset.into();
+                            
+                            // Calculate microseconds
+                            let timestamp_micros = utc_dt.timestamp() * 1_000_000 
+                                + i64::from(utc_dt.timestamp_subsec_micros());
+                            
+                            // Use native timestamp type
+                            Ok(Value::Timestamp(TimeUnit::Microsecond, timestamp_micros))
+                        },
                         None => Err(anyhow!(
                             "Failed to interpret '{}' with offset +10:00 for column '{}' (ambiguous or invalid local time). Value: {}, Format: {}",
                             target_column.name, trimmed_value, naive_dt, chrono_format_str
@@ -170,22 +197,46 @@ fn parse_string_to_duckdb_value(value_str: &str, target_column: &NemSchemaColumn
         "DATE" => {
             if let Some(fmt) = target_column.format.as_deref() {
                 let chrono_format_str = nem_format_to_chrono_format(fmt);
-                // Try to parse with format, but still send as text for DuckDB's robust parsing
-                if NaiveDateTime::parse_from_str(trimmed_value, &chrono_format_str).is_ok() {
-                    Ok(Value::Text(trimmed_value.to_string()))
-                } else if chrono::NaiveDate::parse_from_str(trimmed_value, &chrono_format_str)
-                    .is_ok()
-                {
-                    Ok(Value::Text(trimmed_value.to_string()))
-                } else {
-                    Err(anyhow!(
-                        "Failed to parse '{}' as DATE with chrono format '{}' (original NEM format: '{}') for column '{}'. Sending as raw text.",
-                        trimmed_value, chrono_format_str, fmt, target_column.name
-                    ))
+                
+                // Try to parse as DateTime first
+                if let Ok(naive_dt) = NaiveDateTime::parse_from_str(trimmed_value, &chrono_format_str) {
+                    // If it contains time components, use TimestampTz
+                    let nem_offset = FixedOffset::east_opt(10 * 3600).unwrap();
+                    if let Some(dt_with_offset) = nem_offset.from_local_datetime(&naive_dt).single() {
+                        let utc_dt: DateTime<Utc> = dt_with_offset.into();
+                        let timestamp_micros = utc_dt.timestamp() * 1_000_000 
+                            + i64::from(utc_dt.timestamp_subsec_micros());
+                        return Ok(Value::Timestamp(TimeUnit::Microsecond, timestamp_micros));
+                    }
                 }
+                
+                // Try to parse as Date only
+                if let Ok(naive_date) = chrono::NaiveDate::parse_from_str(trimmed_value, &chrono_format_str) {
+                    // Convert to days since epoch (1970-01-01)
+                    let unix_epoch = chrono::NaiveDate::from_ymd_opt(1970, 1, 1).unwrap();
+                    let days_since_epoch = naive_date.signed_duration_since(unix_epoch).num_days() as i32;
+                    return Ok(Value::Date32(days_since_epoch));
+                }
+                
+                // If both parsing attempts failed, return an error
+                Err(anyhow!(
+                    "Failed to parse '{}' as DATE with chrono format '{}' (original NEM format: '{}') for column '{}'.",
+                    trimmed_value, chrono_format_str, fmt, target_column.name
+                ))
             } else {
-                // Let DuckDB attempt to parse common date formats from text
-                Ok(Value::Text(trimmed_value.to_string()))
+                // Try to parse using common date formats
+                if let Ok(naive_date) = chrono::NaiveDate::parse_from_str(trimmed_value, "%Y-%m-%d") {
+                    let unix_epoch = chrono::NaiveDate::from_ymd_opt(1970, 1, 1).unwrap();
+                    let days_since_epoch = naive_date.signed_duration_since(unix_epoch).num_days() as i32;
+                    Ok(Value::Date32(days_since_epoch))
+                } else if let Ok(naive_date) = chrono::NaiveDate::parse_from_str(trimmed_value, "%Y/%m/%d") {
+                    let unix_epoch = chrono::NaiveDate::from_ymd_opt(1970, 1, 1).unwrap();
+                    let days_since_epoch = naive_date.signed_duration_since(unix_epoch).num_days() as i32;
+                    Ok(Value::Date32(days_since_epoch))
+                } else {
+                    // Last resort, pass as text and let DuckDB try to parse it
+                    Ok(Value::Text(trimmed_value.to_string()))
+                }
             }
         }
         "DOUBLE" => trimmed_value
@@ -253,107 +304,127 @@ fn parse_string_to_duckdb_value(value_str: &str, target_column: &NemSchemaColumn
     }
 }
 
+
+
+
+
 /// Inserts data from a `RawTable` into the specified DuckDB table,
-/// using the provided `SchemaEvolution` for column definitions and type conversions.
-#[tracing::instrument(level = "debug", skip(conn, raw_table_data, schema_definition), fields(target_table = %duckdb_table_name, num_raw_rows = raw_table_data.rows.len()))]
+/// but first verifies that the on‐disk schema matches the expected schema.
+#[tracing::instrument(
+    level = "debug",
+    skip(conn, raw_table_data, schema_definition),
+    fields(target_table = %duckdb_table_name, num_raw_rows = raw_table_data.rows.len())
+)]
 pub fn insert_raw_table_data(
     conn: &Connection,
     duckdb_table_name: &str,
     raw_table_data: &RawTable,
     schema_definition: &crate::schema::SchemaEvolution,
 ) -> Result<usize> {
+    //  Quick exit if nothing to do
     if raw_table_data.rows.is_empty() {
         tracing::debug!("No rows to insert into table '{}'.", duckdb_table_name);
         return Ok(0);
     }
 
-    let expected_col_count = schema_definition.columns.len();
-    if expected_col_count == 0 {
+    //  Verify expected schema is non‐empty
+    let expected_cols: Vec<String> = schema_definition
+        .columns
+        .iter()
+        .map(|c| c.name.clone())
+        .collect();
+    if expected_cols.is_empty() {
         return Err(anyhow!(
             "Schema definition for table '{}' has no columns.",
             duckdb_table_name
         ));
     }
 
-    tracing::info!(
-        num_rows = raw_table_data.rows.len(),
-        table = duckdb_table_name,
-        "Preparing to insert data into DuckDB table."
-    );
 
-    let mut appender: Appender = conn.appender(duckdb_table_name).with_context(|| {
-        format!(
-            "Failed to create appender for table '{}'",
-            duckdb_table_name
-        )
-    })?;
 
-    let mut successfully_appended_rows = 0;
-    for (row_idx, string_row) in raw_table_data.rows.iter().enumerate() {
+
+
+
+
+    // 4) Open an Appender (will also error if table really doesn’t exist)
+    let mut appender = match conn.appender(duckdb_table_name) {
+        Ok(appender) => appender,
+        Err(e) => {
+            tracing::error!(table = %duckdb_table_name, raw_error = %e, "duckdb::Connection::appender() failed");
+            return Err(e).context(format!(
+                "Failed to create appender for table '{}'",
+                duckdb_table_name
+            ));
+        }
+    };
+
+    //  Append rows, skipping any with the wrong length
+    let expected_col_count = expected_cols.len();
+    let mut successfully_appended = 0;
+    for (idx, string_row) in raw_table_data.rows.iter().enumerate() {
         if string_row.len() != expected_col_count {
-            tracing::warn!(
-                row_num = row_idx + 1,
+            tracing::error!(
+                row_num = idx + 1,
                 expected_cols = expected_col_count,
                 actual_cols = string_row.len(),
                 table = duckdb_table_name,
-                "Skipping row due to column count mismatch. First few values: {:?}",
-                string_row.iter().take(3).collect::<Vec<_>>()
+                "Skipping row due to column-count mismatch"
             );
             continue;
         }
 
-        let mut duckdb_row_values: Vec<Value> = Vec::with_capacity(expected_col_count);
-        let mut conversion_failed = false;
-        for (col_idx, cell_value_str) in string_row.iter().enumerate() {
-            let target_column = &schema_definition.columns[col_idx];
-            match parse_string_to_duckdb_value(cell_value_str, target_column) {
-                Ok(duck_value) => {
-                    duckdb_row_values.push(duck_value);
-                }
-                Err(e) => {
+        // convert each cell to Value…
+        let mut duck_vals = Vec::with_capacity(expected_col_count);
+        let mut row_ok = true;
+        for (i, cell) in string_row.iter().enumerate() {
+            let col = &schema_definition.columns[i];
+            match crate::duck::parse_string_to_duckdb_value(cell, col) {
+                Ok(v) => duck_vals.push(v),
+                Err(err) => {
                     tracing::warn!(
-                        row_num = row_idx + 1,
-                        col_num = col_idx + 1,
-                        col_name = %target_column.name,
-                        raw_value = %cell_value_str,
-                        error = %e,
+                        row_num = idx + 1,
+                        col_idx = i + 1,
+                        col_name = %col.name,
+                        raw = %cell,
+                        error = %err,
                         table = duckdb_table_name,
-                        "Failed to parse value. Skipping row."
+                        "Conversion failed; skipping row"
                     );
-                    conversion_failed = true;
+                    row_ok = false;
                     break;
                 }
             }
         }
+        if !row_ok {
+            continue;
+        }
 
-        if !conversion_failed {
-            let params_for_row: Vec<&dyn ToSql> =
-                duckdb_row_values.iter().map(|v| v as &dyn ToSql).collect();
-
-            if let Err(e) = appender.append_row(&params_for_row[..]) {
-                tracing::warn!(
-                    row_num = row_idx + 1,
-                    error = %e,
-                    table = duckdb_table_name,
-                    values = ?duckdb_row_values.iter().map(|v| format!("{:?}", v)).collect::<Vec<_>>(), // Log problematic values
-                    "Failed to append row. Skipping row."
-                );
-            } else {
-                successfully_appended_rows += 1;
-            }
+        // …and append
+        let params: Vec<&dyn ToSql> = duck_vals.iter().map(|v| v as &dyn ToSql).collect();
+        if let Err(e) = appender.append_row(params.as_slice()) {
+            tracing::warn!(
+                row_num = idx + 1,
+                table = duckdb_table_name,
+                error = %e,
+                "Appender.append_row() failed; skipping row"
+            );
+        } else {
+            successfully_appended += 1;
         }
     }
 
+    // 6) Flush everything
     appender
         .flush()
         .with_context(|| format!("Failed to flush appender for table '{}'", duckdb_table_name))?;
     tracing::info!(
-        inserted_rows = successfully_appended_rows,
-        total_raw_rows = raw_table_data.rows.len(),
+        inserted_rows = successfully_appended,
+        total_rows = raw_table_data.rows.len(),
         table = duckdb_table_name,
-        "Finished inserting data into DuckDB table."
+        "Finished inserting data."
     );
-    Ok(successfully_appended_rows)
+
+    Ok(successfully_appended)
 }
 
 /// Open an in-memory DuckDB instance
@@ -363,6 +434,8 @@ pub fn open_mem_db() -> Result<Connection> {
 
 /// Open or create a file-based DuckDB instance
 pub fn open_file_db(path: &str) -> Result<Connection> {
+    // Ok(Connection::open_in_memory()?)
+
     Connection::open(path).context(format!("Failed to open DuckDB file at {}", path))
 }
 
