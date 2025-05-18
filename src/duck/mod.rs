@@ -1,7 +1,8 @@
 // src/duck/mod.rs
 
 use anyhow::{anyhow, Context, Result};
-use chrono::{DateTime, FixedOffset, NaiveDateTime, TimeZone, Utc}; use duckdb::types::TimeUnit;
+use chrono::{DateTime, FixedOffset, NaiveDateTime, TimeZone, Utc};
+use duckdb::types::TimeUnit;
 // Added DateTime, Utc
 use duckdb::{types::Value, Appender, Connection, ToSql};
 use tracing;
@@ -174,11 +175,9 @@ fn parse_string_to_duckdb_value(value_str: &str, target_column: &NemSchemaColumn
                         Some(dt_with_offset) => {
                             // Convert to UTC timestamp with microsecond precision
                             let utc_dt: DateTime<Utc> = dt_with_offset.into();
-                            
                             // Calculate microseconds
-                            let timestamp_micros = utc_dt.timestamp() * 1_000_000 
+                            let timestamp_micros = utc_dt.timestamp() * 1_000_000
                                 + i64::from(utc_dt.timestamp_subsec_micros());
-                            
                             // Use native timestamp type
                             Ok(Value::Timestamp(TimeUnit::Microsecond, timestamp_micros))
                         },
@@ -197,27 +196,33 @@ fn parse_string_to_duckdb_value(value_str: &str, target_column: &NemSchemaColumn
         "DATE" => {
             if let Some(fmt) = target_column.format.as_deref() {
                 let chrono_format_str = nem_format_to_chrono_format(fmt);
-                
+
                 // Try to parse as DateTime first
-                if let Ok(naive_dt) = NaiveDateTime::parse_from_str(trimmed_value, &chrono_format_str) {
+                if let Ok(naive_dt) =
+                    NaiveDateTime::parse_from_str(trimmed_value, &chrono_format_str)
+                {
                     // If it contains time components, use TimestampTz
                     let nem_offset = FixedOffset::east_opt(10 * 3600).unwrap();
-                    if let Some(dt_with_offset) = nem_offset.from_local_datetime(&naive_dt).single() {
+                    if let Some(dt_with_offset) = nem_offset.from_local_datetime(&naive_dt).single()
+                    {
                         let utc_dt: DateTime<Utc> = dt_with_offset.into();
-                        let timestamp_micros = utc_dt.timestamp() * 1_000_000 
+                        let timestamp_micros = utc_dt.timestamp() * 1_000_000
                             + i64::from(utc_dt.timestamp_subsec_micros());
                         return Ok(Value::Timestamp(TimeUnit::Microsecond, timestamp_micros));
                     }
                 }
-                
+
                 // Try to parse as Date only
-                if let Ok(naive_date) = chrono::NaiveDate::parse_from_str(trimmed_value, &chrono_format_str) {
+                if let Ok(naive_date) =
+                    chrono::NaiveDate::parse_from_str(trimmed_value, &chrono_format_str)
+                {
                     // Convert to days since epoch (1970-01-01)
                     let unix_epoch = chrono::NaiveDate::from_ymd_opt(1970, 1, 1).unwrap();
-                    let days_since_epoch = naive_date.signed_duration_since(unix_epoch).num_days() as i32;
+                    let days_since_epoch =
+                        naive_date.signed_duration_since(unix_epoch).num_days() as i32;
                     return Ok(Value::Date32(days_since_epoch));
                 }
-                
+
                 // If both parsing attempts failed, return an error
                 Err(anyhow!(
                     "Failed to parse '{}' as DATE with chrono format '{}' (original NEM format: '{}') for column '{}'.",
@@ -225,13 +230,18 @@ fn parse_string_to_duckdb_value(value_str: &str, target_column: &NemSchemaColumn
                 ))
             } else {
                 // Try to parse using common date formats
-                if let Ok(naive_date) = chrono::NaiveDate::parse_from_str(trimmed_value, "%Y-%m-%d") {
+                if let Ok(naive_date) = chrono::NaiveDate::parse_from_str(trimmed_value, "%Y-%m-%d")
+                {
                     let unix_epoch = chrono::NaiveDate::from_ymd_opt(1970, 1, 1).unwrap();
-                    let days_since_epoch = naive_date.signed_duration_since(unix_epoch).num_days() as i32;
+                    let days_since_epoch =
+                        naive_date.signed_duration_since(unix_epoch).num_days() as i32;
                     Ok(Value::Date32(days_since_epoch))
-                } else if let Ok(naive_date) = chrono::NaiveDate::parse_from_str(trimmed_value, "%Y/%m/%d") {
+                } else if let Ok(naive_date) =
+                    chrono::NaiveDate::parse_from_str(trimmed_value, "%Y/%m/%d")
+                {
                     let unix_epoch = chrono::NaiveDate::from_ymd_opt(1970, 1, 1).unwrap();
-                    let days_since_epoch = naive_date.signed_duration_since(unix_epoch).num_days() as i32;
+                    let days_since_epoch =
+                        naive_date.signed_duration_since(unix_epoch).num_days() as i32;
                     Ok(Value::Date32(days_since_epoch))
                 } else {
                     // Last resort, pass as text and let DuckDB try to parse it
@@ -304,10 +314,6 @@ fn parse_string_to_duckdb_value(value_str: &str, target_column: &NemSchemaColumn
     }
 }
 
-
-
-
-
 /// Inserts data from a `RawTable` into the specified DuckDB table,
 /// but first verifies that the on‐disk schema matches the expected schema.
 #[tracing::instrument(
@@ -339,12 +345,6 @@ pub fn insert_raw_table_data(
             duckdb_table_name
         ));
     }
-
-
-
-
-
-
 
     // 4) Open an Appender (will also error if table really doesn’t exist)
     let mut appender = match conn.appender(duckdb_table_name) {
@@ -412,7 +412,6 @@ pub fn insert_raw_table_data(
             successfully_appended += 1;
         }
     }
-
 
     tracing::info!(
         inserted_rows = successfully_appended,
