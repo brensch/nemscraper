@@ -52,7 +52,7 @@ pub fn load_aemo_zip<P: AsRef<Path>>(zip_path: P) -> Result<BTreeMap<String, Raw
     let mut tables: BTreeMap<String, RawTable> = BTreeMap::new();
 
     for i in 0..archive.len() {
-        let mut file_in_zip = archive.by_index(i).with_context(|| {
+        let file_in_zip = archive.by_index(i).with_context(|| {
             format!("Failed to get file at index {} in ZIP: {}", i, path_display)
         })?;
 
@@ -197,7 +197,7 @@ pub fn load_aemo_zip<P: AsRef<Path>>(zip_path: P) -> Result<BTreeMap<String, Raw
             }
         } else if file_in_zip.is_file() {
             trace!(
-                file_type = تشخیص_파일_타입(&file_name),
+                file_type = clean_file_type(&file_name),
                 "Skipping non-CSV file entry."
             );
         }
@@ -210,7 +210,7 @@ pub fn load_aemo_zip<P: AsRef<Path>>(zip_path: P) -> Result<BTreeMap<String, Raw
 }
 
 // Helper to avoid panic on invalid UTF-8 in filenames for logging
-fn تشخیص_파일_타입(file_name: &str) -> String {
+fn clean_file_type(file_name: &str) -> String {
     if file_name.to_lowercase().ends_with(".csv") {
         "CSV".to_string()
     } else {

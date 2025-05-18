@@ -2,7 +2,6 @@
 
 use anyhow::{anyhow, Context, Result};
 use duckdb::{types::Value, Appender, Connection, ToSql}; // params_from_iter is not needed with this approach
-use std::time::Instant;
 use tracing;
 
 use crate::process::RawTable;
@@ -309,7 +308,6 @@ mod tests {
     use super::*;
     use crate::schema::SchemaEvolution; // Assuming this path is correct from your project structure
     use anyhow::Result;
-    use duckdb::types::Value; // For checking Value::Null
     use tracing_subscriber::{EnvFilter, FmtSubscriber};
 
     // Imports for the performance test (if in the same mod tests block)

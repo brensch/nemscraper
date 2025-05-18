@@ -14,7 +14,7 @@ use serde::{Deserialize, Serialize}; // Added Deserialize
 use sha2::{Digest, Sha256}; // For hashing
 use std::time::{Duration, Instant};
 use std::{
-    collections::{BTreeMap, HashMap, HashSet}, // Added BTreeMap and HashMap
+    collections::{HashMap, HashSet}, // Added BTreeMap and HashMap
     fs,
     path::{Path, PathBuf},
 };
@@ -769,7 +769,7 @@ pub fn extract_schema_evolutions<P: AsRef<Path>>(input_dir: P) -> Result<Vec<Sch
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::{io::Read, sync::Once};
+    use std::sync::Once;
     use tempfile::tempdir;
     use tokio::runtime::Runtime;
     use tracing_subscriber::fmt::format::FmtSpan;
@@ -854,7 +854,6 @@ TRAILING NULLCOLS (foo FILLER, BAR DATE "yyyy/mm/dd")
                         // This might happen if all data is already "done" or no data is found for the period.
                         // For a robust test, we'd need to ensure a clean state or mock the "done" list.
                         warn!("fetch_all returned no new MonthSchema objects. This might be okay if all data was already processed or no data for the default range.");
-                        assert!(entries >= 0); // At least the directory exists.
                     } else {
                         assert!(entries > 0, "Expected some JSON files to be created.");
                         assert_eq!(entries, out.len(), "Number of created files should match number of processed months.");

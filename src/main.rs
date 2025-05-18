@@ -1,10 +1,3 @@
-// These are your existing module declarations
-// Ensure src/lib.rs exists and declares these modules publicly:
-// pub mod duck;
-// pub mod fetch;
-// pub mod process;
-// pub mod schema;
-
 use nemscraper::{duck, fetch, schema};
 use reqwest::Client; // Use crate name to access library modules
                      // HashSet is no longer needed here as each evolution gets its own table
