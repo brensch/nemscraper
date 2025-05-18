@@ -41,3 +41,9 @@ prettytable-rs = "0.10.0"
 arrow-schema = "55.1.0"
 tokio-stream = "0.1.17"
 num_cpus = "1.16.0"
+arrow2 = { version = "0.18", default-features = false, features = [
+    "io_parquet",
+    "io_parquet_compression",
+] }
+arrow = "55.1.0"
+parquet = "55.1.0"

@@ -1,15 +1,22 @@
-// src/process/mod.rs
 use anyhow::{Context, Result};
-use csv::ReaderBuilder;
-
+use futures::stream::{FuturesUnordered, StreamExt};
 use std::{
-    collections::{BTreeMap, HashMap},
-    fs::File,
-    io::{BufReader, Cursor, Read},
-    path::Path,
+    fs::{self, File},
+    io::Read,
+    path::{Path, PathBuf},
+    sync::Arc,
+    time::Instant,
 };
-use tracing::{debug, trace, warn}; // Added tracing
+use tokio::task;
+use tracing::{info, instrument};
 use zip::ZipArchive;
+
+use arrow::{
+    array::{ArrayRef, StringArray},
+    datatypes::{DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema},
+    record_batch::RecordBatch,
+};
+use parquet::{arrow::ArrowWriter, basic::Compression, file::properties::WriterProperties};
 
 #[derive(Debug)]
 pub struct RawTable {
@@ -22,262 +29,207 @@ pub struct RawTable {
     pub effective_month: String,
 }
 
-/// Parses a date string like "YYYY/MM/DD" or "YYYY/MM/DD hh:mm:ss" into "YYYYMM".
-/// Returns None if parsing fails.
-fn parse_date_to_yyyymm(date_str: &str) -> Option<String> {
-    // Handle potential quotes around the date string if it comes from CSV parsing directly.
-    let cleaned_date_str = date_str.trim_matches('"');
+/// Async version using Tokio tasks instead of Rayon
+#[instrument(level = "info", skip(zip_path, out_dir), fields(zip = %zip_path.as_ref().display()))]
+pub async fn split_zip_to_parquet_async<P: AsRef<Path>, Q: AsRef<Path>>(
+    zip_path: P,
+    out_dir: Q,
+) -> Result<()> {
+    let start_total = Instant::now();
+    info!("starting async split_zip_to_parquet");
 
-    if cleaned_date_str.len() >= 7 {
-        // "YYYY/MM"
-        let year_str = &cleaned_date_str[0..4];
-        let month_str = &cleaned_date_str[5..7];
-        if year_str.chars().all(char::is_numeric) && month_str.chars().all(char::is_numeric) {
-            return Some(format!("{}{}", year_str, month_str));
-        }
-    }
-    warn!(date_str, "Failed to parse date string into YYYYMM format");
-    None
-}
+    // Normalize to owned paths for moving into tasks
+    let zip_path_buf: PathBuf = zip_path.as_ref().to_path_buf();
+    let out_dir_buf: PathBuf = out_dir.as_ref().to_path_buf();
 
-/// Open `zip_path`, find all `.csv` entries, and for each:
-/// - Extracts the effective month from the "C" row.
-/// - On “I” rows: starts a new schema table (keyed by schema name), storing headers and the effective_month.
-/// - On “D” rows: pushes the data row into the current schema's table.
-///
-/// Returns a BTreeMap mapping schema names (e.g., "FORECAST_DEFAULT_CF") to RawTable data.
-#[tracing::instrument(level = "info", skip(zip_path), fields(path = %zip_path.as_ref().display()))]
-pub fn load_aemo_zip<P: AsRef<Path>>(zip_path: P) -> Result<BTreeMap<String, RawTable>> {
-    // 1) Open the ZIP once
-    let file = File::open(&zip_path)
-        .with_context(|| format!("Failed to open ZIP file: {:?}", zip_path.as_ref()))?;
-    let mut archive = ZipArchive::new(file)
-        .with_context(|| format!("Failed to read ZIP archive: {:?}", zip_path.as_ref()))?;
+    // Ensure output directory exists
+    let t0 = Instant::now();
+    fs::create_dir_all(&out_dir_buf)?;
+    info!("created output directory in {:?}", t0.elapsed());
 
-    // 2) Extract each .csv entry into memory, in archive order
-    let mut buffers: Vec<(String, Vec<u8>)> = Vec::with_capacity(archive.len());
+    // Open ZIP archive
+    let t1 = Instant::now();
+    let file =
+        File::open(&zip_path_buf).with_context(|| format!("opening ZIP {:?}", zip_path_buf))?;
+    let mut archive =
+        ZipArchive::new(file).with_context(|| format!("reading ZIP {:?}", zip_path_buf))?;
+    info!("opened and read ZIP archive in {:?}", t1.elapsed());
+
+    // Iterate over entries
     for i in 0..archive.len() {
-        let mut entry = archive.by_index(i).with_context(|| {
-            format!(
-                "Failed to access ZIP entry #{} in {:?}",
-                i,
-                zip_path.as_ref()
-            )
-        })?;
+        let mut entry = archive.by_index(i)?;
         let name = entry.name().to_string();
-
-        if entry.is_file() && name.to_lowercase().ends_with(".csv") {
-            let mut buf = Vec::with_capacity(entry.size() as usize);
-            entry
-                .read_to_end(&mut buf)
-                .with_context(|| format!("Failed to read {} into memory", name))?;
-            buffers.push((name, buf));
+        if !name.to_lowercase().ends_with(".csv") {
+            continue;
         }
-    }
-    // drop the archive (and its file handle) now that we've buffered everything
-    drop(archive);
 
-    // 3) Now parse each CSV buffer **in order**, preserving every row’s sequence
-    let mut tables: BTreeMap<String, RawTable> = BTreeMap::new();
-    for (file_name, data) in buffers {
-        let mut rdr = ReaderBuilder::new()
-            .has_headers(false)
-            .flexible(true) // keep this so records with different field-counts work
-            .from_reader(Cursor::new(data));
+        // Read entire CSV entry
+        let t_read = Instant::now();
+        let mut buf = Vec::with_capacity(entry.size() as usize);
+        entry.read_to_end(&mut buf)?;
+        let text = String::from_utf8_lossy(&buf).to_string();
+        info!(
+            index = i,
+            bytes = entry.size(),
+            "read entry in {:?}",
+            t_read.elapsed()
+        );
 
-        let mut current_schema: Option<String> = None;
-        let mut file_month: Option<String> = None;
-
-        for (idx, result) in rdr.records().enumerate() {
-            let record = result
-                .with_context(|| format!("CSV parse error in {} at record {}", file_name, idx))?;
-
-            match record.get(0).map(str::trim) {
-                Some("C") => {
-                    if let Some(ds) = record.get(5) {
-                        file_month = parse_date_to_yyyymm(ds);
-                    }
+        // Find segments
+        let t_seg = Instant::now();
+        let mut segments = Vec::new();
+        let mut pos: usize = 0;
+        let mut current = None;
+        for line in text.lines() {
+            let len = line.len() + 1;
+            if line.starts_with("I,") {
+                if let Some((schema, start)) = current.take() {
+                    segments.push((schema, start, pos));
                 }
-                Some("I") => {
-                    let schema_id = {
-                        let t = record.get(1).unwrap().trim();
-                        let n = record.get(2).unwrap().trim();
-                        format!("{}_{}", t, n)
-                    };
-                    let cols: Vec<String> = record.iter().skip(4).map(|s| s.to_string()).collect();
-                    let month = file_month.clone().unwrap_or_else(|| "UNKNOWN_MONTH".into());
-
-                    // guaranteed to return you &mut RawTable (in order)
-                    let tbl = tables.entry(schema_id.clone()).or_insert_with(|| RawTable {
-                        headers: Vec::new(),
-                        rows: Vec::new(),
-                        effective_month: month.clone(),
-                    });
-
-                    // overwrite headers (once per I-row, in-order)
-                    tbl.headers = cols;
-                    current_schema = Some(schema_id);
-                }
-                Some("D") => {
-                    if let Some(ref schema_id) = current_schema {
-                        let row: Vec<String> =
-                            record.iter().skip(4).map(|s| s.to_string()).collect();
-                        tables
-                            .get_mut(schema_id)
-                            .expect("schema must exist")
-                            .rows
-                            .push(row);
-                    }
-                }
-                _ => {
-                    // skip blanks or other rows
-                }
+                let parts: Vec<&str> = line.split(',').collect();
+                let schema = format!("{}_{}", parts[1], parts[2]);
+                current = Some((schema, pos));
             }
+            pos = pos.saturating_add(len);
+        }
+        if let Some((schema, start)) = current {
+            segments.push((schema, start, text.len()));
+        }
+        info!(
+            "segmented into {} segments in {:?}",
+            segments.len(),
+            t_seg.elapsed()
+        );
+
+        // Spawn a blocking task for each segment
+        let mut futures = FuturesUnordered::new();
+        for (schema_id, start, end) in segments {
+            let out_dir_clone = out_dir_buf.clone();
+            let name_clone = name.clone();
+            let text_clone = text.clone();
+
+            futures.push(task::spawn_blocking(move || -> Result<()> {
+                let t_segment = Instant::now();
+                info!(segment = %schema_id, "processing segment");
+
+                let slice = &text_clone[start..end];
+                // Parse header
+                let cols: Vec<String> = slice
+                    .lines()
+                    .find(|l| l.starts_with("I,"))
+                    .unwrap()
+                    .split(',')
+                    .skip(4)
+                    .map(str::to_string)
+                    .collect();
+                let num_cols = cols.len();
+
+                // Build arrays per column
+                let t_arrays = Instant::now();
+                let arrays: Vec<ArrayRef> = (0..num_cols)
+                    .map(|col_idx| {
+                        let cells: Vec<&str> = slice
+                            .lines()
+                            .filter(|l| l.starts_with("D,"))
+                            .map(|row| row.split(',').skip(4 + col_idx).next().unwrap())
+                            .collect();
+                        Arc::new(StringArray::from(cells)) as ArrayRef
+                    })
+                    .collect();
+                info!(segment = %schema_id, "built {} arrays in {:?}", num_cols, t_arrays.elapsed());
+
+                // Create schema & RecordBatch
+                let fields: Vec<ArrowField> = cols
+                    .iter()
+                    .map(|name| ArrowField::new(name, ArrowDataType::Utf8, true))
+                    .collect();
+                let schema = Arc::new(ArrowSchema::new(fields));
+                let batch = RecordBatch::try_new(schema.clone(), arrays)?;
+                info!(segment = %schema_id, "created RecordBatch in {:?}", t_segment.elapsed());
+
+                // Write Parquet
+                let t_write = Instant::now();
+                let out_file = out_dir_clone.join(format!("{}—{}.parquet", name_clone, schema_id));
+                let file = File::create(&out_file)?;
+                let props = WriterProperties::builder().set_compression(Compression::UNCOMPRESSED).build();
+                let mut writer = ArrowWriter::try_new(file, schema, Some(props))?;
+                let total_rows = batch.num_rows();
+                let chunk_size = 1_000_000;
+                for offset in (0..total_rows).step_by(chunk_size) {
+                    let len = (chunk_size).min(total_rows - offset);
+                    let slice = batch.slice(offset, len);
+                    writer.write(&slice)?;
+                }
+                writer.close()?;
+                info!(segment = %schema_id, "wrote parquet segment in {:?}", t_write.elapsed());
+                info!(segment = %schema_id, "segment total time {:?}", t_segment.elapsed());
+                Ok(())
+            }));
+        }
+
+        // Await all segment tasks
+        while let Some(res) = futures.next().await {
+            res??;
         }
     }
 
-    Ok(tables)
-}
-
-// Helper to avoid panic on invalid UTF-8 in filenames for logging
-fn clean_file_type(file_name: &str) -> String {
-    if file_name.to_lowercase().ends_with(".csv") {
-        "CSV".to_string()
-    } else {
-        Path::new(file_name)
-            .extension()
-            .and_then(|os_str| os_str.to_str())
-            .map(|s| s.to_uppercase())
-            .unwrap_or_else(|| "Unknown".to_string())
-    }
+    info!(
+        "async split_zip_to_parquet total time {:?}",
+        start_total.elapsed()
+    );
+    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use anyhow::Result;
-    use std::env;
-    use std::io::{Cursor, Write};
-    use std::time::Instant;
-    use tempfile::NamedTempFile;
+    use parquet::file::reader::SerializedFileReader;
+    use std::io::{Cursor, Read, Write};
+    use std::{env, fs::File};
+    use tempfile::{tempdir, NamedTempFile};
     use tracing_subscriber::{EnvFilter, FmtSubscriber};
-    use zip::write::FileOptions;
-    use zip::CompressionMethod; // For test logging
+    use zip::write::{ExtendedFileOptions, FileOptions};
+    use zip::CompressionMethod;
 
-    fn init_test_logging() {
-        // Initialize tracing for tests, if not already done globally
+    #[tokio::test]
+    async fn test_split_zip_to_parquet_async() -> Result<()> {
         let subscriber = FmtSubscriber::builder()
             .with_env_filter(
                 EnvFilter::try_from_default_env()
-                    .unwrap_or_else(|_| EnvFilter::new("info,nemscraper::process=debug")),
+                    .unwrap_or_else(|_| EnvFilter::new("info,nemscraper::history=trace")), // Adjust crate name if necessary
             )
-            .with_test_writer() // Redirect logs to the test output
+            .with_test_writer()
             .finish();
-        let _ = tracing::subscriber::set_global_default(subscriber); // Use `let _ =` to ignore errors if already set
-    }
+        let _ = tracing::subscriber::set_global_default(subscriber);
+        // Pick up external ZIP or build sample
+        let zip_path = if let Ok(path) = env::var("ZIP_PATH") {
+            PathBuf::from(path)
+        } else {
+            let sample = r##"C,SETP.WORLD,FPP_DCF,AEMO,PUBLIC,\"2024/12/14\",...\n\  I,FPP,FORECAST_DEFAULT_CF,1,UID,CON,ST_DT,EN_DT,VER,BID,REG,DCF,FLAG,TOTAL,UID\n\  D,FPP,FORECAST_DEFAULT_CF,1,X,Y,2024/12/22 00:00,2024/12/23 00:00,1,A,B,0.1,0,5,X\n\  D,FPP,FORECAST_DEFAULT_CF,1,X,Y,2024/12/22 01:00,2024/12/23 01:00,1,A,B,0.2,0,6,X\n\  I,FPP,FORECAST_RESIDUAL_DCF,1,CON,ST_DT,EN_DT,VER,BID,RES,FLAG,TOTAL\n\  D,FPP,FORECAST_RESIDUAL_DCF,1,Y,2024/12/22 00:00,2024/12/23 00:00,1,A,0.3,0,7\n\  D,FPP,FORECAST_RESIDUAL_DCF,1,Y,2024/12/22 01:00,2024/12/23 01:00,1,A,0.4,0,8"##;
+            let mut buf = Vec::new();
+            {
+                let mut zip = zip::ZipWriter::new(Cursor::new(&mut buf));
+                let options = FileOptions::<ExtendedFileOptions>::default()
+                    .compression_method(CompressionMethod::Stored);
+                zip.start_file("aemo.csv", options)?;
+                zip.write_all(sample.as_bytes())?;
+                zip.finish()?;
+            }
+            let tmp = NamedTempFile::new()?;
+            tmp.reopen()?.write_all(&buf)?;
+            tmp.path().to_path_buf()
+        };
 
-    #[test]
-    fn test_load_aemo_zip_example() -> Result<()> {
-        init_test_logging();
-        // build the exact example CSV you provided
-        let content = r#"C,SETP.WORLD,FPP_DCF,AEMO,PUBLIC,"2024/12/14",18:02:37,0000000443338900,FPP,0000000443338900
-I,FPP,FORECAST_DEFAULT_CF,1,FPP_UNITID,CONSTRAINTID,EFFECTIVE_START_DATETIME,EFFECTIVE_END_DATETIME,VERSIONNO,BIDTYPE,REGIONID,DEFAULT_CONTRIBUTION_FACTOR,DCF_REASON_FLAG,DCF_ABS_NEGATIVE_PERF_TOTAL,SETTLEMENTS_UNITID
-D,FPP,FORECAST_DEFAULT_CF,1,ADPBA1,F_I+GFT_TG_R5,"2024/12/22 00:05:00","2024/12/29 00:00:00",2,RAISEREG,SA1,-0.00011729,0,520.67692,ADPBA1
-D,FPP,FORECAST_DEFAULT_CF,1,ADPBA1,F_I+LREG_0210,"2024/12/22 00:05:00","2024/12/29 00:00:00",2,LOWERREG,SA1,-0.00035807,0,415.19675,ADPBA1
-I,FPP,FORECAST_RESIDUAL_DCF,1,CONSTRAINTID,EFFECTIVE_START_DATETIME,EFFECTIVE_END_DATETIME,VERSIONNO,BIDTYPE,RESIDUAL_DCF,RESIDUAL_DCF_REASON_FLAG,DCF_ABS_NEGATIVE_PERF_TOTAL
-D,FPP,FORECAST_RESIDUAL_DCF,1,F_I+GFT_TG_R5,"2024/12/22 00:05:00","2024/12/29 00:00:00",2,RAISEREG,-0.22384015,0,520.67692
-D,FPP,FORECAST_RESIDUAL_DCF,1,F_I+LREG_0210,"2024/12/22 00:05:00","2024/12/29 00:00:00",2,LOWERREG,-0.19742411,0,415.19675
-"#;
+        let out_dir = tempdir()?;
+        split_zip_to_parquet_async(&zip_path, out_dir.path()).await?;
 
-        // write ZIP
-        let mut buf = Vec::new();
-        {
-            let mut zip = zip::ZipWriter::new(Cursor::new(&mut buf));
-            let options: FileOptions<'_, ()> =
-                FileOptions::default().compression_method(CompressionMethod::Stored);
-            zip.start_file("aemo.csv", options)?;
-            zip.write_all(content.as_bytes())?;
-            zip.finish()?;
-        }
-
-        let mut tmp = NamedTempFile::new()?;
-        tmp.write_all(&buf)?;
-
-        // run loader
-        let tables = load_aemo_zip(tmp.path())?;
-
-        // we should get two schemas
-        assert_eq!(tables.len(), 2);
-        let default_cf = tables
-            .get("FPP_FORECAST_DEFAULT_CF")
-            .expect("FPP_FORECAST_DEFAULT_CF table not found");
-        let residual_dcf = tables
-            .get("FPP_FORECAST_RESIDUAL_DCF")
-            .expect("FPP_FORECAST_RESIDUAL_DCF table not found");
-
-        // Check effective month (from "C" row)
-        assert_eq!(default_cf.effective_month, "202412");
-        assert_eq!(residual_dcf.effective_month, "202412");
-
-        // correct headers?
-        assert_eq!(
-            default_cf.headers,
-            vec![
-                "FPP_UNITID",
-                "CONSTRAINTID",
-                "EFFECTIVE_START_DATETIME",
-                "EFFECTIVE_END_DATETIME",
-                "VERSIONNO",
-                "BIDTYPE",
-                "REGIONID",
-                "DEFAULT_CONTRIBUTION_FACTOR",
-                "DCF_REASON_FLAG",
-                "DCF_ABS_NEGATIVE_PERF_TOTAL",
-                "SETTLEMENTS_UNITID"
-            ]
-        );
-        assert_eq!(default_cf.rows.len(), 2); // Updated count based on provided sample
-
-        assert_eq!(
-            residual_dcf.headers,
-            vec![
-                "CONSTRAINTID",
-                "EFFECTIVE_START_DATETIME",
-                "EFFECTIVE_END_DATETIME",
-                "VERSIONNO",
-                "BIDTYPE",
-                "RESIDUAL_DCF",
-                "RESIDUAL_DCF_REASON_FLAG",
-                "DCF_ABS_NEGATIVE_PERF_TOTAL"
-            ]
-        );
-        assert_eq!(residual_dcf.rows.len(), 2); // Updated count
-
-        Ok(())
-    }
-
-    /// Benchmark test: set ZIP_PATH to your real file and run with `-- --nocapture`
-    #[test]
-    fn bench_load_aemo_zip() -> Result<()> {
-        init_test_logging();
-
-        // ZIP_PATH should point to an actual AEMO ZIP on your filesystem:
-        let zip_path_str =
-            env::var("ZIP_PATH").expect("Please set ZIP_PATH env var to the path of your ZIP file");
-        let zip_path = std::path::Path::new(&zip_path_str);
-
-        println!("→ Loading ZIP: {}", zip_path.display());
-        let start = Instant::now();
-        let tables = load_aemo_zip(zip_path)
-            .with_context(|| format!("Failed to load ZIP at {}", zip_path.display()))?;
-        let elapsed = start.elapsed();
-
-        println!(
-            "✔ load_aemo_zip({}) extracted {} tables in {:?}",
-            zip_path.display(),
-            tables.len(),
-            elapsed
-        );
+        // Verify at least one parquet file created
+        let files: Vec<_> = std::fs::read_dir(out_dir.path())?
+            .filter_map(|e| e.ok().map(|e| e.path()))
+            .filter(|p| p.extension().and_then(|s| s.to_str()) == Some("parquet"))
+            .collect();
+        assert!(!files.is_empty(), "no parquet files produced");
         Ok(())
     }
 }

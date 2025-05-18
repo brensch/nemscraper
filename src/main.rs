@@ -167,37 +167,37 @@ async fn main() -> anyhow::Result<()> {
                         let filename = zip_path.file_name().unwrap().to_string_lossy().to_string();
                         tracing::info!("Shard#{} processing {}", shard_id, filename);
 
-                        let tables = match process::load_aemo_zip(&zip_path) {
-                            Ok(t) => t,
-                            Err(e) => {
-                                tracing::error!("Unpack {} err: {}", filename, e);
-                                continue;
-                            }
-                        };
-                        let mut ok = true;
-                        for (tbl, raw) in &tables {
-                            if let Some(evo) =
-                                schema::find_schema_evolution(&lookup, tbl, &raw.effective_month)
-                            {
-                                let target = format!("{}_{}", evo.table_name, evo.fields_hash);
-                                if let Err(e) =
-                                    duck::insert_raw_table_data(&conn, &target, raw, &evo)
-                                {
-                                    tracing::error!("Insert {} failed: {}", target, e);
-                                    ok = false;
-                                }
-                            } else {
-                                tracing::warn!("No schema for {}@{}", tbl, raw.effective_month);
-                                ok = false;
-                            }
-                        }
-                        if ok {
-                            // history::record_processed_csv_data(&conn, &zip_path, &tables)
-                            //     .unwrap_or_else(|e| {
-                            //         tracing::error!("History rec err {}: {}", filename, e)
-                            //     });
-                            // let _ = fs::remove_file(&zip_path);
-                        }
+                        // let tables = match process::load_aemo_zip(&zip_path) {
+                        //     Ok(t) => t,
+                        //     Err(e) => {
+                        //         tracing::error!("Unpack {} err: {}", filename, e);
+                        //         continue;
+                        //     }
+                        // };
+                        // let mut ok = true;
+                        // for (tbl, raw) in &tables {
+                        //     if let Some(evo) =
+                        //         schema::find_schema_evolution(&lookup, tbl, &raw.effective_month)
+                        //     {
+                        //         let target = format!("{}_{}", evo.table_name, evo.fields_hash);
+                        //         if let Err(e) =
+                        //             duck::insert_raw_table_data(&conn, &target, raw, &evo)
+                        //         {
+                        //             tracing::error!("Insert {} failed: {}", target, e);
+                        //             ok = false;
+                        //         }
+                        //     } else {
+                        //         tracing::warn!("No schema for {}@{}", tbl, raw.effective_month);
+                        //         ok = false;
+                        //     }
+                        // }
+                        // if ok {
+                        // history::record_processed_csv_data(&conn, &zip_path, &tables)
+                        //     .unwrap_or_else(|e| {
+                        //         tracing::error!("History rec err {}: {}", filename, e)
+                        //     });
+                        // let _ = fs::remove_file(&zip_path);
+                        // }
                     }
                     Err((url, err)) => {
                         tracing::error!("Download error {}: {}", url, err);
