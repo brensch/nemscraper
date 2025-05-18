@@ -192,11 +192,11 @@ async fn main() -> anyhow::Result<()> {
                             }
                         }
                         if ok {
-                            history::record_processed_csv_data(&conn, &zip_path, &tables)
-                                .unwrap_or_else(|e| {
-                                    tracing::error!("History rec err {}: {}", filename, e)
-                                });
-                            let _ = fs::remove_file(&zip_path);
+                            // history::record_processed_csv_data(&conn, &zip_path, &tables)
+                            //     .unwrap_or_else(|e| {
+                            //         tracing::error!("History rec err {}: {}", filename, e)
+                            //     });
+                            // let _ = fs::remove_file(&zip_path);
                         }
                     }
                     Err((url, err)) => {

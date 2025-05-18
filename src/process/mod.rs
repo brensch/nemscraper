@@ -2,7 +2,12 @@
 use anyhow::{Context, Result};
 use csv::ReaderBuilder;
 
-use std::{collections::BTreeMap, fs::File, path::Path};
+use std::{
+    collections::{BTreeMap, HashMap},
+    fs::File,
+    io::{BufReader, Cursor, Read},
+    path::Path,
+};
 use tracing::{debug, trace, warn}; // Added tracing
 use zip::ZipArchive;
 
@@ -43,183 +48,94 @@ fn parse_date_to_yyyymm(date_str: &str) -> Option<String> {
 /// Returns a BTreeMap mapping schema names (e.g., "FORECAST_DEFAULT_CF") to RawTable data.
 #[tracing::instrument(level = "info", skip(zip_path), fields(path = %zip_path.as_ref().display()))]
 pub fn load_aemo_zip<P: AsRef<Path>>(zip_path: P) -> Result<BTreeMap<String, RawTable>> {
-    let path_display = zip_path.as_ref().display().to_string();
-    debug!("Opening ZIP file");
-    let file = File::open(zip_path.as_ref())
-        .with_context(|| format!("Failed to open ZIP file: {}", path_display))?;
+    // 1) Open the ZIP once
+    let file = File::open(&zip_path)
+        .with_context(|| format!("Failed to open ZIP file: {:?}", zip_path.as_ref()))?;
     let mut archive = ZipArchive::new(file)
-        .with_context(|| format!("Failed to read ZIP archive: {}", path_display))?;
+        .with_context(|| format!("Failed to read ZIP archive: {:?}", zip_path.as_ref()))?;
 
-    let mut tables: BTreeMap<String, RawTable> = BTreeMap::new();
-
+    // 2) Extract each .csv entry into memory, in archive order
+    let mut buffers: Vec<(String, Vec<u8>)> = Vec::with_capacity(archive.len());
     for i in 0..archive.len() {
-        let file_in_zip = archive.by_index(i).with_context(|| {
-            format!("Failed to get file at index {} in ZIP: {}", i, path_display)
+        let mut entry = archive.by_index(i).with_context(|| {
+            format!(
+                "Failed to access ZIP entry #{} in {:?}",
+                i,
+                zip_path.as_ref()
+            )
         })?;
+        let name = entry.name().to_string();
 
-        let file_name = file_in_zip.name().to_string(); // Get file name for logging
-        let file_processing_span =
-            tracing::debug_span!("csv_processing", zip_file_name = %file_name);
-        let _enter = file_processing_span.enter();
-
-        if file_in_zip.is_file() && file_name.to_lowercase().ends_with(".csv") {
-            trace!("Processing CSV file entry");
-            let mut rdr = ReaderBuilder::new()
-                .has_headers(false)
-                .flexible(true) // Handles varying numbers of fields if any
-                .from_reader(file_in_zip); // file_in_zip is consumed here
-
-            let mut current_schema_identifier: Option<String> = None;
-            let mut file_effective_month: Option<String> = None;
-
-            for (record_idx, result) in rdr.records().enumerate() {
-                let record = result.with_context(|| {
-                    format!(
-                        "Failed to read record {} from CSV '{}' in ZIP '{}'",
-                        record_idx, file_name, path_display
-                    )
-                })?;
-
-                trace!(
-                    record_num = record_idx,
-                    first_field = record.get(0).unwrap_or("N/A"),
-                    "Read record"
-                );
-
-                match record.get(0).map(|s| s.trim()) {
-                    Some("C") => {
-                        // "C" row, typically the first row. Extract file effective date.
-                        // Date is usually at record[6] (0-indexed). Example: "2024/12/14"
-                        if let Some(date_str) = record.get(5) {
-                            if let Some(yyyymm) = parse_date_to_yyyymm(date_str) {
-                                file_effective_month = Some(yyyymm);
-                                debug!(
-                                    effective_month =
-                                        file_effective_month.as_deref().unwrap_or("N/A"),
-                                    "Determined file effective month from 'C' row."
-                                );
-                            } else {
-                                warn!(
-                                    raw_date = date_str,
-                                    "Could not parse effective month from 'C' row date field."
-                                );
-                            }
-                        }
-                    }
-                    Some("I") => {
-                        // "I" row: Schema definition.
-                        // record[1]_record[2] is the schema name, record[4..] are column names.
-
-                        // get the schema name by concatenating record[1] and record[2]
-                        // record[1] is the schema type (e.g., "FPP")
-                        let schema_type =
-                            record.get(1).map(|s| s.trim().to_string()).ok_or_else(|| {
-                                warn!("'I' row missing schema type at index 1.");
-                                anyhow::anyhow!(
-                                    "'I' row missing schema type (index 1) in {}",
-                                    file_name
-                                )
-                            })?;
-                        // record[2] is the schema name (e.g., "FORECAST_DEFAULT_CF")
-                        let schema_name =
-                            record.get(2).map(|s| s.trim().to_string()).ok_or_else(|| {
-                                warn!("'I' row missing schema name at index 2.");
-                                anyhow::anyhow!(
-                                    "'I' row missing schema name (index 2) in {}",
-                                    file_name
-                                )
-                            })?;
-
-                        let schema_identifier = format!("{}_{}", schema_type, schema_name);
-
-                        let cols: Vec<String> = record
-                            .iter()
-                            .skip(4)
-                            .map(|s| s.trim().to_string())
-                            .collect();
-                        trace!(schema_identifier, num_cols = cols.len(), "Parsed 'I' row.");
-
-                        if file_effective_month.is_none() {
-                            warn!(schema_identifier, "'I' row encountered before a 'C' row or 'C' row date was unparsable. Effective month for this table is unknown.");
-                            // Decide on a fallback or skip. For now, we'll use a placeholder.
-                            // This situation should be rare if files are well-formed.
-                        }
-
-                        let table_effective_month = file_effective_month.clone().unwrap_or_else(|| {
-                            warn!(schema_identifier, "Using placeholder for effective_month due to missing 'C' row date.");
-                            "UNKNOWN_MONTH".to_string()
-                        });
-
-                        let table_entry =
-                            tables.entry(schema_identifier.clone()).or_insert_with(|| {
-                                debug!(
-                                    schema_identifier,
-                                    effective_month = table_effective_month,
-                                    "Creating new RawTable entry."
-                                );
-                                RawTable {
-                                    headers: Vec::new(), // Will be set below
-                                    rows: Vec::new(),
-                                    effective_month: table_effective_month,
-                                }
-                            });
-                        table_entry.headers = cols; // Overwrite/set headers
-
-                        // If the effective_month was determined *after* a previous 'I' row for the same schema name
-                        // (e.g. multiple CSVs for same table in one zip, or malformed single CSV), update it.
-                        // This logic assumes one effective_month per CSV file, taken from the first 'C' row.
-                        if let Some(ref month) = file_effective_month {
-                            if table_entry.effective_month == "UNKNOWN_MONTH"
-                                || table_entry.effective_month != *month
-                            {
-                                trace!(
-                                    schema_identifier,
-                                    old_month = table_entry.effective_month,
-                                    new_month = month,
-                                    "Updating effective_month for existing table entry."
-                                );
-                                table_entry.effective_month = month.clone();
-                            }
-                        }
-
-                        current_schema_identifier = Some(schema_identifier);
-                    }
-                    Some("D") => {
-                        // "D" row: Data row.
-                        if let Some(ref current_name) = current_schema_identifier {
-                            if let Some(table_entry) = tables.get_mut(current_name) {
-                                let row_data: Vec<String> =
-                                    record.iter().skip(4).map(|s| s.to_string()).collect(); // Keep original strings, don't trim yet
-                                table_entry.rows.push(row_data);
-                            } else {
-                                // This case should ideally not happen if "I" always precedes "D" for a schema.
-                                warn!(current_schema_name = current_name, "Encountered 'D' row for schema not yet initialized with an 'I' row. Skipping row.");
-                            }
-                        } else {
-                            warn!("Encountered 'D' row without a preceding 'I' row in the current CSV file. Skipping row.");
-                        }
-                    }
-                    _ => {
-                        // Other row types, or empty first field. Ignored.
-                        trace!(
-                            record_num = record_idx,
-                            first_field = record.get(0).unwrap_or("N/A"),
-                            "Ignoring row type or empty first field."
-                        );
-                    }
-                }
-            }
-        } else if file_in_zip.is_file() {
-            trace!(
-                file_type = clean_file_type(&file_name),
-                "Skipping non-CSV file entry."
-            );
+        if entry.is_file() && name.to_lowercase().ends_with(".csv") {
+            let mut buf = Vec::with_capacity(entry.size() as usize);
+            entry
+                .read_to_end(&mut buf)
+                .with_context(|| format!("Failed to read {} into memory", name))?;
+            buffers.push((name, buf));
         }
     }
-    debug!(
-        num_tables_extracted = tables.len(),
-        "Finished processing ZIP file."
-    );
+    // drop the archive (and its file handle) now that we've buffered everything
+    drop(archive);
+
+    // 3) Now parse each CSV buffer **in order**, preserving every row’s sequence
+    let mut tables: BTreeMap<String, RawTable> = BTreeMap::new();
+    for (file_name, data) in buffers {
+        let mut rdr = ReaderBuilder::new()
+            .has_headers(false)
+            .flexible(true) // keep this so records with different field-counts work
+            .from_reader(Cursor::new(data));
+
+        let mut current_schema: Option<String> = None;
+        let mut file_month: Option<String> = None;
+
+        for (idx, result) in rdr.records().enumerate() {
+            let record = result
+                .with_context(|| format!("CSV parse error in {} at record {}", file_name, idx))?;
+
+            match record.get(0).map(str::trim) {
+                Some("C") => {
+                    if let Some(ds) = record.get(5) {
+                        file_month = parse_date_to_yyyymm(ds);
+                    }
+                }
+                Some("I") => {
+                    let schema_id = {
+                        let t = record.get(1).unwrap().trim();
+                        let n = record.get(2).unwrap().trim();
+                        format!("{}_{}", t, n)
+                    };
+                    let cols: Vec<String> = record.iter().skip(4).map(|s| s.to_string()).collect();
+                    let month = file_month.clone().unwrap_or_else(|| "UNKNOWN_MONTH".into());
+
+                    // guaranteed to return you &mut RawTable (in order)
+                    let tbl = tables.entry(schema_id.clone()).or_insert_with(|| RawTable {
+                        headers: Vec::new(),
+                        rows: Vec::new(),
+                        effective_month: month.clone(),
+                    });
+
+                    // overwrite headers (once per I-row, in-order)
+                    tbl.headers = cols;
+                    current_schema = Some(schema_id);
+                }
+                Some("D") => {
+                    if let Some(ref schema_id) = current_schema {
+                        let row: Vec<String> =
+                            record.iter().skip(4).map(|s| s.to_string()).collect();
+                        tables
+                            .get_mut(schema_id)
+                            .expect("schema must exist")
+                            .rows
+                            .push(row);
+                    }
+                }
+                _ => {
+                    // skip blanks or other rows
+                }
+            }
+        }
+    }
+
     Ok(tables)
 }
 
