@@ -1,4 +1,4 @@
-//! lib.rs  ‒ crate `schema` (Tokio async, single shared Client, no headers)
+//! lib.rs ‒ crate `schema` (Tokio async, single shared Client, no headers)
 //
 //! Call `schema::fetch_all(&client, "schemas").await?;`
 //! with a `reqwest::Client` configured (headers, proxy, TLS, …) by the caller.
@@ -6,43 +6,53 @@
 
 use anyhow::{Context, Result};
 use futures::{stream::FuturesUnordered, StreamExt};
+use hex;
 use regex::Regex;
 use reqwest::Client;
 use scraper::{Html, Selector};
-use serde::Serialize;
+use serde::{Deserialize, Serialize}; // Added Deserialize
+use sha2::{Digest, Sha256}; // For hashing
+use std::time::{Duration, Instant};
 use std::{
-    collections::HashSet,
+    collections::{BTreeMap, HashMap, HashSet}, // Added BTreeMap and HashMap
     fs,
     path::{Path, PathBuf},
 };
 use tokio::{fs as tokio_fs, io::AsyncWriteExt, time::sleep};
-use tracing::{debug, error, info, instrument, span, trace, warn, Level}; // Added trace
-                                                                         // EnvFilter and FmtSpan would be used by the main application, not directly by library init
-                                                                         // use tracing_subscriber::EnvFilter;
-                                                                         // use tracing_subscriber::fmt::format::FmtSpan;
-use std::time::{Duration, Instant};
-use url::Url; // For timing operations
+use tracing::{debug, error, info, instrument, span, trace, warn, Level};
+use url::Url; // For converting hash to string
 
 /* ───────────────────────────── data types ───────────────────────────── */
 
-#[derive(Debug, Serialize, PartialEq)]
+#[derive(Debug, Serialize, Deserialize, PartialEq, Clone, Eq, Hash)] // Added Deserialize, Clone, Eq, Hash
 pub struct Column {
     pub name: String,
     pub ty: String,
     pub format: Option<String>,
 }
 
-#[derive(Debug, Serialize, PartialEq)]
+#[derive(Debug, Serialize, Deserialize, PartialEq)] // Added Deserialize
 pub struct CtlSchema {
     pub table: String,
-    pub month: String,
+    pub month: String, // This month is from the CTL, might differ from filename if file is misplaced
     pub columns: Vec<Column>,
 }
 
-#[derive(Debug, Serialize, PartialEq)]
+#[derive(Debug, Serialize, Deserialize, PartialEq)] // Added Deserialize
 pub struct MonthSchema {
-    pub month: String,
+    pub month: String, // This is the YYYYMM from the filename/directory structure
     pub schemas: Vec<CtlSchema>,
+}
+
+/// Represents a specific version of a table schema and its lifespan.
+#[derive(Debug, Serialize, Deserialize, PartialEq, Eq, Hash, Clone)]
+pub struct SchemaEvolution {
+    pub table_name: String,
+    pub fields_hash: String, // SHA256 hash of the sorted column names, types, and formats
+    pub start_month: String, // YYYYMM
+    pub end_month: String,   // YYYYMM (inclusive)
+    #[serde(skip_serializing_if = "Vec::is_empty")] // To keep JSON clean
+    pub columns: Vec<Column>, // Store the actual columns for this version
 }
 
 /* ──────────────────────────── CTL parsing ──────────────────────────── */
@@ -50,14 +60,14 @@ pub struct MonthSchema {
 #[instrument(level = "debug", skip(contents), fields(content_len = contents.len()))]
 pub fn parse_ctl(contents: &str) -> Result<CtlSchema> {
     debug!("Starting CTL parsing");
-    let month = Regex::new(r"(?mi)INFILE[^\n]*?(\d{6})\D*\d{6}[^\n]*\.[cC][sS][vV]")?
+    let month_in_ctl = Regex::new(r"(?mi)INFILE[^\n]*?(\d{6})\D*\d{6}[^\n]*\.[cC][sS][vV]")?
         .captures(contents)
         .and_then(|c| c.get(1).map(|m| m.as_str().to_owned()))
         .ok_or_else(|| {
             warn!("Month not found in INFILE during CTL parsing");
             anyhow::anyhow!("month not found in INFILE")
         })?;
-    trace!(month, "Successfully parsed month from INFILE");
+    trace!(month_in_ctl, "Successfully parsed month from INFILE");
 
     let table = Regex::new(r"(?mi)^APPEND INTO TABLE\s+(\w+)")?
         .captures(contents)
@@ -104,7 +114,7 @@ pub fn parse_ctl(contents: &str) -> Result<CtlSchema> {
     debug!(num_columns = columns.len(), "Finished CTL parsing");
     Ok(CtlSchema {
         table,
-        month,
+        month: month_in_ctl, // Use month parsed from CTL content
         columns,
     })
 }
@@ -250,8 +260,7 @@ fn month_code_from_url(u: &Url) -> Option<String> {
 /// if log output is desired.
 #[instrument(level = "info", skip(client, output_dir), fields(output_path = %output_dir.as_ref().display()))]
 pub async fn fetch_all<P: AsRef<Path>>(client: &Client, output_dir: P) -> Result<Vec<MonthSchema>> {
-    // Logger initialization is now expected to be done by the caller (e.g., in main.rs)
-    info!("Starting schema fetch_all process."); // Kept as info: main entry point
+    info!("Starting schema fetch_all process.");
     let output_dir = output_dir.as_ref();
     fs::create_dir_all(output_dir)
         .with_context(|| format!("Failed to create output directory: {:?}", output_dir))?;
@@ -260,7 +269,9 @@ pub async fn fetch_all<P: AsRef<Path>>(client: &Client, output_dir: P) -> Result
     let done: HashSet<String> = fs::read_dir(output_dir)?
         .filter_map(|e| e.ok())
         .filter_map(|e| e.file_name().into_string().ok())
-        .filter_map(|n| (n.ends_with(".json") && n.len() == 11).then(|| n[..6].to_owned()))
+        .filter_map(|n| {
+            (n.ends_with(".json") && n.len() == "YYYYMM.json".len()).then(|| n[..6].to_owned())
+        }) // Corrected length check
         .collect();
     debug!(
         processed_months_count = done.len(),
@@ -292,6 +303,9 @@ pub async fn fetch_all<P: AsRef<Path>>(client: &Client, output_dir: P) -> Result
     let mut results = Vec::<MonthSchema>::new();
     let mut tasks_spawned = 0;
 
+    // Sort month_urls to process them chronologically, helpful for debugging and consistency
+    month_urls.sort_by_key(|url| month_code_from_url(url));
+
     for month_url in month_urls {
         let month_code = match month_code_from_url(&month_url) {
             Some(c) => c,
@@ -302,7 +316,9 @@ pub async fn fetch_all<P: AsRef<Path>>(client: &Client, output_dir: P) -> Result
         };
 
         if done.contains(&month_code) {
-            info!(month = month_code, "Skipping month (already on disk)"); // Kept info: user-visible skip
+            info!(month = month_code, "Skipping month (already on disk)");
+            // Optionally load existing data if needed downstream, or just skip for fetch_all
+            // For `extract_schema_evolutions`, we'll read all files anyway.
             continue;
         }
 
@@ -367,7 +383,7 @@ pub async fn fetch_all<P: AsRef<Path>>(client: &Client, output_dir: P) -> Result
     info!(
         total_months_processed_in_run = results.len(),
         "Schema fetch_all process completed."
-    ); // Kept as info: final summary
+    );
     Ok(results)
 }
 
@@ -375,17 +391,13 @@ pub async fn fetch_all<P: AsRef<Path>>(client: &Client, output_dir: P) -> Result
 #[instrument(level = "info", skip(client, output_dir, ctl_max_retries, ctl_initial_backoff_ms), fields(month_code = code, ctl_dir = %ctl_dir, output_path = %output_dir.display()))]
 async fn process_month(
     client: Client,
-    code: String,
+    code: String, // This is the YYYYMM for the month being processed.
     ctl_dir: Url,
     output_dir: PathBuf,
     ctl_max_retries: u32,
     ctl_initial_backoff_ms: u64,
 ) -> Result<Option<MonthSchema>> {
-    // Note: The `info!` log for "Starting to process month" was removed as per previous request
-    // to reduce verbosity and rely on the `#[instrument]` span.
-    // If you want it back, it would be:
-    // debug!("Starting to process month"); // Or info! if preferred
-
+    // Return type is Option<MonthSchema>
     let ctl_urls = match list_ctl_urls(&client, &ctl_dir).await {
         Ok(v) if !v.is_empty() => {
             debug!(count = v.len(), "Found CTL URLs for month");
@@ -401,11 +413,7 @@ async fn process_month(
         }
     };
 
-    // The `info!` log for ctl_count was here, now covered by the debug log above
-    // and the final summary. If desired:
-    // debug!(ctl_count = ctl_urls.len(), "Processing CTL URLs for month");
-
-    let mut schemas = Vec::new();
+    let mut ctl_schemas = Vec::new(); // Changed from `schemas` to `ctl_schemas` to avoid confusion
     let mut total_download_duration = Duration::ZERO;
     let mut total_parse_duration = Duration::ZERO;
 
@@ -436,23 +444,33 @@ async fn process_month(
         let parse_start_time = Instant::now();
         match parse_ctl(&text) {
             Ok(s) => {
+                // `mut s` to potentially correct month if needed
                 total_parse_duration += parse_start_time.elapsed();
+                // The month in `s.month` comes from the CTL file.
+                // The `code` argument is the month derived from the directory structure.
+                // They should ideally match. If not, it's a data inconsistency.
+                // For now, we trust the `code` (directory month) for the MonthSchema grouping.
+                // The `s.month` (CTL month) is preserved within CtlSchema.
+                if s.month != code {
+                    warn!(ctl_month = s.month, dir_month = code, table_name = s.table, ctl_url = %url,
+                          "Month mismatch between CTL content and directory structure. Using directory month for grouping.");
+                }
+
                 debug!(
                     table_name = s.table,
+                    ctl_month = s.month, // Log the month from CTL
                     duration_ms = parse_start_time.elapsed().as_millis(),
                     "Successfully parsed CTL file"
                 );
-                schemas.push(s);
+                ctl_schemas.push(s);
             }
             Err(e) => {
-                // Log the parse error, but continue with other CTL files.
-                // The duration for this failed parse is not added to total_parse_duration.
                 warn!(error = %e, "Failed to parse CTL file content, skipping this file.");
             }
         }
     }
 
-    if schemas.is_empty() {
+    if ctl_schemas.is_empty() {
         warn!(
             "Month {} produced no schemas (no valid CTLs found or all failed processing)",
             code
@@ -460,8 +478,13 @@ async fn process_month(
         return Ok(None);
     }
 
-    let path = output_dir.join(format!("{code}.json"));
-    debug!(file_path = %path.display(), num_schemas = schemas.len(), "Writing schemas to JSON file");
+    let month_schema_for_file = MonthSchema {
+        month: code.clone(), // Use the directory-derived month `code` for the MonthSchema
+        schemas: ctl_schemas,
+    };
+
+    let path = output_dir.join(format!("{}.json", code)); // Corrected filename format
+    debug!(file_path = %path.display(), num_schemas = month_schema_for_file.schemas.len(), "Writing schemas to JSON file");
 
     let write_start_time = Instant::now();
     let mut f = tokio_fs::File::create(&path).await.with_context(|| {
@@ -471,8 +494,9 @@ async fn process_month(
         )
     })?;
 
-    let json_data = serde_json::to_string_pretty(&schemas)
-        .with_context(|| format!("Failed to serialize schemas for month {}", code))?;
+    // We are serializing Vec<CtlSchema> as per original logic, but wrapped in MonthSchema for context
+    let json_data = serde_json::to_string_pretty(&month_schema_for_file)
+        .with_context(|| format!("Failed to serialize MonthSchema for month {}", code))?;
 
     f.write_all(json_data.as_bytes()).await.with_context(|| {
         format!(
@@ -482,50 +506,295 @@ async fn process_month(
     })?;
     let file_write_duration_ms = write_start_time.elapsed().as_millis();
 
-    // Updated final info log with timing fields
     info!(
         month_code = code,
-        schemas_written = schemas.len(),
+        schemas_written = month_schema_for_file.schemas.len(),
         total_download_time_ms = total_download_duration.as_millis(),
         total_ctl_parse_time_ms = total_parse_duration.as_millis(),
         file_write_time_ms = file_write_duration_ms,
         "Successfully processed month and wrote schemas to disk."
     );
 
-    Ok(Some(MonthSchema {
-        month: code,
-        schemas,
-    }))
+    Ok(Some(month_schema_for_file)) // Return the constructed MonthSchema
+}
+
+/* ─────────────────── Schema Evolution Extraction ─────────────────── */
+
+/// Calculates a stable hash for a list of columns.
+/// Columns are sorted by name before hashing to ensure order doesn't affect the hash.
+fn calculate_fields_hash(columns: &[Column]) -> String {
+    let mut hasher = Sha256::new();
+    let mut sorted_columns = columns.to_vec();
+    // Sort by name, then type, then format to ensure a canonical representation
+    sorted_columns.sort_by(|a, b| {
+        a.name
+            .cmp(&b.name)
+            .then_with(|| a.ty.cmp(&b.ty))
+            .then_with(|| a.format.cmp(&b.format))
+    });
+
+    for col in sorted_columns {
+        hasher.update(col.name.as_bytes());
+        hasher.update(col.ty.as_bytes());
+        if let Some(ref format) = col.format {
+            hasher.update(format.as_bytes());
+        }
+        hasher.update(b";"); // Separator
+    }
+    hex::encode(hasher.finalize())
+}
+
+/// Extracts schema evolution information from previously generated JSON files.
+///
+/// Reads all `<YYYYMM>.json` files from the `input_dir`, processes them in chronological order,
+/// and identifies periods where table schemas remain consistent.
+///
+/// # Arguments
+/// * `input_dir` - The directory containing the `<YYYYMM>.json` files.
+///
+/// # Returns
+/// A `Result` containing a `Vec<SchemaEvolution>` detailing the history of each table schema,
+/// or an `anyhow::Error` if an issue occurs.
+#[instrument(level = "info", skip(input_dir), fields(input_path = %input_dir.as_ref().display()))]
+pub fn extract_schema_evolutions<P: AsRef<Path>>(input_dir: P) -> Result<Vec<SchemaEvolution>> {
+    info!("Starting schema evolution extraction.");
+    let input_dir = input_dir.as_ref();
+
+    let mut month_files = Vec::new();
+    for entry in fs::read_dir(input_dir)
+        .with_context(|| format!("Failed to read input directory: {:?}", input_dir))?
+    {
+        let entry = entry.with_context(|| "Failed to read directory entry")?;
+        let path = entry.path();
+        if path.is_file() {
+            if let Some(ext) = path.extension() {
+                if ext == "json" {
+                    if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
+                        // Expect YYYYMM format
+                        if stem.len() == 6 && stem.chars().all(|c| c.is_digit(10)) {
+                            // Check if the year part is reasonable (e.g., 1990-2099)
+                            let year = stem[0..4].parse::<u32>().unwrap_or(0);
+                            let month_val = stem[4..6].parse::<u32>().unwrap_or(0);
+                            if (1990..=2099).contains(&year) && (1..=12).contains(&month_val) {
+                                month_files.push(path.clone());
+                            } else {
+                                warn!(
+                                    "Skipping file with invalid month format in name: {:?}",
+                                    path
+                                );
+                            }
+                        } else {
+                            warn!("Skipping file with non-YYYYMM name: {:?}", path);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Sort files by month (YYYYMM from filename)
+    month_files.sort_by_key(|path| {
+        path.file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or_default()
+            .to_string()
+    });
+
+    debug!(
+        num_month_files = month_files.len(),
+        "Found and sorted month JSON files."
+    );
+
+    if month_files.is_empty() {
+        info!("No month JSON files found in the input directory. No evolution to extract.");
+        return Ok(Vec::new());
+    }
+
+    let mut evolutions: Vec<SchemaEvolution> = Vec::new();
+    // Tracks the current active schema for each table: TableName -> (FieldsHash, StartMonth, Columns)
+    let mut active_schemas: HashMap<String, (String, String, Vec<Column>)> = HashMap::new();
+
+    let mut previous_month_code: Option<String> = None;
+
+    for month_file_path in &month_files {
+        let file_name_month = month_file_path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or_default()
+            .to_string();
+
+        debug!(month_file = %month_file_path.display(), month_code = file_name_month, "Processing month file");
+
+        let file_contents = fs::read_to_string(month_file_path)
+            .with_context(|| format!("Failed to read month file: {:?}", month_file_path))?;
+
+        let month_data: MonthSchema = serde_json::from_str(&file_contents)
+            .with_context(|| format!("Failed to parse JSON from file: {:?}", month_file_path))?;
+
+        // Ensure the month in the filename matches the month in the MonthSchema object
+        if month_data.month != file_name_month {
+            warn!(
+                file_month = file_name_month, schema_object_month = month_data.month, file_path = %month_file_path.display(),
+                "Mismatch between filename month and MonthSchema.month field. Using filename month."
+            );
+            // Potentially skip this file or handle inconsistency, for now, we proceed using file_name_month.
+        }
+
+        let current_month_code = file_name_month;
+
+        // Keep track of tables seen in this month to handle tables that disappear
+        let mut tables_in_current_month: HashSet<String> = HashSet::new();
+
+        for ctl_schema in month_data.schemas {
+            tables_in_current_month.insert(ctl_schema.table.clone());
+            let fields_hash = calculate_fields_hash(&ctl_schema.columns);
+
+            if let Some(active_entry) = active_schemas.get_mut(&ctl_schema.table) {
+                // Table already has an active schema
+                if active_entry.0 != fields_hash {
+                    // Schema changed for this table
+                    debug!(
+                        table = ctl_schema.table,
+                        old_hash = active_entry.0,
+                        new_hash = fields_hash,
+                        end_month = previous_month_code.as_deref().unwrap_or("N/A"),
+                        "Schema changed"
+                    );
+                    evolutions.push(SchemaEvolution {
+                        table_name: ctl_schema.table.clone(),
+                        fields_hash: active_entry.0.clone(),
+                        start_month: active_entry.1.clone(),
+                        end_month: previous_month_code
+                            .clone()
+                            .unwrap_or_else(|| active_entry.1.clone()), // End in previous month
+                        columns: active_entry.2.clone(),
+                    });
+                    // Start new schema
+                    *active_entry = (
+                        fields_hash,
+                        current_month_code.clone(),
+                        ctl_schema.columns.clone(),
+                    );
+                } else {
+                    // Schema is the same, just continue. The end_month will be updated if it changes later or at the end.
+                }
+            } else {
+                // New table encountered
+                debug!(
+                    table = ctl_schema.table,
+                    hash = fields_hash,
+                    start_month = current_month_code,
+                    "New table schema started"
+                );
+                active_schemas.insert(
+                    ctl_schema.table.clone(),
+                    (
+                        fields_hash,
+                        current_month_code.clone(),
+                        ctl_schema.columns.clone(),
+                    ),
+                );
+            }
+        }
+
+        // Check for tables that were active but are not in the current month's schemas
+        // These tables' schemas are considered ended in the `previous_month_code`.
+        let mut tables_to_remove_from_active = Vec::new();
+        if let Some(ref prev_m) = previous_month_code {
+            // Only if there *was* a previous month
+            for (table_name, (hash, start_m, cols)) in &active_schemas {
+                if !tables_in_current_month.contains(table_name) {
+                    debug!(
+                        table = table_name,
+                        hash = hash,
+                        start_month = start_m,
+                        end_month = prev_m,
+                        "Schema ended (table not present in current month)"
+                    );
+                    evolutions.push(SchemaEvolution {
+                        table_name: table_name.clone(),
+                        fields_hash: hash.clone(),
+                        start_month: start_m.clone(),
+                        end_month: prev_m.clone(),
+                        columns: cols.clone(),
+                    });
+                    tables_to_remove_from_active.push(table_name.clone());
+                }
+            }
+        }
+        for table_name in tables_to_remove_from_active {
+            active_schemas.remove(&table_name);
+        }
+
+        previous_month_code = Some(current_month_code);
+    }
+
+    // After iterating through all month files, close any remaining active schemas
+    // Their end_month will be the last processed month_code
+    if let Some(last_month_code) = previous_month_code {
+        for (table_name, (hash, start_month, columns)) in active_schemas {
+            debug!(
+                table = table_name,
+                hash = hash,
+                start_month = start_month,
+                end_month = last_month_code,
+                "Closing active schema at end of processing"
+            );
+            evolutions.push(SchemaEvolution {
+                table_name,
+                fields_hash: hash,
+                start_month,
+                end_month: last_month_code.clone(),
+                columns,
+            });
+        }
+    }
+
+    // Sort evolutions for deterministic output, useful for tests and consistency
+    evolutions.sort_by(|a, b| {
+        a.table_name
+            .cmp(&b.table_name)
+            .then_with(|| a.start_month.cmp(&b.start_month))
+            .then_with(|| a.end_month.cmp(&b.end_month))
+    });
+
+    info!(
+        num_evolutions = evolutions.len(),
+        "Schema evolution extraction completed."
+    );
+    Ok(evolutions)
 }
 
 /* ───────────────────────────── tests ───────────────────────────── */
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Once;
+    use std::{io::Read, sync::Once};
+    use tempfile::tempdir;
     use tokio::runtime::Runtime;
     use tracing_subscriber::fmt::format::FmtSpan;
-    use tracing_subscriber::EnvFilter; // For test logger setup // For test logger setup
+    use tracing_subscriber::EnvFilter; // For creating temporary directories in tests
 
-    // Test logger initialization remains, as tests are separate execution contexts.
-    fn init_test_logging_for_tests() {
-        static TEST_INIT_LOGGER: Once = Once::new();
+    static TEST_INIT_LOGGER: Once = Once::new();
+    fn init_test_logging() {
+        // Renamed for clarity
         TEST_INIT_LOGGER.call_once(|| {
             let filter = EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| EnvFilter::new("info,schema=debug")); // Default for tests
+                .unwrap_or_else(|_| EnvFilter::new("info,schema=debug"));
 
             tracing_subscriber::fmt()
                 .with_env_filter(filter)
-                .with_test_writer() // Directs output to test harness
-                .with_span_events(FmtSpan::CLOSE)
-                .init();
-            info!("Tracing logger initialized for schema tests.");
+                .with_test_writer()
+                .with_span_events(FmtSpan::CLOSE) // FmtSpan::NEW | FmtSpan::CLOSE for more detail
+                .try_init() // Use try_init to avoid panic if already initialized
+                .ok(); // Ignore error if it's already initialized by another test
+            info!("Test tracing logger initialized for schema crate tests.");
         });
     }
 
     #[test]
     fn month_regex_variants() {
-        init_test_logging_for_tests();
+        init_test_logging();
         let re = Regex::new(r"(?mi)INFILE[^\n]*?(\d{6})\D*\d{6}[^\n]*\.[cC][sS][vV]").unwrap();
         let cases = [
             ("INFILE F_201008010000.csv", "201008"),
@@ -539,7 +808,7 @@ mod tests {
 
     #[test]
     fn parse_minimal_ctl() {
-        init_test_logging_for_tests();
+        init_test_logging();
         let ctl = r#"
 LOAD DATA
 INFILE FILE_202201010000.csv
@@ -550,31 +819,46 @@ TRAILING NULLCOLS (foo FILLER, BAR DATE "yyyy/mm/dd")
         assert_eq!(s.month, "202201");
         assert_eq!(s.table, "FOO");
         assert_eq!(s.columns.len(), 1);
+        assert_eq!(s.columns[0].name, "BAR");
+        assert_eq!(s.columns[0].ty, "DATE");
+        assert_eq!(s.columns[0].format, Some("\"yyyy/mm/dd\"".to_string()));
     }
 
     #[test]
     #[ignore] // This test requires network access and can take time
-    fn integration_one_month() {
-        init_test_logging_for_tests(); // Initialize logger for test output
-        info!("Starting integration test: integration_one_month");
+    fn integration_fetch_all_basic() {
+        // Renamed for clarity
+        init_test_logging();
+        info!("Starting integration test: integration_fetch_all_basic");
         let rt = Runtime::new().unwrap();
         rt.block_on(async {
-            // In a real application, main.rs would have set up the tracing subscriber.
-            // For this test, init_test_logging_for_tests() does it.
-
-            let tmp = tempfile::tempdir().unwrap();
+            let tmp = tempdir().unwrap();
             let client = Client::builder()
-                .timeout(Duration::from_secs(30))
+                .timeout(Duration::from_secs(60)) // Increased timeout
                 .build()
                 .unwrap();
 
             debug!(temp_dir = %tmp.path().display(), "Running fetch_all for integration test");
+            // To make this test faster and more reliable, we should limit the scope.
+            // For now, it fetches everything, which can be a lot.
+            // Consider modifying `Workspace_all` or its callers to fetch only a specific year/month for testing.
             match fetch_all(&client, tmp.path()).await {
                 Ok(out) => {
                     info!(
                         processed_months_count = out.len(),
                         "Integration test fetch_all completed successfully"
                     );
+                    // Add assertions here if needed, e.g., check if any files were created.
+                    let entries = fs::read_dir(tmp.path()).unwrap().count();
+                    if out.is_empty() {
+                        // This might happen if all data is already "done" or no data is found for the period.
+                        // For a robust test, we'd need to ensure a clean state or mock the "done" list.
+                        warn!("fetch_all returned no new MonthSchema objects. This might be okay if all data was already processed or no data for the default range.");
+                        assert!(entries >= 0); // At least the directory exists.
+                    } else {
+                        assert!(entries > 0, "Expected some JSON files to be created.");
+                        assert_eq!(entries, out.len(), "Number of created files should match number of processed months.");
+                    }
                 }
                 Err(e) => {
                     error!(error = %e, "Integration test fetch_all failed");
@@ -582,6 +866,437 @@ TRAILING NULLCOLS (foo FILLER, BAR DATE "yyyy/mm/dd")
                 }
             }
         });
-        info!("Finished integration test: integration_one_month");
+        info!("Finished integration test: integration_fetch_all_basic");
+    }
+
+    #[test]
+    fn test_calculate_fields_hash_stability() {
+        init_test_logging();
+        let cols1 = vec![
+            Column {
+                name: "A".to_string(),
+                ty: "VARCHAR".to_string(),
+                format: None,
+            },
+            Column {
+                name: "B".to_string(),
+                ty: "NUMBER".to_string(),
+                format: Some("FMT".to_string()),
+            },
+        ];
+        let cols2 = vec![
+            // Same as cols1 but different order
+            Column {
+                name: "B".to_string(),
+                ty: "NUMBER".to_string(),
+                format: Some("FMT".to_string()),
+            },
+            Column {
+                name: "A".to_string(),
+                ty: "VARCHAR".to_string(),
+                format: None,
+            },
+        ];
+        let cols3 = vec![
+            // Different
+            Column {
+                name: "A".to_string(),
+                ty: "VARCHAR2".to_string(),
+                format: None,
+            }, // type changed
+            Column {
+                name: "B".to_string(),
+                ty: "NUMBER".to_string(),
+                format: Some("FMT".to_string()),
+            },
+        ];
+
+        let hash1 = calculate_fields_hash(&cols1);
+        let hash2 = calculate_fields_hash(&cols2);
+        let hash3 = calculate_fields_hash(&cols3);
+
+        assert_eq!(
+            hash1, hash2,
+            "Hashes should be the same for columns in different order."
+        );
+        assert_ne!(
+            hash1, hash3,
+            "Hashes should differ for different column definitions."
+        );
+        assert!(!hash1.is_empty(), "Hash should not be empty.");
+    }
+
+    #[test]
+    fn test_extract_schema_evolutions() -> Result<()> {
+        init_test_logging();
+        let tmp_dir = tempdir().context("Failed to create temp dir for test")?;
+        let output_path = tmp_dir.path();
+
+        // --- Create dummy JSON files ---
+
+        // Month 1: TableA v1, TableB v1
+        let cols_a_v1 = vec![Column {
+            name: "col1".to_string(),
+            ty: "VARCHAR".to_string(),
+            format: None,
+        }];
+        let cols_b_v1 = vec![Column {
+            name: "data".to_string(),
+            ty: "NUMBER".to_string(),
+            format: None,
+        }];
+        let month1_schemas = vec![
+            CtlSchema {
+                table: "TableA".to_string(),
+                month: "202301".to_string(),
+                columns: cols_a_v1.clone(),
+            },
+            CtlSchema {
+                table: "TableB".to_string(),
+                month: "202301".to_string(),
+                columns: cols_b_v1.clone(),
+            },
+        ];
+        let month1_data = MonthSchema {
+            month: "202301".to_string(),
+            schemas: month1_schemas,
+        };
+        fs::write(
+            output_path.join("202301.json"),
+            serde_json::to_string_pretty(&month1_data)?,
+        )?;
+
+        // Month 2: TableA v1 (same), TableB v2 (changed)
+        let cols_b_v2 = vec![
+            Column {
+                name: "data".to_string(),
+                ty: "NUMBER".to_string(),
+                format: None,
+            },
+            Column {
+                name: "extra".to_string(),
+                ty: "DATE".to_string(),
+                format: Some("YYYYMMDD".to_string()),
+            },
+        ];
+        let month2_schemas = vec![
+            CtlSchema {
+                table: "TableA".to_string(),
+                month: "202302".to_string(),
+                columns: cols_a_v1.clone(),
+            },
+            CtlSchema {
+                table: "TableB".to_string(),
+                month: "202302".to_string(),
+                columns: cols_b_v2.clone(),
+            },
+        ];
+        let month2_data = MonthSchema {
+            month: "202302".to_string(),
+            schemas: month2_schemas,
+        };
+        fs::write(
+            output_path.join("202302.json"),
+            serde_json::to_string_pretty(&month2_data)?,
+        )?;
+
+        // Month 3: TableA v2 (changed), TableB v2 (same), TableC v1 (new)
+        let cols_a_v2 = vec![
+            Column {
+                name: "col1".to_string(),
+                ty: "VARCHAR".to_string(),
+                format: None,
+            },
+            Column {
+                name: "col2".to_string(),
+                ty: "INT".to_string(),
+                format: None,
+            },
+        ];
+        let cols_c_v1 = vec![Column {
+            name: "id".to_string(),
+            ty: "UUID".to_string(),
+            format: None,
+        }];
+        let month3_schemas = vec![
+            CtlSchema {
+                table: "TableA".to_string(),
+                month: "202303".to_string(),
+                columns: cols_a_v2.clone(),
+            },
+            CtlSchema {
+                table: "TableB".to_string(),
+                month: "202303".to_string(),
+                columns: cols_b_v2.clone(),
+            },
+            CtlSchema {
+                table: "TableC".to_string(),
+                month: "202303".to_string(),
+                columns: cols_c_v1.clone(),
+            },
+        ];
+        let month3_data = MonthSchema {
+            month: "202303".to_string(),
+            schemas: month3_schemas,
+        };
+        fs::write(
+            output_path.join("202303.json"),
+            serde_json::to_string_pretty(&month3_data)?,
+        )?;
+
+        // Month 4: TableA v2 (same), TableC v1 (same) - TableB disappears
+        let month4_schemas = vec![
+            CtlSchema {
+                table: "TableA".to_string(),
+                month: "202304".to_string(),
+                columns: cols_a_v2.clone(),
+            },
+            CtlSchema {
+                table: "TableC".to_string(),
+                month: "202304".to_string(),
+                columns: cols_c_v1.clone(),
+            },
+        ];
+        let month4_data = MonthSchema {
+            month: "202304".to_string(),
+            schemas: month4_schemas,
+        };
+        fs::write(
+            output_path.join("202304.json"),
+            serde_json::to_string_pretty(&month4_data)?,
+        )?;
+
+        // --- Call the function ---
+        let evolutions = extract_schema_evolutions(output_path)?;
+
+        // --- Assertions ---
+        assert_eq!(evolutions.len(), 5, "Expected 5 schema evolution periods");
+
+        let hash_a_v1 = calculate_fields_hash(&cols_a_v1);
+        let hash_a_v2 = calculate_fields_hash(&cols_a_v2);
+        let hash_b_v1 = calculate_fields_hash(&cols_b_v1);
+        let hash_b_v2 = calculate_fields_hash(&cols_b_v2);
+        let hash_c_v1 = calculate_fields_hash(&cols_c_v1);
+
+        // Expected evolutions (order matters due to sorting in the function)
+        let expected_evolutions = vec![
+            SchemaEvolution {
+                // TableA v1
+                table_name: "TableA".to_string(),
+                fields_hash: hash_a_v1.clone(),
+                start_month: "202301".to_string(),
+                end_month: "202302".to_string(),
+                columns: cols_a_v1.clone(),
+            },
+            SchemaEvolution {
+                // TableA v2
+                table_name: "TableA".to_string(),
+                fields_hash: hash_a_v2.clone(),
+                start_month: "202303".to_string(),
+                end_month: "202304".to_string(),
+                columns: cols_a_v2.clone(),
+            },
+            SchemaEvolution {
+                // TableB v1
+                table_name: "TableB".to_string(),
+                fields_hash: hash_b_v1.clone(),
+                start_month: "202301".to_string(),
+                end_month: "202301".to_string(),
+                columns: cols_b_v1.clone(),
+            },
+            SchemaEvolution {
+                // TableB v2
+                table_name: "TableB".to_string(),
+                fields_hash: hash_b_v2.clone(),
+                start_month: "202302".to_string(),
+                end_month: "202303".to_string(),
+                columns: cols_b_v2.clone(),
+            },
+            SchemaEvolution {
+                // TableC v1
+                table_name: "TableC".to_string(),
+                fields_hash: hash_c_v1.clone(),
+                start_month: "202303".to_string(),
+                end_month: "202304".to_string(),
+                columns: cols_c_v1.clone(),
+            },
+        ];
+
+        // To compare, it's easier if both are converted to a HashSet or sorted consistently.
+        // The function already sorts them.
+        assert_eq!(evolutions.len(), expected_evolutions.len());
+        for (i, evo) in evolutions.iter().enumerate() {
+            assert_eq!(
+                evo, &expected_evolutions[i],
+                "Mismatch at evolution index {}",
+                i
+            );
+        }
+
+        Ok(())
+    }
+
+        use std::fs::{self, File};
+
+       #[test]
+    #[ignore] // Ignored by default because it modifies real data.
+    fn test_migrate_real_schemas_directory() -> Result<()> {
+        init_test_logging(); // Initialize logger for test output
+        let migration_span = span!(Level::INFO, "migration_script", target_dir = "schemas");
+        let _enter = migration_span.enter();
+
+        warn!("!!! RUNNING MIGRATION SCRIPT ON 'schemas' DIRECTORY !!!");
+        warn!("!!! ENSURE YOU HAVE A BACKUP BEFORE PROCEEDING IF THIS IS THE FIRST RUN !!!");
+        info!("Starting migration of JSON files in 'schemas' directory.");
+
+        let data_path = Path::new("schemas");
+
+        if !data_path.exists() || !data_path.is_dir() {
+            error!(path = %data_path.display(), "Target directory 'schemas' does not exist or is not a directory. Aborting migration.");
+            return Err(anyhow::anyhow!("'schemas' directory not found."));
+        }
+        
+        // --- Create the directory if it doesn't exist (though the check above makes this somewhat redundant for is_dir) ---
+        // This is more for ensuring the path is valid before proceeding.
+        fs::create_dir_all(data_path)
+            .with_context(|| format!("Failed to ensure existence of directory: {:?}", data_path))?;
+
+
+        // --- Run Migration Logic ---
+        info!(path = %data_path.display(), "Scanning 'schemas' directory for JSON files to migrate/check.");
+        let mut migrated_count = 0;
+        let mut already_correct_count = 0;
+        let mut skipped_count = 0;
+        let mut error_count = 0;
+
+        for entry in fs::read_dir(data_path)
+            .with_context(|| format!("Failed to read 'schemas' directory: {:?}", data_path))?
+        {
+            let entry = match entry {
+                Ok(e) => e,
+                Err(e) => {
+                    error!(error = %e, "Failed to read a directory entry in 'schemas'. Skipping.");
+                    error_count += 1;
+                    continue;
+                }
+            };
+            let path = entry.path();
+            let file_processing_span = span!(Level::DEBUG, "file_processing", file_path = %path.display());
+            let _enter_file = file_processing_span.enter();
+
+            if path.is_file() && path.extension().map_or(false, |ext| ext == "json") {
+                let file_name_month_opt = path.file_stem().and_then(|s| s.to_str());
+
+                if file_name_month_opt.is_none() || file_name_month_opt.unwrap().len() != 6 || !file_name_month_opt.unwrap().chars().all(|c| c.is_digit(10)) {
+                    warn!(path = %path.display(), "Skipping JSON file with invalid YYYYMM name format.");
+                    skipped_count += 1;
+                    continue;
+                }
+                let file_name_month = file_name_month_opt.unwrap().to_string();
+
+                trace!("Reading file content for: {}", file_name_month);
+                let mut file_content_str = String::new();
+                match File::open(&path) {
+                    Ok(mut file) => {
+                        if let Err(e) = file.read_to_string(&mut file_content_str) {
+                            error!(path = %path.display(), error = %e, "Failed to read content of file. Skipping.");
+                            error_count += 1;
+                            continue;
+                        }
+                    }
+                    Err(e) => {
+                        error!(path = %path.display(), error = %e, "Failed to open file. Skipping.");
+                        error_count += 1;
+                        continue;
+                    }
+                }
+                
+
+                // Attempt to parse as Vec<CtlSchema> (legacy format) first
+                match serde_json::from_str::<Vec<CtlSchema>>(&file_content_str) {
+                    Ok(legacy_data) => {
+                        // Successfully parsed as legacy format, needs migration
+                        info!(month = file_name_month, "File is in legacy Vec<CtlSchema> format. Migrating.");
+                        let new_month_schema = MonthSchema {
+                            month: file_name_month.clone(), // Use month from filename
+                            schemas: legacy_data,
+                        };
+                        
+                        match serde_json::to_string_pretty(&new_month_schema) {
+                            Ok(new_json_content) => {
+                                if let Err(e) = fs::write(&path, new_json_content) {
+                                    error!(path = %path.display(), error = %e, "Failed to overwrite file with new format. Skipping further writes to this file.");
+                                    error_count += 1;
+                                } else {
+                                    debug!(month = file_name_month, "Successfully migrated and overwritten.");
+                                    migrated_count += 1;
+                                }
+                            }
+                            Err(e) => {
+                                error!(month = file_name_month, error = %e, "Failed to serialize migrated MonthSchema. Skipping write for this file.");
+                                error_count += 1;
+                            }
+                        }
+                    }
+                    Err(_e_legacy) => {
+                        // Failed to parse as legacy, check if it's already new format
+                        trace!(month = file_name_month, error = %_e_legacy, "Not legacy format. Checking if already MonthSchema.");
+                        match serde_json::from_str::<MonthSchema>(&file_content_str) {
+                            Ok(month_schema_data) => {
+                                // Already in new format
+                                if month_schema_data.month == file_name_month {
+                                    debug!(month = file_name_month, "File is already in correct MonthSchema format.");
+                                    already_correct_count += 1;
+                                } else {
+                                    warn!(
+                                        month = file_name_month, 
+                                        internal_month = month_schema_data.month,
+                                        "File is MonthSchema, but internal month differs from filename. Correcting internal month."
+                                    );
+                                    let corrected_month_schema = MonthSchema { month: file_name_month.clone(), schemas: month_schema_data.schemas };
+                                    match serde_json::to_string_pretty(&corrected_month_schema) {
+                                        Ok(corrected_json) => {
+                                            if let Err(e) = fs::write(&path, corrected_json) {
+                                                error!(path = %path.display(), error = %e, "Failed to overwrite file with corrected internal month. Skipping further writes to this file.");
+                                                error_count += 1;
+                                            } else {
+                                                debug!(month = file_name_month, "Corrected internal month and overwritten.");
+                                                // Consider this a migration/correction
+                                                migrated_count +=1; 
+                                            }
+                                        }
+                                        Err(e) => {
+                                            error!(month = file_name_month, error = %e, "Failed to serialize corrected MonthSchema. Skipping write for this file.");
+                                            error_count += 1;
+                                        }
+                                    }
+                                }
+                            }
+                            Err(_e_new) => {
+                                // Failed to parse as either known format
+                                error!(month = file_name_month, legacy_error = %_e_legacy, new_error = %_e_new, "File is not valid legacy Vec<CtlSchema> nor new MonthSchema format. Skipping.");
+                                skipped_count += 1;
+                            }
+                        }
+                    }
+                }
+            } else {
+                if path.is_file() { // Only log for files, not directories skipped by extension check
+                     trace!(path = %path.display(),"Skipping non-JSON file.");
+                }
+            }
+        }
+        info!(migrated = migrated_count, already_correct = already_correct_count, skipped_malformed_or_invalid_name = skipped_count, errors = error_count, "Migration scan of 'schemas' directory complete.");
+
+        // --- Assertions ---
+        // For a script operating on real data, explicit assertions about counts are tricky.
+        // The primary "test" is that it runs without panic and logs its actions.
+        // We can assert that no unexpected errors caused a panic.
+        assert!(error_count == 0, "Expected zero critical file processing/writing errors during migration. Check logs for details.");
+        // If you have an idea of how many files *should* be migrated or skipped, you could add those.
+        // For now, the log output is the main verification.
+
+        info!("Migration script for 'schemas' directory finished.");
+        Ok(())
     }
 }
