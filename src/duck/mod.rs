@@ -413,10 +413,7 @@ pub fn insert_raw_table_data(
         }
     }
 
-    // 6) Flush everything
-    appender
-        .flush()
-        .with_context(|| format!("Failed to flush appender for table '{}'", duckdb_table_name))?;
+
     tracing::info!(
         inserted_rows = successfully_appended,
         total_rows = raw_table_data.rows.len(),

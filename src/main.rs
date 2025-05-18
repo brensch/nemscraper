@@ -5,6 +5,8 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::sync::{mpsc, Semaphore};
+use tokio::task;
+use num_cpus;
 use tracing_subscriber::{fmt, EnvFilter};
 
 #[tokio::main]
@@ -134,8 +136,12 @@ async fn main() -> anyhow::Result<()> {
     }
     let schema_lookup_arc = Arc::new(schema_lookup_map);
 
-    // 3. Ensure history table exists
+    // 3. Ensure history table exists and configure database settings
     let conn = duck::open_file_db(duckdb_file_path)?;
+    
+    // No need for special configuration - DuckDB handles WAL automatically
+    // We just need to make sure our workers use the mutex for serialized access
+    
     history::ensure_history_table_exists(&conn)?;
     // Let's drop this connection to avoid keeping it open
     drop(conn);
@@ -162,18 +168,20 @@ async fn main() -> anyhow::Result<()> {
     }
     tracing::info!("Found {} URLs to potentially download.", urls_to_download.len());
 
-    // 5. Concurrent Downloading with Sequential Processing
-    let (tx, mut rx) = mpsc::channel::<Result<PathBuf, (String, String)>>(128);
-    let download_semaphore = Arc::new(Semaphore::new(3)); // Max 2 concurrent downloads
+    // 5. Concurrent Downloading with Parallel Processing
+    // Use a larger buffer to prevent blocking downloads
+    let (tx, mut rx) = mpsc::channel::<Result<PathBuf, (String, String)>>(1024);
+    let download_semaphore = Arc::new(Semaphore::new(3)); // Max 3 concurrent downloads
 
     // Start downloads
+    let mut download_handles = Vec::with_capacity(urls_to_download.len());
     for zip_url in urls_to_download {
         let client_clone = Arc::clone(&client);
         let zips_output_dir_clone = Arc::clone(&zips_output_dir);
         let tx_clone = tx.clone();
         let semaphore_clone = Arc::clone(&download_semaphore);
 
-        tokio::spawn(async move {
+        let download_handle = tokio::spawn(async move {
             let zip_filename_from_url = Path::new(&zip_url)
                 .file_name()
                 .map(|s| s.to_string_lossy().into_owned())
@@ -185,7 +193,15 @@ async fn main() -> anyhow::Result<()> {
                     let err_msg = format!("Semaphore acquisition failed: {}", e);
                     tracing::error!(url = %zip_url, zip_filename = %zip_filename_from_url, 
                         error = %err_msg, "Semaphore acquisition failed for download task.");
-                    let _ = tx_clone.send(Err((zip_url, err_msg))).await;
+                    
+                    // Use a separate task to send to channel to prevent blocking this task
+                    let tx_for_err = tx_clone.clone();
+                    let zip_url_for_err = zip_url.clone();
+                    tokio::spawn(async move {
+                        if tx_for_err.send(Err((zip_url_for_err, err_msg))).await.is_err() {
+                            // Just log and continue if sending fails
+                        }
+                    });
                     return;
                 }
             };
@@ -200,51 +216,111 @@ async fn main() -> anyhow::Result<()> {
                     tracing::info!(url = %zip_url, zip_filename = %downloaded_zip_filename, 
                         file_path = %path.display(), "Download successful.");
 
-                    if tx_clone.send(Ok(path)).await.is_err() {
-                        tracing::error!(url = %zip_url, original_zip_filename = %zip_filename_from_url, 
-                            attempted_file_sent = %downloaded_zip_filename, 
-                            "Failed to send downloaded path to channel (receiver dropped).");
-                    }
+                    // Use a separate task to send to channel to prevent blocking this task
+                    let tx_for_ok = tx_clone.clone();
+                    let path_clone = path.clone();
+                    tokio::spawn(async move {
+                        if tx_for_ok.send(Ok(path_clone)).await.is_err() {
+                            // Just log and continue if sending fails
+                        }
+                    });
                 }
                 Err(e) => {
                     let download_failure_message = e.to_string();
                     tracing::error!(url = %zip_url, zip_filename = %zip_filename_from_url, 
                         error = %download_failure_message, "Failed to download ZIP.");
 
-                    if tx_clone.send(Err((zip_url.clone(), download_failure_message))).await.is_err() {
-                        tracing::error!(url = %zip_url, zip_filename = %zip_filename_from_url, 
-                            "Failed to send download error to channel (receiver dropped).");
-                    }
+                    // Use a separate task to send to channel to prevent blocking this task
+                    let tx_for_err = tx_clone.clone();
+                    let zip_url_for_err = zip_url.clone();
+                    let download_failure_msg_clone = download_failure_message.clone();
+                    tokio::spawn(async move {
+                        if tx_for_err.send(Err((zip_url_for_err, download_failure_msg_clone))).await.is_err() {
+                            // Just log and continue if sending fails
+                        }
+                    });
                 }
             }
             drop(permit); // Release semaphore permit
         });
+        download_handles.push(download_handle);
     }
     drop(tx); // Drop the original sender
+    
+    // Create a task to wait for all downloads to complete
+    let downloads_complete_handle = tokio::spawn(async move {
+        for (i, handle) in download_handles.into_iter().enumerate() {
+            if let Err(e) = handle.await {
+                tracing::error!(download_index = i, error = %e, "Download task panicked");
+            }
+        }
+        tracing::info!("All download tasks have completed");
+    });
 
-    // 6. Sequential Processing of Downloaded Files
-    tracing::info!("Starting sequential processing of downloaded files.");
-    while let Some(received_item_result) = rx.recv().await {
-        match received_item_result {
-            Ok(zip_path) => {
-                let current_zip_filename = zip_path
-                    .file_name()
-                    .map(|s| s.to_string_lossy().into_owned())
-                    .unwrap_or_else(|| zip_path.to_string_lossy().into_owned());
+    // 6. Parallel Processing of Downloaded Files
+    tracing::info!("Starting parallel processing of downloaded files using thread pool.");
 
-                tracing::info!(zip_filename = %current_zip_filename, file_path = %zip_path.display(), 
-                    "Processing downloaded file.");
-                
-                // Open a fresh connection for each file
-                match duck::open_file_db(duckdb_file_path) {
-                    Ok(conn) => {
+    // Create a synchronized way to protect database access
+    let db_mutex = Arc::new(tokio::sync::Mutex::new(()));
+    
+    // Create a synchronized completion mechanism
+    let (completion_tx, mut completion_rx) = mpsc::channel::<()>(1);
+    let completion_tx = Arc::new(completion_tx);
+
+    // Create multiple channels for processing tasks (one per worker)
+    let num_workers = num_cpus::get();
+    tracing::info!("Creating {} worker threads for parallel processing", num_workers);
+
+    // Create worker channels and store their senders
+    let mut worker_senders: Vec<mpsc::Sender<Result<PathBuf, (String, String)>>> = Vec::with_capacity(num_workers);
+    let db_file_path = duckdb_file_path.to_string();
+    let schema_lookup_for_workers = Arc::clone(&schema_lookup_arc);
+    
+    // Create a Vec to store all worker task handles
+    let mut worker_handles = Vec::with_capacity(num_workers);
+    
+    // Create worker threads
+    for worker_id in 0..num_workers {
+        // Create a channel for this worker
+        let (worker_tx, mut worker_rx) = mpsc::channel(32);
+        worker_senders.push(worker_tx);
+        
+        let worker_schema_lookup = Arc::clone(&schema_lookup_for_workers);
+        let worker_db_path = db_file_path.clone();
+        let worker_completion_tx = Arc::clone(&completion_tx);
+        let worker_db_mutex = Arc::clone(&db_mutex);
+        
+        let worker_handle = tokio::spawn(async move {
+            tracing::info!(worker_id = worker_id, "Processing worker started");
+            
+            // Each worker gets its own DuckDB connection
+            let worker_conn = match duck::open_file_db(&worker_db_path) {
+                Ok(conn) => conn,
+                Err(e) => {
+                    tracing::error!(worker_id = worker_id, error = %e, 
+                        "Worker failed to open DuckDB connection. Worker stopping.");
+                    return;
+                }
+            };
+
+            while let Some(received_item_result) = worker_rx.recv().await {
+                match received_item_result {
+                    Ok(zip_path) => {
+                        let current_zip_filename = zip_path
+                            .file_name()
+                            .map(|s| s.to_string_lossy().into_owned())
+                            .unwrap_or_else(|| zip_path.to_string_lossy().into_owned());
+
+                        tracing::info!(worker_id = worker_id, zip_filename = %current_zip_filename, 
+                            file_path = %zip_path.display(), "Worker processing downloaded file.");
+                        
                         match process::load_aemo_zip(&zip_path) {
                             Ok(loaded_data_map) if !loaded_data_map.is_empty() => {
                                 let mut all_tables_processed = true;
                                 
                                 for (aemo_table_name, raw_table_data) in &loaded_data_map {
                                     if let Some(evolution) = schema::find_schema_evolution(
-                                        &schema_lookup_arc, 
+                                        &worker_schema_lookup, 
                                         aemo_table_name,
                                         &raw_table_data.effective_month,
                                     ) {
@@ -254,112 +330,161 @@ async fn main() -> anyhow::Result<()> {
                                             evolution.fields_hash
                                         );
 
-                                        tracing::debug!(zip_filename = %current_zip_filename, 
+                                        tracing::debug!(worker_id = worker_id, zip_filename = %current_zip_filename, 
                                             source_csv = %aemo_table_name, 
                                             target_duckdb = %duckdb_table_name, 
                                             rows = raw_table_data.rows.len(), 
-                                            "Inserting data.");
+                                            "Worker inserting data.");
+                                            
+                                        // Acquire mutex before database operations
+                                        let _db_lock = worker_db_mutex.lock().await;
                                             
                                         if let Err(e) = duck::insert_raw_table_data(
-                                            &conn,
+                                            &worker_conn,
                                             &duckdb_table_name,
                                             raw_table_data,
                                             &evolution,
                                         ) {
-                                            tracing::error!(zip_filename = %current_zip_filename, 
+                                            tracing::error!(worker_id = worker_id, zip_filename = %current_zip_filename, 
                                                 error = %e, 
                                                 duckdb_table = %duckdb_table_name, 
                                                 source_zip_path = %zip_path.display(), 
-                                                "Failed to insert data.");
+                                                "Worker failed to insert data.");
                                             all_tables_processed = false;
                                         }
                                     } else {
-                                        tracing::warn!(zip_filename = %current_zip_filename, 
+                                        tracing::warn!(worker_id = worker_id, zip_filename = %current_zip_filename, 
                                             aemo_table = %aemo_table_name, 
                                             month = %raw_table_data.effective_month, 
                                             source_zip_path = %zip_path.display(), 
-                                            "No matching schema evolution found. Skipping table insertion.");
+                                            "Worker found no matching schema evolution. Skipping table insertion.");
                                         all_tables_processed = false;
                                     }
                                 }
 
                                 if all_tables_processed {
-                                    tracing::info!(zip_filename = %current_zip_filename, 
+                                    tracing::info!(worker_id = worker_id, zip_filename = %current_zip_filename, 
                                         file_path = %zip_path.display(), 
-                                        "All tables from ZIP processed, recording history.");
+                                        "Worker completed processing all tables from ZIP, recording history.");
                                     
                                     // Uncomment if you want to record history and delete processed files
                                     // if let Err(e) = history::record_processed_csv_data(
-                                    //     &conn,
+                                    //     &worker_conn,
                                     //     &zip_path,
                                     //     &loaded_data_map,
                                     // ) {
-                                    //     tracing::error!(zip_filename = %current_zip_filename, 
+                                    //     tracing::error!(worker_id = worker_id, zip_filename = %current_zip_filename, 
                                     //         error = %e, 
                                     //         zip_file_path = %zip_path.display(), 
-                                    //         "Failed to record processed CSV data. File will not be deleted.");
+                                    //         "Worker failed to record processed CSV data. File will not be deleted.");
                                     // } else {
-                                    //     tracing::info!(zip_filename = %current_zip_filename, 
+                                    //     tracing::info!(worker_id = worker_id, zip_filename = %current_zip_filename, 
                                     //         file_path = %zip_path.display(), 
-                                    //         "History recorded. Attempting to delete ZIP file.");
+                                    //         "Worker recorded history. Attempting to delete ZIP file.");
                                     //     if let Err(e) = fs::remove_file(&zip_path) {
-                                    //         tracing::error!(zip_filename = %current_zip_filename, 
+                                    //         tracing::error!(worker_id = worker_id, zip_filename = %current_zip_filename, 
                                     //             error = %e, 
                                     //             file_path = %zip_path.display(), 
-                                    //             "Failed to delete processed ZIP file.");
+                                    //             "Worker failed to delete processed ZIP file.");
                                     //     } else {
-                                    //         tracing::info!(zip_filename = %current_zip_filename, 
+                                    //         tracing::info!(worker_id = worker_id, zip_filename = %current_zip_filename, 
                                     //             file_path = %zip_path.display(), 
-                                    //             "Successfully deleted processed ZIP file.");
+                                    //             "Worker successfully deleted processed ZIP file.");
                                     //     }
                                     // }
                                 } else {
-                                    tracing::warn!(zip_filename = %current_zip_filename, 
+                                    tracing::warn!(worker_id = worker_id, zip_filename = %current_zip_filename, 
                                         file_path = %zip_path.display(), 
-                                        "Skipping history record and deletion due to processing errors or missing schemas.");
+                                        "Worker skipping history record and deletion due to processing errors or missing schemas.");
                                 }
                             }
                             Ok(_) => {
                                 // ZIP is empty
-                                tracing::info!(zip_filename = %current_zip_filename, 
+                                tracing::info!(worker_id = worker_id, zip_filename = %current_zip_filename, 
                                     file_path = %zip_path.display(), 
-                                    "ZIP contained no data tables to process. Deleting file.");
+                                    "Worker found ZIP contained no data tables to process. Deleting file.");
                                 if let Err(e) = fs::remove_file(&zip_path) {
-                                    tracing::error!(zip_filename = %current_zip_filename, 
+                                    tracing::error!(worker_id = worker_id, zip_filename = %current_zip_filename, 
                                         error = %e, 
                                         file_path = %zip_path.display(), 
-                                        "Failed to delete empty ZIP file.");
+                                        "Worker failed to delete empty ZIP file.");
                                 }
                             }
                             Err(e) => {
-                                tracing::error!(zip_filename = %current_zip_filename, 
+                                tracing::error!(worker_id = worker_id, zip_filename = %current_zip_filename, 
                                     error = %e, 
                                     file_path = %zip_path.display(), 
-                                    "Failed to load/process AEMO ZIP. File may remain.");
+                                    "Worker failed to load/process AEMO ZIP. File may remain.");
                             }
                         }
-                        // Explicitly drop the connection after processing each file
-                        drop(conn);
                     }
-                    Err(e) => {
-                        tracing::error!(zip_filename = %current_zip_filename, 
-                            file_path = %zip_path.display(), 
-                            error = %e, 
-                            "Failed to open DuckDB connection. Skipping file.");
+                    Err((url, download_err_msg)) => {
+                        let failed_zip_filename = Path::new(&url)
+                            .file_name()
+                            .map(|s| s.to_string_lossy().into_owned())
+                            .unwrap_or_else(|| url.clone());
+                        
+                        tracing::error!(worker_id = worker_id, zip_filename = %failed_zip_filename, 
+                            url = %url, 
+                            error = %download_err_msg, 
+                            "Worker received download failure. File will not be processed.");
                     }
                 }
             }
-            Err((url, download_err_msg)) => {
-                let failed_zip_filename = Path::new(&url)
-                    .file_name()
-                    .map(|s| s.to_string_lossy().into_owned())
-                    .unwrap_or_else(|| url.clone());
-                
-                tracing::error!(zip_filename = %failed_zip_filename, 
-                    url = %url, 
-                    error = %download_err_msg, 
-                    "Download failed. File will not be processed.");
+            
+            tracing::info!(worker_id = worker_id, "Processing worker shutting down");
+            
+            // Signal that this worker has completed
+            if let Err(e) = worker_completion_tx.send(()).await {
+                tracing::warn!(worker_id = worker_id, error = %e, "Failed to send completion signal");
             }
+        });
+        
+        worker_handles.push(worker_handle);
+    }
+
+    // Forward downloads to the processing workers using round-robin distribution
+    let distribution_handle = task::spawn(async move {
+        let mut current_worker = 0;
+        
+        while let Some(item) = rx.recv().await {
+            // Round-robin assignment to workers
+            if let Err(e) = worker_senders[current_worker].send(item).await {
+                tracing::error!(worker_id = current_worker, error = %e, 
+                    "Failed to send item to worker");
+            }
+            
+            // Move to next worker
+            current_worker = (current_worker + 1) % worker_senders.len();
+        }
+        
+        // When all downloads are done, drop all senders to signal workers to shut down
+        tracing::info!("All downloads processed, shutting down worker channels");
+        drop(worker_senders);
+    });
+    
+    // Wait for the distribution task to complete
+    if let Err(e) = distribution_handle.await {
+        tracing::error!(error = %e, "Error occurred while waiting for distribution task to complete");
+    }
+    
+    // Wait for downloads to complete
+    if let Err(e) = downloads_complete_handle.await {
+        tracing::error!(error = %e, "Error occurred while waiting for downloads to complete");
+    }
+    
+    // Wait for all workers to signal completion
+    for _ in 0..num_workers {
+        if completion_rx.recv().await.is_none() {
+            tracing::warn!("Completion channel closed before receiving all worker completions");
+            break;
+        }
+    }
+    
+    // Optionally wait for all worker tasks to complete
+    for (i, handle) in worker_handles.into_iter().enumerate() {
+        if let Err(e) = handle.await {
+            tracing::error!(worker_id = i, error = %e, "Worker task panicked");
         }
     }
 
