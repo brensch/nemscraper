@@ -116,7 +116,7 @@ fn parse_string_to_duckdb_value(value_str: &str, target_column: &NemSchemaColumn
     let schema_type_upper = target_column.ty.to_uppercase();
 
     match schema_type_upper.as_str() {
-        s if s.starts_with("DATE") => Ok(Value::Text(trimmed_value.to_string())),
+        s if s.starts_with("DATE") => Ok(Value::Text(trimmed_value.to_string())), // Let DuckDB parse Text to DATE/TIMESTAMP
         s if s.starts_with("FLOAT") || s.starts_with("NUMBER") || s.starts_with("DECIMAL") => {
             trimmed_value
                 .parse::<f64>()
@@ -132,7 +132,7 @@ fn parse_string_to_duckdb_value(value_str: &str, target_column: &NemSchemaColumn
         }
         s if s.starts_with("INT") => {
             trimmed_value.parse::<i32>().map(Value::Int).map_err(|e| {
-                // Value::Integer for i32
+                // Value::Integer is for i32
                 anyhow!(
                     "Failed to parse '{}' as i32 for column '{}': {}",
                     trimmed_value,
@@ -187,7 +187,7 @@ fn parse_string_to_duckdb_value(value_str: &str, target_column: &NemSchemaColumn
                 target_column.name
             )),
         },
-        _ => Ok(Value::Text(trimmed_value.to_string())),
+        _ => Ok(Value::Text(trimmed_value.to_string())), // Default to Text for VARCHAR, TEXT, STRING, CHAR, UNKNOWN
     }
 }
 
@@ -304,18 +304,24 @@ pub fn open_mem_db() -> Result<Connection> {
 pub fn open_file_db(path: &str) -> Result<Connection> {
     Connection::open(path).context(format!("Failed to open DuckDB file at {}", path))
 }
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::schema::SchemaEvolution;
+    use crate::schema::SchemaEvolution; // Assuming this path is correct from your project structure
     use anyhow::Result;
+    use duckdb::types::Value; // For checking Value::Null
     use tracing_subscriber::{EnvFilter, FmtSubscriber};
+
+    // Imports for the performance test (if in the same mod tests block)
+    use rand::distributions::Alphanumeric;
+    use rand::{thread_rng, Rng};
+    use std::time::Instant;
 
     fn init_test_logging() {
         let subscriber = FmtSubscriber::builder()
             .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| {
-                EnvFilter::new("info,nemscraper::duck=trace,nemscraper::process=trace")
+                // Ensure your project/crate name is correct here if not 'nemscraper'
+                EnvFilter::new("info,nemscraper::duck=trace,nemscraper::process=trace") 
             }))
             .with_test_writer()
             .finish();
@@ -329,12 +335,42 @@ mod tests {
             map_schema_type_to_duckdb_type("DATE", Some("\"yyyy/mm/dd hh24:mi:ss\"")),
             "TIMESTAMP"
         );
-        // ... (rest of map_schema_types tests remain the same)
+        assert_eq!(
+            map_schema_type_to_duckdb_type("DATE", Some("YYYY/MM/DD HH24:MI:SS")),
+            "TIMESTAMP"
+        );
+        assert_eq!(
+            map_schema_type_to_duckdb_type("DATE", Some("YYYY-MM-DD hh:mi:ss")),
+            "TIMESTAMP"
+        );
+        assert_eq!(map_schema_type_to_duckdb_type("DATE", None), "DATE");
+        assert_eq!(map_schema_type_to_duckdb_type("FLOAT", None), "DOUBLE");
+        assert_eq!(map_schema_type_to_duckdb_type("NUMBER(10,2)", None), "DOUBLE");
+        assert_eq!(map_schema_type_to_duckdb_type("DECIMAL", None), "DOUBLE");
         assert_eq!(map_schema_type_to_duckdb_type("INTEGER", None), "INTEGER");
         assert_eq!(map_schema_type_to_duckdb_type("INT", None), "INTEGER");
+        assert_eq!(map_schema_type_to_duckdb_type("BIGINT", None), "BIGINT");
+        assert_eq!(map_schema_type_to_duckdb_type("SMALLINT", None), "SMALLINT");
+        assert_eq!(map_schema_type_to_duckdb_type("TINYINT", None), "TINYINT");
+        assert_eq!(map_schema_type_to_duckdb_type("VARCHAR(100)", None), "VARCHAR");
+        assert_eq!(map_schema_type_to_duckdb_type("TEXT", None), "VARCHAR");
+        assert_eq!(map_schema_type_to_duckdb_type("STRING", None), "VARCHAR");
+        assert_eq!(map_schema_type_to_duckdb_type("CHAR(5)", None), "VARCHAR");
+        assert_eq!(map_schema_type_to_duckdb_type("BOOLEAN", None), "BOOLEAN");
+        assert_eq!(map_schema_type_to_duckdb_type("BOOL", None), "BOOLEAN");
+        assert_eq!(map_schema_type_to_duckdb_type("BLOB", None), "BLOB");
+        assert_eq!(map_schema_type_to_duckdb_type("BYTEA", None), "BLOB");
         assert_eq!(
             map_schema_type_to_duckdb_type("UNKNOWN_TYPE", None),
             "VARCHAR"
+        );
+         assert_eq!(
+            map_schema_type_to_duckdb_type("date", Some("yyyy-mm-dd")),
+            "DATE"
+        );
+        assert_eq!(
+            map_schema_type_to_duckdb_type("number", None),
+            "DOUBLE"
         );
     }
 
@@ -365,7 +401,7 @@ mod tests {
             },
             NemSchemaColumn {
                 name: "EVENT_TIME".to_string(),
-                ty: "DATE".to_string(),
+                ty: "DATE".to_string(), // This type plus the format will result in TIMESTAMP
                 format: Some("YYYY/MM/DD HH24:MI:SS".to_string()),
             },
             NemSchemaColumn {
@@ -409,28 +445,28 @@ mod tests {
                     "2023/02/20 12:00:00".to_string(),
                     "0".to_string(),
                 ],
-                vec![
+                vec![ 
                     "3".to_string(),
                     "Charlie".to_string(),
-                    "".to_string(),
+                    "".to_string(), 
                     "2023/03/10 08:00:00".to_string(),
                     "F".to_string(),
                 ],
-                vec![
+                vec![ 
                     "4".to_string(),
                     "David".to_string(),
                     "99.0".to_string(),
-                    "  ".to_string(),
+                    "  ".to_string(), 
                     "YES".to_string(),
                 ],
-                vec![
+                vec![ 
                     "5".to_string(),
                     "Eve".to_string(),
                     "INVALID_FLOAT".to_string(),
                     "2023/05/05 05:05:05".to_string(),
                     "N".to_string(),
                 ],
-                vec![
+                vec![ 
                     "6".to_string(),
                     "Valid".to_string(),
                     "1.0".to_string(),
@@ -449,9 +485,19 @@ mod tests {
             &test_schema_evolution,
         )?;
         assert_eq!(
-            inserted_count, 4,
+            inserted_count, 4, 
             "Expected 4 rows to be successfully inserted"
         );
+
+        // Verify the EVENT_TIME column type is TIMESTAMP using information_schema
+        let mut stmt_type_check = conn.prepare(&format!(
+            "SELECT data_type FROM information_schema.columns WHERE table_schema = 'main' AND table_name = '{}' AND column_name = 'EVENT_TIME'",
+            duckdb_table_name 
+        ))?;
+        let event_time_col_type: String = stmt_type_check.query_row([], |row| row.get(0))
+            .context(format!("Failed to query data_type for EVENT_TIME in table {}", duckdb_table_name))?;
+        assert_eq!(event_time_col_type.to_uppercase(), "TIMESTAMP", "EVENT_TIME column type should be TIMESTAMP");
+
 
         let mut stmt = conn.prepare(&format!(
             "SELECT ID, NAME, VALUE, EVENT_TIME, IS_ACTIVE FROM \"{}\" ORDER BY ID",
@@ -459,32 +505,155 @@ mod tests {
         ))?;
         let mut query_rows = stmt.query([])?;
 
+        // Row 1
         let r = query_rows.next()?.unwrap();
         assert_eq!(r.get::<_, i32>(0)?, 1);
         assert_eq!(r.get::<_, String>(1)?, "Alice");
         assert_eq!(r.get::<_, f64>(2)?, 123.45);
+        // We can fetch the actual timestamp value if needed, e.g., using duckdb::types::Timestamp
+        // let _event_time_r1: duckdb::types::Timestamp = r.get(3)?;
         assert_eq!(r.get::<_, bool>(4)?, true);
 
+        // Row 2
         let r = query_rows.next()?.unwrap();
         assert_eq!(r.get::<_, i32>(0)?, 2);
         assert_eq!(r.get::<_, String>(1)?, "Bob");
         assert_eq!(r.get::<_, f64>(2)?, 67.89);
         assert_eq!(r.get::<_, bool>(4)?, false);
 
+        // Row 3 (Value is NULL)
         let r = query_rows.next()?.unwrap();
         assert_eq!(r.get::<_, i32>(0)?, 3);
         assert_eq!(r.get::<_, String>(1)?, "Charlie");
         let value_col3: Option<f64> = r.get(2)?;
-        assert!(value_col3.is_none());
+        assert!(value_col3.is_none(), "Expected VALUE to be NULL for row 3");
         assert_eq!(r.get::<_, bool>(4)?, false);
 
+        // Row 4 (EVENT_TIME is NULL)
         let r = query_rows.next()?.unwrap();
         assert_eq!(r.get::<_, i32>(0)?, 4);
         assert_eq!(r.get::<_, String>(1)?, "David");
         assert_eq!(r.get::<_, f64>(2)?, 99.0);
+        // let event_time_val_r4: Value = r.get_raw(3).to_owned();
+        // assert_eq!(event_time_val_r4, Value::Null, "Expected EVENT_TIME to be NULL for row 4");
         assert_eq!(r.get::<_, bool>(4)?, true);
 
-        assert!(query_rows.next()?.is_none());
+        assert!(query_rows.next()?.is_none(), "Expected no more rows after the 4 valid ones");
+
+        Ok(())
+    }
+
+    #[test]
+    #[ignore] // This test can take a while, mark as ignored
+    fn test_insert_1m_rows_performance() -> Result<()> {
+        init_test_logging();
+        let conn = open_mem_db().context("Failed to open in-memory DB for performance test")?;
+
+        let table_base_name = "PERF_TEST_DATA_TABLE";
+        let schema_hash = "perfhash1M";
+        let duckdb_table_name = format!("{}_{}", table_base_name, schema_hash);
+
+        let schema_cols = vec![
+            NemSchemaColumn { name: "ID".to_string(), ty: "INTEGER".to_string(), format: None },
+            NemSchemaColumn { name: "NAME".to_string(), ty: "VARCHAR(50)".to_string(), format: None },
+            NemSchemaColumn { name: "VALUE".to_string(), ty: "FLOAT".to_string(), format: None },
+            NemSchemaColumn { name: "EVENT_TIME".to_string(), ty: "DATE".to_string(), format: Some("YYYY/MM/DD HH24:MI:SS".to_string()) },
+            NemSchemaColumn { name: "IS_ACTIVE".to_string(), ty: "BOOLEAN".to_string(), format: None },
+        ];
+
+        let test_schema_evolution = SchemaEvolution {
+            table_name: table_base_name.to_string(),
+            fields_hash: schema_hash.to_string(),
+            start_month: "202401".to_string(), 
+            end_month: "202412".to_string(),   
+            columns: schema_cols.clone(),
+        };
+
+        create_table_from_schema(&conn, &duckdb_table_name, &test_schema_evolution.columns)
+            .context("Failed to create table for performance test")?;
+
+        tracing::info!("Starting data generation for 1 million rows...");
+        let num_rows_to_generate: usize = 1_000_000;
+        let mut rows_data: Vec<Vec<String>> = Vec::with_capacity(num_rows_to_generate);
+        let mut rng = thread_rng();
+
+        for i in 0..num_rows_to_generate {
+            let id = (i + 1).to_string(); 
+            
+            let name_len = rng.gen_range(5..=15); 
+            let name: String = (&mut rng)
+                .sample_iter(&Alphanumeric)
+                .take(name_len) 
+                .map(char::from)
+                .collect();
+            
+            let value = rng.gen_range(0.0..10000.0).to_string();
+
+            let year = rng.gen_range(2020..=2024); 
+            let month = rng.gen_range(1..=12);
+            let day = rng.gen_range(1..=28); 
+            let hour = rng.gen_range(0..=23);
+            let minute = rng.gen_range(0..=59);
+            let second = rng.gen_range(0..=59);
+            let event_time = format!("{:04}/{:02}/{:02} {:02}:{:02}:{:02}", year, month, day, hour, minute, second);
+
+            let is_active = if rng.gen() { "true" } else { "false" }.to_string();
+
+            rows_data.push(vec![id, name, value, event_time, is_active]);
+        }
+        tracing::info!("Data generation complete. Generated {} rows.", rows_data.len());
+
+        let raw_table_to_insert = RawTable {
+            headers: vec![ 
+                "ID".to_string(), "NAME".to_string(), "VALUE".to_string(),
+                "EVENT_TIME".to_string(), "IS_ACTIVE".to_string()
+            ],
+            rows: rows_data,
+            effective_month: "202401".to_string(), 
+        };
+
+        tracing::info!("Starting insertion of {} rows into table '{}'...", num_rows_to_generate, duckdb_table_name);
+        let start_time = Instant::now();
+
+        let inserted_count = insert_raw_table_data(
+            &conn,
+            &duckdb_table_name,
+            &raw_table_to_insert,
+            &test_schema_evolution,
+        )?;
+
+        let duration = start_time.elapsed();
+        let rows_per_second = if duration.as_secs_f64() > 0.0 {
+            inserted_count as f64 / duration.as_secs_f64()
+        } else {
+            f64::INFINITY // Represent as infinite if duration is zero (practically very fast)
+        };
+
+        tracing::info!(
+            "Insertion complete. Inserted {} rows into '{}' in {:.2?}. Average: {:.2} rows/sec",
+            inserted_count,
+            duckdb_table_name,
+            duration,
+            rows_per_second
+        );
+
+        assert_eq!(
+            inserted_count, num_rows_to_generate,
+            "Expected all {} generated rows to be inserted, but {} were inserted.", 
+            num_rows_to_generate, inserted_count
+        );
+        
+        let count: i64 = conn.query_row(
+            &format!("SELECT COUNT(*) FROM \"{}\"", duckdb_table_name),
+            [],
+            |row| row.get(0),
+        ).context("Failed to query count from performance test table")?;
+        
+        assert_eq!(
+            count, 
+            num_rows_to_generate as i64, 
+            "Database row count mismatch after performance test."
+        );
 
         Ok(())
     }
