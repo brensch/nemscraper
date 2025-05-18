@@ -111,7 +111,7 @@ dependencies = [
  "arrow-data",
  "arrow-ord",
  "arrow-row",
- "arrow-schema",
+ "arrow-schema 54.3.1",
  "arrow-select",
  "arrow-string",
 ]
@@ -125,7 +125,7 @@ dependencies = [
  "arrow-array",
  "arrow-buffer",
  "arrow-data",
- "arrow-schema",
+ "arrow-schema 54.3.1",
  "chrono",
  "num",
 ]
@@ -139,7 +139,7 @@ dependencies = [
  "ahash 0.8.12",
  "arrow-buffer",
  "arrow-data",
- "arrow-schema",
+ "arrow-schema 54.3.1",
  "chrono",
  "half",
  "hashbrown 0.15.3",
@@ -166,7 +166,7 @@ dependencies = [
  "arrow-array",
  "arrow-buffer",
  "arrow-data",
- "arrow-schema",
+ "arrow-schema 54.3.1",
  "arrow-select",
  "atoi",
  "base64 0.22.1",
@@ -185,7 +185,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "61cfdd7d99b4ff618f167e548b2411e5dd2c98c0ddebedd7df433d34c20a4429"
 dependencies = [
  "arrow-buffer",
- "arrow-schema",
+ "arrow-schema 54.3.1",
  "half",
  "num",
 ]
@@ -199,7 +199,7 @@ dependencies = [
  "arrow-array",
  "arrow-buffer",
  "arrow-data",
- "arrow-schema",
+ "arrow-schema 54.3.1",
  "arrow-select",
 ]
 
@@ -212,7 +212,7 @@ dependencies = [
  "arrow-array",
  "arrow-buffer",
  "arrow-data",
- "arrow-schema",
+ "arrow-schema 54.3.1",
  "half",
 ]
 
@@ -226,6 +226,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "arrow-schema"
+version = "55.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "73a47aa0c771b5381de2b7f16998d351a6f4eb839f1e13d48353e17e873d969b"
+
+[[package]]
 name = "arrow-select"
 version = "54.3.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -235,7 +241,7 @@ dependencies = [
  "arrow-array",
  "arrow-buffer",
  "arrow-data",
- "arrow-schema",
+ "arrow-schema 54.3.1",
  "num",
 ]
 
@@ -248,7 +254,7 @@ dependencies = [
  "arrow-array",
  "arrow-buffer",
  "arrow-data",
- "arrow-schema",
+ "arrow-schema 54.3.1",
  "arrow-select",
  "memchr",
  "num",
@@ -778,6 +784,7 @@ checksum = "49ac283b6621e3becf8014d1efa655522794075834c72f744573debef9c9f6c8"
 dependencies = [
  "arrow",
  "cast",
+ "chrono",
  "fallible-iterator",
  "fallible-streaming-iterator",
  "hashlink",
@@ -1753,6 +1760,7 @@ name = "nemscraper"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "arrow-schema 55.1.0",
  "async-trait",
  "chrono",
  "csv",
