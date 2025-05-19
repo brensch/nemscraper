@@ -158,6 +158,7 @@ mod tests {
     use anyhow::Result;
     use std::env;
     use std::io::{Cursor, Write};
+    use std::sync::Arc;
     use std::time::Instant;
     use tempfile::NamedTempFile;
     use tracing_subscriber::{EnvFilter, FmtSubscriber};
@@ -256,28 +257,82 @@ D,FPP,FORECAST_RESIDUAL_DCF,1,F_I+LREG_0210,"2024/12/22 00:05:00","2024/12/29 00
         Ok(())
     }
 
+    use crate::{duck, schema};
+
     /// Benchmark test: set ZIP_PATH to your real file and run with `-- --nocapture`
+    /// Benchmark test: set `ZIP_PATH` to your real file and run with `-- --nocapture`
     #[test]
     fn bench_load_aemo_zip() -> Result<()> {
         init_test_logging();
 
-        // ZIP_PATH should point to an actual AEMO ZIP on your filesystem:
+        // 1) Load the ZIP and parse into in-memory tables
         let zip_path_str =
             env::var("ZIP_PATH").expect("Please set ZIP_PATH env var to the path of your ZIP file");
-        let zip_path = std::path::Path::new(&zip_path_str);
-
+        let zip_path = Path::new(&zip_path_str);
         println!("→ Loading ZIP: {}", zip_path.display());
         let start = Instant::now();
-        let tables = load_aemo_zip(zip_path)
-            .with_context(|| format!("Failed to load ZIP at {}", zip_path.display()))?;
+        let tables = load_aemo_zip(zip_path)?;
         let elapsed = start.elapsed();
-
         println!(
             "✔ load_aemo_zip({}) extracted {} tables in {:?}",
             zip_path.display(),
             tables.len(),
             elapsed
         );
+
+        // 2) Extract schema evolutions from disk
+        let schemas_dir = Path::new("schemas");
+        println!(
+            "→ Extracting schema evolutions from {}",
+            schemas_dir.display()
+        );
+        let evolutions = schema::extract_schema_evolutions(schemas_dir)?;
+        println!("✔ found {} schema evolutions", evolutions.len());
+
+        // 3) Create a temporary DuckDB file
+        // let db_file = NamedTempFile::new()?;
+        // let db_path = db_file.path().to_str().unwrap();
+        println!("→ Creating DuckDB ");
+        let conn = duck::open_mem_db()?;
+
+        // 4) Create each versioned table in DuckDB
+        let mut created = 0;
+        for evo in &evolutions {
+            let tbl_name = format!("{}_{}", evo.table_name, evo.fields_hash);
+            duck::create_table_from_schema(&conn, &tbl_name, &evo.columns)?;
+            created += 1;
+        }
+        println!("✔ created {} tables in DuckDB", created);
+
+        // 5) Build lookup: table_name -> sorted Vec<Arc<SchemaEvolution>>
+        let mut lookup: HashMap<String, Vec<Arc<schema::SchemaEvolution>>> = HashMap::new();
+        for evo in &evolutions {
+            lookup
+                .entry(evo.table_name.clone())
+                .or_default()
+                .push(Arc::new(evo.clone()));
+        }
+        for versions in lookup.values_mut() {
+            versions.sort_by_key(|e| e.start_month.clone());
+        }
+
+        // 6) Insert each RawTable into its matching versioned table
+        let mut inserted = 0;
+        for (tbl_id, raw) in &tables {
+            if let Some(evo) = schema::find_schema_evolution(&lookup, tbl_id, &raw.effective_month)
+            {
+                let target = format!("{}_{}", evo.table_name, evo.fields_hash);
+                duck::insert_raw_table_data(&conn, &target, raw, &evo)?;
+                inserted += 1;
+            } else {
+                panic!(
+                    "No schema evolution found for {}@{}",
+                    tbl_id, raw.effective_month
+                );
+            }
+        }
+        println!("✔ inserted {} tables into DuckDB", inserted);
+
         Ok(())
     }
 }
