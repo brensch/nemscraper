@@ -133,35 +133,33 @@ pub fn split_zip_to_parquet<P: AsRef<Path>, Q: AsRef<Path>>(zip_path: P, out_dir
                     .collect::<Vec<ArrowField>>(),
             ));
 
-            // CSV -> RecordBatch
+            // Parse CSV in streaming batches
             let cursor = Cursor::new(data_slice.as_bytes());
             let mut csv_reader = ReaderBuilder::new(arrow_schema.clone())
                 .with_header(false)
+                // // if you *really* want to read more than 1024 at once:
+                // .with_batch_size(10_000_000)
                 .build(cursor)?;
-            let batch = csv_reader.next().transpose()?.unwrap();
-            info!(
-                segment = %schema_id,
-                "deserialized into RecordBatch in {:?}",
-                t_segment.elapsed()
-            );
 
-            // Write Parquet
-            let t_write = Instant::now();
+            // Prepare Parquet writer
             let out_file = out_dir_buf.join(format!("{}—{}.parquet", name, schema_id));
             let file = File::create(&out_file)?;
             let props = WriterProperties::builder()
-                .set_compression(Compression::SNAPPY)
+                .set_compression(Compression::UNCOMPRESSED)
                 .build();
-            let mut writer = ArrowWriter::try_new(file, arrow_schema, Some(props))?;
+            let mut writer = ArrowWriter::try_new(file, arrow_schema.clone(), Some(props))?;
 
-            let total_rows = batch.num_rows();
-            let chunk_size = 1_000_000;
-            for offset in (0..total_rows).step_by(chunk_size) {
-                let len = (chunk_size).min(total_rows - offset);
-                let slice_batch = batch.slice(offset, len);
-                writer.write(&slice_batch)?;
+            // Stream *all* batches through to Parquet
+            let t_write = Instant::now();
+
+            while let Some(batch) = csv_reader.next().transpose()? {
+                writer.write(&batch)?;
             }
+
+            // Finalize
             writer.close()?;
+            info!(segment = %schema_id, "wrote full parquet in {:?}", t_write.elapsed());
+
             info!(
                 segment = %schema_id,
                 "wrote parquet segment in {:?}",
@@ -228,10 +226,9 @@ mod tests {
 
         // use a non-temp, project-relative test output dir
         let out_dir = PathBuf::from("tests/output");
-        if out_dir.exists() {
-            fs::remove_dir_all(&out_dir)?;
+        if !out_dir.exists() {
+            fs::create_dir_all(&out_dir)?;
         }
-        fs::create_dir_all(&out_dir)?;
 
         split_zip_to_parquet(&zip_path, &out_dir)?;
 
