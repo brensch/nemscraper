@@ -53,7 +53,7 @@ fn chunk_and_write_segment(
     ));
 
     // 3) choose your chunk size
-    let chunk_size = 1_000_000;
+    let chunk_size = 500_000;
 
     // 4) view each row as a &str
     let lines: Vec<&str> = data_slice.lines().collect();
@@ -70,8 +70,7 @@ fn chunk_and_write_segment(
 
     // 5) parallelize per-chunk
     lines
-        .chunks(chunk_size)
-        .into_iter()
+        .par_chunks(chunk_size)
         .enumerate()
         .for_each(|(chunk_idx, chunk_lines)| {
             // reassemble a mini-CSV
