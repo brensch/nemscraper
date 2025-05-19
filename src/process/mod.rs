@@ -22,7 +22,6 @@ use arrow::{
     record_batch::RecordBatch,
 };
 use parquet::{arrow::ArrowWriter, basic::Compression, file::properties::WriterProperties};
-
 #[instrument(level = "info", skip(zip_path, out_dir), fields(zip = %zip_path.as_ref().display()))]
 pub async fn split_zip_to_parquet_async<P: AsRef<Path>, Q: AsRef<Path>>(
     zip_path: P,
@@ -67,48 +66,50 @@ pub async fn split_zip_to_parquet_async<P: AsRef<Path>, Q: AsRef<Path>>(
             t_read.elapsed()
         );
 
-        // Identify segments at I-row boundaries, capturing header_start and data_start
-        let t_seg = Instant::now();
+        // Identify segments by I-row boundaries, using split_inclusive so
+        // chunk.len() always reflects the real byte length (incl. CRLF if present)
         let mut segments: Vec<(String, usize, usize, usize)> = Vec::new();
-        let mut pos: usize = 0;
+        let mut pos = 0; // byte offset into `text`
+        let mut header_start = 0; // start of current I-header
+        let mut data_start = 0; // start of first D-row after that header
         let mut current_schema: Option<String> = None;
-        let mut header_start: usize = 0;
-        let mut data_start: usize = 0;
+        let mut encountered_header = false;
 
-        for line in text.lines() {
-            let len = line.len() + 1;
-
-            // only break on the final C-row (END OF REPORT), not the initial metadata C-row
-            if line.starts_with("C,\"END") {
-                break;
+        for chunk in text.split_inclusive('\n') {
+            // stop at the “C,…” footer
+            if chunk.starts_with("C,") {
+                if !encountered_header {
+                    pos += chunk.len();
+                    encountered_header = true;
+                }
+                continue;
             }
 
-            if line.starts_with("I,") {
-                // close out previous segment
+            // whenever we hit an I-row, close out the previous segment
+            if chunk.starts_with("I,") {
                 if let Some(schema_id) = current_schema.take() {
+                    // segment_end = pos is the exact byte index where this I-line began
                     segments.push((schema_id, header_start, data_start, pos));
                 }
-                // mark new segment start
+
+                // start a new segment at this I-row
                 header_start = pos;
-                let parts: Vec<&str> = line.split(',').collect();
-                let schema_id = format!("{}_{}", parts[1], parts[2]);
-                current_schema = Some(schema_id);
-                data_start = pos + len;
+                // pull out your 2nd and 3rd fields to build the schema_id
+                let parts: Vec<&str> = chunk.trim_end_matches('\n').split(',').collect();
+                current_schema = Some(format!("{}_{}", parts[1], parts[2]));
+
+                // data starts immediately *after* this header chunk
+                data_start = pos + chunk.len();
             }
 
-            pos = pos.saturating_add(len);
+            // advance our offset by the full length of this chunk (including newline)
+            pos += chunk.len();
         }
 
-        // close out the last I-segment up to just before the final C-row
+        // push the very last segment (up to the footer or EOF)
         if let Some(schema_id) = current_schema {
             segments.push((schema_id, header_start, data_start, pos));
         }
-
-        info!(
-            "segmented into {} segments in {:?}",
-            segments.len(),
-            t_seg.elapsed()
-        );
 
         // Process each segment in parallel via Tokio tasks
         let mut futures = FuturesUnordered::new();
@@ -123,11 +124,6 @@ pub async fn split_zip_to_parquet_async<P: AsRef<Path>, Q: AsRef<Path>>(
 
                 // Extract data slice (skip I-line)
                 let data_slice = &text_clone[data_start..segment_end];
-
-                // Log each CSV line for debugging
-                for (row_idx, line) in data_slice.lines().enumerate() {
-                    info!(segment = %schema_id, row = row_idx, line = %line, "csv line");
-                }
 
                 // Parse columns from the I-line header slice
                 let header_line = &text_clone[header_start..data_start];
@@ -148,11 +144,10 @@ pub async fn split_zip_to_parquet_async<P: AsRef<Path>, Q: AsRef<Path>>(
                         .collect::<Vec<ArrowField>>(),
                 ));
 
-                // CSV -> RecordBatch, projecting only data columns
+                // CSV -> RecordBatch
                 let cursor = Cursor::new(data_slice.as_bytes());
                 let mut csv_reader = ReaderBuilder::new(arrow_schema.clone())
                     .with_header(false)
-                    // .with_projection(projection)
                     .build(cursor)?;
                 let batch = csv_reader.next().transpose()?.unwrap();
                 info!(
@@ -161,7 +156,7 @@ pub async fn split_zip_to_parquet_async<P: AsRef<Path>, Q: AsRef<Path>>(
                     t_segment.elapsed()
                 );
 
-                // Write Parquet in row-group chunks
+                // Write Parquet
                 let t_write = Instant::now();
                 let out_file = out_dir_clone.join(format!("{}—{}.parquet", name_clone, schema_id));
                 let file = File::create(&out_file)?;
@@ -225,11 +220,13 @@ mod tests {
         let subscriber = FmtSubscriber::builder()
             .with_env_filter(
                 EnvFilter::try_from_default_env()
-                    .unwrap_or_else(|_| EnvFilter::new("info,nemscraper::history=trace")), // Adjust crate name if necessary
+                    .unwrap_or_else(|_| EnvFilter::new("info,nemscraper::history=trace")),
             )
             .with_test_writer()
             .finish();
         let _ = tracing::subscriber::set_global_default(subscriber);
+
+        // prepare sample ZIP as before...
         let zip_path = if let Ok(path) = env::var("ZIP_PATH") {
             PathBuf::from(path)
         } else {
@@ -248,10 +245,16 @@ mod tests {
             tmp.path().to_path_buf()
         };
 
-        let out_dir = tempdir()?;
-        split_zip_to_parquet_async(&zip_path, out_dir.path()).await?;
+        // use a non-temp, project-relative test output dir
+        let out_dir = PathBuf::from("tests/output");
+        if out_dir.exists() {
+            fs::remove_dir_all(&out_dir)?;
+        }
+        fs::create_dir_all(&out_dir)?;
 
-        let files: Vec<_> = std::fs::read_dir(out_dir.path())?
+        split_zip_to_parquet_async(&zip_path, &out_dir).await?;
+
+        let files: Vec<_> = fs::read_dir(&out_dir)?
             .filter_map(|e| e.ok().map(|e| e.path()))
             .filter(|p| p.extension().and_then(|s| s.to_str()) == Some("parquet"))
             .collect();
