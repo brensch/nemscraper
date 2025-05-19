@@ -5,6 +5,7 @@
 //! The calling application is responsible for initializing a `tracing` subscriber.
 
 use anyhow::{Context, Result};
+use chrono::{Datelike, Utc};
 use futures::{stream::FuturesUnordered, StreamExt};
 use hex;
 use regex::Regex;
@@ -558,51 +559,42 @@ fn calculate_fields_hash(columns: &[Column]) -> String {
 /// # Returns
 /// A `Result` containing a `Vec<SchemaEvolution>` detailing the history of each table schema,
 /// or an `anyhow::Error` if an issue occurs.
+
 #[instrument(level = "info", skip(input_dir), fields(input_path = %input_dir.as_ref().display()))]
 pub fn extract_schema_evolutions<P: AsRef<Path>>(input_dir: P) -> Result<Vec<SchemaEvolution>> {
     info!("Starting schema evolution extraction.");
     let input_dir = input_dir.as_ref();
 
+    // --- Gather and sort all YYYYMM.json files ---
     let mut month_files = Vec::new();
     for entry in fs::read_dir(input_dir)
         .with_context(|| format!("Failed to read input directory: {:?}", input_dir))?
     {
         let entry = entry.with_context(|| "Failed to read directory entry")?;
         let path = entry.path();
-        if path.is_file() {
-            if let Some(ext) = path.extension() {
-                if ext == "json" {
-                    if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
-                        // Expect YYYYMM format
-                        if stem.len() == 6 && stem.chars().all(|c| c.is_digit(10)) {
-                            // Check if the year part is reasonable (e.g., 1990-2099)
-                            let year = stem[0..4].parse::<u32>().unwrap_or(0);
-                            let month_val = stem[4..6].parse::<u32>().unwrap_or(0);
-                            if (1990..=2099).contains(&year) && (1..=12).contains(&month_val) {
-                                month_files.push(path.clone());
-                            } else {
-                                warn!(
-                                    "Skipping file with invalid month format in name: {:?}",
-                                    path
-                                );
-                            }
-                        } else {
-                            warn!("Skipping file with non-YYYYMM name: {:?}", path);
-                        }
+        if path.is_file() && path.extension().and_then(|e| e.to_str()) == Some("json") {
+            if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
+                if stem.len() == 6 && stem.chars().all(|c| c.is_digit(10)) {
+                    let year = stem[0..4].parse::<u32>().unwrap_or(0);
+                    let month_val = stem[4..6].parse::<u32>().unwrap_or(0);
+                    if (1990..=2099).contains(&year) && (1..=12).contains(&month_val) {
+                        month_files.push(path.clone());
+                        continue;
                     }
                 }
             }
+            warn!(
+                "Skipping file with non-YYYYMM name or invalid month: {:?}",
+                path
+            );
         }
     }
-
-    // Sort files by month (YYYYMM from filename)
-    month_files.sort_by_key(|path| {
-        path.file_stem()
+    month_files.sort_by_key(|p| {
+        p.file_stem()
             .and_then(|s| s.to_str())
             .unwrap_or_default()
             .to_string()
     });
-
     debug!(
         num_month_files = month_files.len(),
         "Found and sorted month JSON files."
@@ -614,11 +606,11 @@ pub fn extract_schema_evolutions<P: AsRef<Path>>(input_dir: P) -> Result<Vec<Sch
     }
 
     let mut evolutions: Vec<SchemaEvolution> = Vec::new();
-    // Tracks the current active schema for each table: TableName -> (FieldsHash, StartMonth, Columns)
+    // table_name -> (fields_hash, start_month, columns)
     let mut active_schemas: HashMap<String, (String, String, Vec<Column>)> = HashMap::new();
-
     let mut previous_month_code: Option<String> = None;
 
+    // --- Process each month in order ---
     for month_file_path in &month_files {
         let file_name_month = month_file_path
             .file_stem()
@@ -627,68 +619,48 @@ pub fn extract_schema_evolutions<P: AsRef<Path>>(input_dir: P) -> Result<Vec<Sch
             .to_string();
 
         debug!(month_file = %month_file_path.display(), month_code = file_name_month, "Processing month file");
-
         let file_contents = fs::read_to_string(month_file_path)
             .with_context(|| format!("Failed to read month file: {:?}", month_file_path))?;
-
         let month_data: MonthSchema = serde_json::from_str(&file_contents)
             .with_context(|| format!("Failed to parse JSON from file: {:?}", month_file_path))?;
 
-        // Ensure the month in the filename matches the month in the MonthSchema object
         if month_data.month != file_name_month {
             warn!(
-                file_month = file_name_month, schema_object_month = month_data.month, file_path = %month_file_path.display(),
+                file_month = file_name_month,
+                schema_object_month = month_data.month,
+                file_path = %month_file_path.display(),
                 "Mismatch between filename month and MonthSchema.month field. Using filename month."
             );
-            // Potentially skip this file or handle inconsistency, for now, we proceed using file_name_month.
         }
-
-        let current_month_code = file_name_month;
-
-        // Keep track of tables seen in this month to handle tables that disappear
+        let current_month_code = file_name_month.clone();
         let mut tables_in_current_month: HashSet<String> = HashSet::new();
 
+        // For each table in this month
         for ctl_schema in month_data.schemas {
             tables_in_current_month.insert(ctl_schema.table.clone());
             let fields_hash = calculate_fields_hash(&ctl_schema.columns);
 
-            if let Some(active_entry) = active_schemas.get_mut(&ctl_schema.table) {
-                // Table already has an active schema
-                if active_entry.0 != fields_hash {
-                    // Schema changed for this table
-                    debug!(
-                        table = ctl_schema.table,
-                        old_hash = active_entry.0,
-                        new_hash = fields_hash,
-                        end_month = previous_month_code.as_deref().unwrap_or("N/A"),
-                        "Schema changed"
-                    );
+            if let Some(active) = active_schemas.get_mut(&ctl_schema.table) {
+                // If schema changed, close out previous and start new
+                if active.0 != fields_hash {
                     evolutions.push(SchemaEvolution {
                         table_name: ctl_schema.table.clone(),
-                        fields_hash: active_entry.0.clone(),
-                        start_month: active_entry.1.clone(),
+                        fields_hash: active.0.clone(),
+                        start_month: active.1.clone(),
                         end_month: previous_month_code
                             .clone()
-                            .unwrap_or_else(|| active_entry.1.clone()), // End in previous month
-                        columns: active_entry.2.clone(),
+                            .unwrap_or_else(|| active.1.clone()),
+                        columns: active.2.clone(),
                     });
-                    // Start new schema
-                    *active_entry = (
+                    *active = (
                         fields_hash,
                         current_month_code.clone(),
                         ctl_schema.columns.clone(),
                     );
-                } else {
-                    // Schema is the same, just continue. The end_month will be updated if it changes later or at the end.
                 }
+                // else: same schema, keep active until changed
             } else {
-                // New table encountered
-                debug!(
-                    table = ctl_schema.table,
-                    hash = fields_hash,
-                    start_month = current_month_code,
-                    "New table schema started"
-                );
+                // New table
                 active_schemas.insert(
                     ctl_schema.table.clone(),
                     (
@@ -700,74 +672,47 @@ pub fn extract_schema_evolutions<P: AsRef<Path>>(input_dir: P) -> Result<Vec<Sch
             }
         }
 
-        // Check for tables that were active but are not in the current month's schemas
-        // These tables' schemas are considered ended in the `previous_month_code`.
-        let mut tables_to_remove_from_active = Vec::new();
-        if let Some(ref prev_m) = previous_month_code {
-            // Only if there *was* a previous month
-            for (table_name, (hash, start_m, cols)) in &active_schemas {
-                if !tables_in_current_month.contains(table_name) {
-                    debug!(
-                        table = table_name,
-                        hash = hash,
-                        start_month = start_m,
-                        end_month = prev_m,
-                        "Schema ended (table not present in current month)"
-                    );
+        // Any active schemas not present this month have ended
+        if let Some(prev) = &previous_month_code {
+            let mut to_remove = Vec::new();
+            for (table, (hash, start, cols)) in &active_schemas {
+                if !tables_in_current_month.contains(table) {
                     evolutions.push(SchemaEvolution {
-                        table_name: table_name.clone(),
+                        table_name: table.clone(),
                         fields_hash: hash.clone(),
-                        start_month: start_m.clone(),
-                        end_month: prev_m.clone(),
+                        start_month: start.clone(),
+                        end_month: prev.clone(),
                         columns: cols.clone(),
                     });
-                    tables_to_remove_from_active.push(table_name.clone());
+                    to_remove.push(table.clone());
                 }
             }
-        }
-        for table_name in tables_to_remove_from_active {
-            active_schemas.remove(&table_name);
+            for t in to_remove {
+                active_schemas.remove(&t);
+            }
         }
 
         previous_month_code = Some(current_month_code);
     }
 
-    // After iterating through all month files, close any remaining active schemas
-    // Their end_month will be extended 1 year into the future from the last processed month
-    if let Some(last_month_code) = previous_month_code {
-        // Calculate a date 1 year in the future
-        let year = last_month_code[0..4].parse::<u32>().unwrap_or(2025);
-        let month = last_month_code[4..6].parse::<u32>().unwrap_or(1);
+    // --- FINAL PASS: extend every table's last evolution to current YYYYMM ---
+    let now = Utc::now();
+    let current_yyyymm = format!("{:04}{:02}", now.year(), now.month());
 
-        // Add 1 year to the date
-        let future_year = year + 1;
-        let future_month_code = format!("{}{:02}", future_year, month);
-
-        debug!(
-            last_month = last_month_code,
-            future_month = future_month_code,
-            "Extending final schema versions one year into the future"
-        );
-
-        for (table_name, (hash, start_month, columns)) in active_schemas {
-            debug!(
-                table = table_name,
-                hash = hash,
-                start_month = start_month,
-                end_month = future_month_code,
-                "Closing active schema with extended end date"
-            );
-            evolutions.push(SchemaEvolution {
-                table_name,
-                fields_hash: hash,
-                start_month,
-                end_month: future_month_code.clone(),
-                columns,
-            });
-        }
+    // Map table_name -> index in `evolutions` of its last entry
+    // ── FINAL PASS ──
+    // Build a map from *owned* table_name → index of its last evolution
+    let mut last_index: HashMap<String, usize> = HashMap::new();
+    for (idx, evo) in evolutions.iter().enumerate() {
+        last_index.insert(evo.table_name.clone(), idx);
     }
 
-    // Sort evolutions for deterministic output, useful for tests and consistency
+    // Now we can freely mutate `evolutions` because `last_index` no longer holds borrows into it
+    for &idx in last_index.values() {
+        evolutions[idx].end_month = current_yyyymm.clone();
+    }
+
+    // Sort for deterministic output
     evolutions.sort_by(|a, b| {
         a.table_name
             .cmp(&b.table_name)
