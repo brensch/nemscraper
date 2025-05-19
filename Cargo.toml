@@ -47,3 +47,4 @@ arrow2 = { version = "0.18", default-features = false, features = [
 ] }
 arrow = "55.1.0"
 parquet = "55.1.0"
+rayon = "1.10.0"

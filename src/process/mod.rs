@@ -1,11 +1,11 @@
-// Declare submodules and re-export RawTable
 mod raw_table;
 pub use raw_table::RawTable;
 
 use anyhow::{Context, Result};
 use std::{
     fs::{self, File},
-    io::{Cursor, Read},
+    io::Cursor,
+    io::Read,
     path::{Path, PathBuf},
     sync::Arc,
     time::Instant,
@@ -19,30 +19,118 @@ use arrow::{
     datatypes::{DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema},
     record_batch::RecordBatch,
 };
+use num_cpus;
 use parquet::{arrow::ArrowWriter, basic::Compression, file::properties::WriterProperties};
+use rayon::prelude::*;
+
+/// Split a single “I…D…D…” segment into row‐chunks and write each as its own Parquet file.
+/// - `name`: original CSV file name
+/// - `schema_id`: the segment’s schema identifier
+/// - `header_slice`: the raw “I,…\n” header line
+/// - `data_slice`: everything between that header and the next I- or C-line
+/// - `out_dir`: where to write `name—schema_id—chunkN.parquet`
+fn chunk_and_write_segment(
+    name: &str,
+    schema_id: &str,
+    header_slice: &str,
+    data_slice: &str,
+    out_dir: &Path,
+) {
+    // 1) parse column names once
+    let cols: Vec<String> = header_slice
+        .lines()
+        .next()
+        .unwrap()
+        .split(',')
+        .map(str::to_string)
+        .collect();
+
+    // 2) build the Arrow schema
+    let arrow_schema = Arc::new(ArrowSchema::new(
+        cols.iter()
+            .map(|c| ArrowField::new(c, ArrowDataType::Utf8, true))
+            .collect::<Vec<ArrowField>>(),
+    ));
+
+    // 3) choose your chunk size
+    let chunk_size = 1_000_000;
+
+    // 4) view each row as a &str
+    let lines: Vec<&str> = data_slice.lines().collect();
+    let total_rows = lines.len();
+    let n_chunks = (total_rows + chunk_size - 1) / chunk_size;
+
+    info!(
+        segment = %schema_id,
+        rows = total_rows,
+        chunks = n_chunks,
+        "splitting segment into {}-row chunks",
+        chunk_size
+    );
+
+    // 5) parallelize per-chunk
+    lines
+        .chunks(chunk_size)
+        .into_iter()
+        .enumerate()
+        .for_each(|(chunk_idx, chunk_lines)| {
+            // reassemble a mini-CSV
+            let chunk_body = chunk_lines.join("\n");
+            let cursor = Cursor::new(chunk_body.as_bytes());
+
+            // fresh CSV reader for this chunk
+            let mut csv_reader = ReaderBuilder::new(arrow_schema.clone())
+                .with_header(false)
+                .build(cursor)
+                .unwrap();
+
+            // open per-chunk Parquet file
+            let out_file =
+                out_dir.join(format!("{}—{}—chunk{}.parquet", name, schema_id, chunk_idx));
+            let file = File::create(&out_file).unwrap();
+            let props = WriterProperties::builder()
+                .set_compression(Compression::SNAPPY)
+                .build();
+            let mut writer = ArrowWriter::try_new(file, arrow_schema.clone(), Some(props)).unwrap();
+
+            // write all record batches
+            while let Some(batch) = csv_reader.next().transpose().unwrap() {
+                writer.write(&batch).unwrap();
+            }
+            writer.close().unwrap();
+
+            info!(
+                segment = %schema_id,
+                chunk = chunk_idx,
+                "wrote chunk {} ({} rows)",
+                chunk_idx,
+                chunk_lines.len()
+            );
+        });
+}
 
 #[instrument(level = "info", skip(zip_path, out_dir), fields(zip = %zip_path.as_ref().display()))]
 pub fn split_zip_to_parquet<P: AsRef<Path>, Q: AsRef<Path>>(zip_path: P, out_dir: Q) -> Result<()> {
+    // Build a global Rayon pool on first call (ignore error if already built)
+    rayon::ThreadPoolBuilder::new()
+        .num_threads(num_cpus::get())
+        .build_global()
+        .ok();
+
     let start_total = Instant::now();
-    info!("starting serial split_zip_to_parquet");
+    info!("starting parallel split_zip_to_parquet");
 
     let zip_path_buf: PathBuf = zip_path.as_ref().to_path_buf();
     let out_dir_buf: PathBuf = out_dir.as_ref().to_path_buf();
 
-    // Ensure output directory exists
-    let t0 = Instant::now();
     fs::create_dir_all(&out_dir_buf)?;
-    info!("created output directory in {:?}", t0.elapsed());
 
-    // Open ZIP archive
-    let t1 = Instant::now();
     let file =
         File::open(&zip_path_buf).with_context(|| format!("opening ZIP {:?}", zip_path_buf))?;
     let mut archive =
         ZipArchive::new(file).with_context(|| format!("reading ZIP {:?}", zip_path_buf))?;
-    info!("opened and read ZIP archive in {:?}", t1.elapsed());
 
-    // Iterate entries
+    // Iterate each CSV in the ZIP
     for i in 0..archive.len() {
         let mut entry = archive.by_index(i)?;
         let name = entry.name().to_string();
@@ -50,131 +138,65 @@ pub fn split_zip_to_parquet<P: AsRef<Path>, Q: AsRef<Path>>(zip_path: P, out_dir
             continue;
         }
 
-        // Read entire CSV entry
-        let t_read = Instant::now();
+        // Read entire CSV into memory
         let mut buf = Vec::with_capacity(entry.size() as usize);
         entry.read_to_end(&mut buf)?;
-        let text = String::from_utf8_lossy(&buf).to_string();
-        info!(
-            index = i,
-            bytes = entry.size(),
-            "read entry in {:?}",
-            t_read.elapsed()
-        );
+        let text = Arc::new(String::from_utf8_lossy(&buf).to_string());
 
-        // Identify segments by I-row boundaries
-        let mut segments: Vec<(String, usize, usize, usize)> = Vec::new();
-        let mut pos = 0; // byte offset into `text`
-        let mut header_start = 0; // start of current I-header
-        let mut data_start = 0; // start of first D-row after that header
-        let mut current_schema: Option<String> = None;
-        let mut encountered_header = false;
+        // Identify I…D… segments
+        let segments: Vec<(String, usize, usize, usize)> = {
+            let mut segs = Vec::new();
+            let mut pos = 0;
+            let mut header_start = 0;
+            let mut data_start = 0;
+            let mut current_schema: Option<String> = None;
+            let mut seen_footer = false;
 
-        for chunk in text.split_inclusive('\n') {
-            // stop at the "C,…" footer
-            if chunk.starts_with("C,") {
-                if !encountered_header {
+            for chunk in text.split_inclusive('\n') {
+                if chunk.starts_with("C,") {
+                    if seen_footer {
+                        break;
+                    }
+                    seen_footer = true;
                     pos += chunk.len();
-                    encountered_header = true;
+                    continue;
                 }
-                continue;
-            }
-
-            // whenever we hit an I-row, close out the previous segment
-            if chunk.starts_with("I,") {
-                if let Some(schema_id) = current_schema.take() {
-                    // segment_end = pos is the exact byte index where this I-line began
-                    segments.push((schema_id, header_start, data_start, pos));
+                if chunk.starts_with("I,") {
+                    if let Some(schema_id) = current_schema.take() {
+                        segs.push((schema_id, header_start, data_start, pos));
+                    }
+                    header_start = pos;
+                    let parts: Vec<&str> = chunk.trim_end_matches('\n').split(',').collect();
+                    current_schema = Some(format!("{}_{}", parts[1], parts[2]));
+                    data_start = pos + chunk.len();
                 }
-
-                // start a new segment at this I-row
-                header_start = pos;
-                // pull out your 2nd and 3rd fields to build the schema_id
-                let parts: Vec<&str> = chunk.trim_end_matches('\n').split(',').collect();
-                current_schema = Some(format!("{}_{}", parts[1], parts[2]));
-
-                // data starts immediately *after* this header chunk
-                data_start = pos + chunk.len();
+                pos += chunk.len();
             }
-
-            // advance our offset by the full length of this chunk (including newline)
-            pos += chunk.len();
-        }
-
-        // push the very last segment (up to the footer or EOF)
-        if let Some(schema_id) = current_schema {
-            segments.push((schema_id, header_start, data_start, pos));
-        }
-
-        // Process each segment serially
-        for (schema_id, header_start, data_start, segment_end) in segments {
-            let t_segment = Instant::now();
-            info!(segment = %schema_id, "processing segment");
-
-            // Extract data slice (skip I-line)
-            let data_slice = &text[data_start..segment_end];
-
-            // Parse columns from the I-line header slice
-            let header_line = &text[header_start..data_start];
-            let cols: Vec<String> = header_line
-                .lines()
-                .next()
-                .unwrap()
-                .split(',')
-                .map(str::to_string)
-                .collect();
-            let num_cols = cols.len();
-            info!(segment = %schema_id, num_cols, "parsed columns");
-
-            // Build Arrow schema
-            let arrow_schema = Arc::new(ArrowSchema::new(
-                cols.iter()
-                    .map(|c| ArrowField::new(c, ArrowDataType::Utf8, true))
-                    .collect::<Vec<ArrowField>>(),
-            ));
-
-            // Parse CSV in streaming batches
-            let cursor = Cursor::new(data_slice.as_bytes());
-            let mut csv_reader = ReaderBuilder::new(arrow_schema.clone())
-                .with_header(false)
-                // // if you *really* want to read more than 1024 at once:
-                // .with_batch_size(10_000_000)
-                .build(cursor)?;
-
-            // Prepare Parquet writer
-            let out_file = out_dir_buf.join(format!("{}—{}.parquet", name, schema_id));
-            let file = File::create(&out_file)?;
-            let props = WriterProperties::builder()
-                .set_compression(Compression::UNCOMPRESSED)
-                .build();
-            let mut writer = ArrowWriter::try_new(file, arrow_schema.clone(), Some(props))?;
-
-            // Stream *all* batches through to Parquet
-            let t_write = Instant::now();
-
-            while let Some(batch) = csv_reader.next().transpose()? {
-                writer.write(&batch)?;
+            if let Some(schema_id) = current_schema {
+                segs.push((schema_id, header_start, data_start, pos));
             }
+            segs
+        };
 
-            // Finalize
-            writer.close()?;
-            info!(segment = %schema_id, "wrote full parquet in {:?}", t_write.elapsed());
-
-            info!(
-                segment = %schema_id,
-                "wrote parquet segment in {:?}",
-                t_write.elapsed()
-            );
-            info!(
-                segment = %schema_id,
-                "segment total time {:?}",
-                t_segment.elapsed()
-            );
-        }
+        // Process each segment in parallel, chunking rows internally
+        segments
+            .into_par_iter()
+            .for_each(|(schema_id, hs, ds, es)| {
+                let t0 = Instant::now();
+                info!(segment = %schema_id, "processing segment");
+                let header_slice = &text[hs..ds];
+                let data_slice = &text[ds..es];
+                chunk_and_write_segment(&name, &schema_id, header_slice, data_slice, &out_dir_buf);
+                info!(
+                    segment = %schema_id,
+                    "segment total time {:?}",
+                    t0.elapsed()
+                );
+            });
     }
 
     info!(
-        "serial split_zip_to_parquet total time {:?}",
+        "parallel split_zip_to_parquet total time {:?}",
         start_total.elapsed()
     );
     Ok(())
@@ -184,11 +206,7 @@ pub fn split_zip_to_parquet<P: AsRef<Path>, Q: AsRef<Path>>(zip_path: P, out_dir
 mod tests {
     use super::*;
     use anyhow::Result;
-    use std::{
-        env,
-        fs::File,
-        io::{Cursor, Write},
-    };
+    use std::{env, fs, io::Write};
     use tempfile::NamedTempFile;
     use tracing_subscriber::{EnvFilter, FmtSubscriber};
     use zip::write::{ExtendedFileOptions, FileOptions};
@@ -205,7 +223,7 @@ mod tests {
             .finish();
         let _ = tracing::subscriber::set_global_default(subscriber);
 
-        // prepare sample ZIP as before...
+        // prepare sample ZIP...
         let zip_path = if let Ok(path) = env::var("ZIP_PATH") {
             PathBuf::from(path)
         } else {
@@ -224,7 +242,6 @@ mod tests {
             tmp.path().to_path_buf()
         };
 
-        // use a non-temp, project-relative test output dir
         let out_dir = PathBuf::from("tests/output");
         if !out_dir.exists() {
             fs::create_dir_all(&out_dir)?;

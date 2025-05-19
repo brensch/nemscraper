@@ -19,3 +19,4 @@ target/
 *.duckdb
 *.zip
 *.wal
+*.parquet
