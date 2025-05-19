@@ -3,7 +3,6 @@ mod raw_table;
 pub use raw_table::RawTable;
 
 use anyhow::{Context, Result};
-use futures::stream::{FuturesUnordered, StreamExt};
 use std::{
     fs::{self, File},
     io::{Cursor, Read},
@@ -11,7 +10,6 @@ use std::{
     sync::Arc,
     time::Instant,
 };
-use tokio::task;
 use tracing::{info, instrument};
 use zip::ZipArchive;
 
@@ -22,13 +20,11 @@ use arrow::{
     record_batch::RecordBatch,
 };
 use parquet::{arrow::ArrowWriter, basic::Compression, file::properties::WriterProperties};
+
 #[instrument(level = "info", skip(zip_path, out_dir), fields(zip = %zip_path.as_ref().display()))]
-pub async fn split_zip_to_parquet_async<P: AsRef<Path>, Q: AsRef<Path>>(
-    zip_path: P,
-    out_dir: Q,
-) -> Result<()> {
+pub fn split_zip_to_parquet<P: AsRef<Path>, Q: AsRef<Path>>(zip_path: P, out_dir: Q) -> Result<()> {
     let start_total = Instant::now();
-    info!("starting async split_zip_to_parquet");
+    info!("starting serial split_zip_to_parquet");
 
     let zip_path_buf: PathBuf = zip_path.as_ref().to_path_buf();
     let out_dir_buf: PathBuf = out_dir.as_ref().to_path_buf();
@@ -66,8 +62,7 @@ pub async fn split_zip_to_parquet_async<P: AsRef<Path>, Q: AsRef<Path>>(
             t_read.elapsed()
         );
 
-        // Identify segments by I-row boundaries, using split_inclusive so
-        // chunk.len() always reflects the real byte length (incl. CRLF if present)
+        // Identify segments by I-row boundaries
         let mut segments: Vec<(String, usize, usize, usize)> = Vec::new();
         let mut pos = 0; // byte offset into `text`
         let mut header_start = 0; // start of current I-header
@@ -76,7 +71,7 @@ pub async fn split_zip_to_parquet_async<P: AsRef<Path>, Q: AsRef<Path>>(
         let mut encountered_header = false;
 
         for chunk in text.split_inclusive('\n') {
-            // stop at the “C,…” footer
+            // stop at the "C,…" footer
             if chunk.starts_with("C,") {
                 if !encountered_header {
                     pos += chunk.len();
@@ -111,91 +106,77 @@ pub async fn split_zip_to_parquet_async<P: AsRef<Path>, Q: AsRef<Path>>(
             segments.push((schema_id, header_start, data_start, pos));
         }
 
-        // Process each segment in parallel via Tokio tasks
-        let mut futures = FuturesUnordered::new();
+        // Process each segment serially
         for (schema_id, header_start, data_start, segment_end) in segments {
-            let out_dir_clone = out_dir_buf.clone();
-            let name_clone = name.clone();
-            let text_clone = text.clone();
+            let t_segment = Instant::now();
+            info!(segment = %schema_id, "processing segment");
 
-            futures.push(task::spawn_blocking(move || -> Result<()> {
-                let t_segment = Instant::now();
-                info!(segment = %schema_id, "processing segment");
+            // Extract data slice (skip I-line)
+            let data_slice = &text[data_start..segment_end];
 
-                // Extract data slice (skip I-line)
-                let data_slice = &text_clone[data_start..segment_end];
+            // Parse columns from the I-line header slice
+            let header_line = &text[header_start..data_start];
+            let cols: Vec<String> = header_line
+                .lines()
+                .next()
+                .unwrap()
+                .split(',')
+                .map(str::to_string)
+                .collect();
+            let num_cols = cols.len();
+            info!(segment = %schema_id, num_cols, "parsed columns");
 
-                // Parse columns from the I-line header slice
-                let header_line = &text_clone[header_start..data_start];
-                let cols: Vec<String> = header_line
-                    .lines()
-                    .next()
-                    .unwrap()
-                    .split(',')
-                    .map(str::to_string)
-                    .collect();
-                let num_cols = cols.len();
-                info!(segment = %schema_id, num_cols, "parsed columns");
+            // Build Arrow schema
+            let arrow_schema = Arc::new(ArrowSchema::new(
+                cols.iter()
+                    .map(|c| ArrowField::new(c, ArrowDataType::Utf8, true))
+                    .collect::<Vec<ArrowField>>(),
+            ));
 
-                // Build Arrow schema
-                let arrow_schema = Arc::new(ArrowSchema::new(
-                    cols.iter()
-                        .map(|c| ArrowField::new(c, ArrowDataType::Utf8, true))
-                        .collect::<Vec<ArrowField>>(),
-                ));
+            // CSV -> RecordBatch
+            let cursor = Cursor::new(data_slice.as_bytes());
+            let mut csv_reader = ReaderBuilder::new(arrow_schema.clone())
+                .with_header(false)
+                .build(cursor)?;
+            let batch = csv_reader.next().transpose()?.unwrap();
+            info!(
+                segment = %schema_id,
+                "deserialized into RecordBatch in {:?}",
+                t_segment.elapsed()
+            );
 
-                // CSV -> RecordBatch
-                let cursor = Cursor::new(data_slice.as_bytes());
-                let mut csv_reader = ReaderBuilder::new(arrow_schema.clone())
-                    .with_header(false)
-                    .build(cursor)?;
-                let batch = csv_reader.next().transpose()?.unwrap();
-                info!(
-                    segment = %schema_id,
-                    "deserialized into RecordBatch in {:?}",
-                    t_segment.elapsed()
-                );
+            // Write Parquet
+            let t_write = Instant::now();
+            let out_file = out_dir_buf.join(format!("{}—{}.parquet", name, schema_id));
+            let file = File::create(&out_file)?;
+            let props = WriterProperties::builder()
+                .set_compression(Compression::SNAPPY)
+                .build();
+            let mut writer = ArrowWriter::try_new(file, arrow_schema, Some(props))?;
 
-                // Write Parquet
-                let t_write = Instant::now();
-                let out_file = out_dir_clone.join(format!("{}—{}.parquet", name_clone, schema_id));
-                let file = File::create(&out_file)?;
-                let props = WriterProperties::builder()
-                    .set_compression(Compression::SNAPPY)
-                    .build();
-                let mut writer = ArrowWriter::try_new(file, arrow_schema, Some(props))?;
-
-                let total_rows = batch.num_rows();
-                let chunk_size = 1_000_000;
-                for offset in (0..total_rows).step_by(chunk_size) {
-                    let len = (chunk_size).min(total_rows - offset);
-                    let slice_batch = batch.slice(offset, len);
-                    writer.write(&slice_batch)?;
-                }
-                writer.close()?;
-                info!(
-                    segment = %schema_id,
-                    "wrote parquet segment in {:?}",
-                    t_write.elapsed()
-                );
-                info!(
-                    segment = %schema_id,
-                    "segment total time {:?}",
-                    t_segment.elapsed()
-                );
-
-                Ok(())
-            }));
-        }
-
-        // Await all tasks
-        while let Some(res) = futures.next().await {
-            res??;
+            let total_rows = batch.num_rows();
+            let chunk_size = 1_000_000;
+            for offset in (0..total_rows).step_by(chunk_size) {
+                let len = (chunk_size).min(total_rows - offset);
+                let slice_batch = batch.slice(offset, len);
+                writer.write(&slice_batch)?;
+            }
+            writer.close()?;
+            info!(
+                segment = %schema_id,
+                "wrote parquet segment in {:?}",
+                t_write.elapsed()
+            );
+            info!(
+                segment = %schema_id,
+                "segment total time {:?}",
+                t_segment.elapsed()
+            );
         }
     }
 
     info!(
-        "async split_zip_to_parquet total time {:?}",
+        "serial split_zip_to_parquet total time {:?}",
         start_total.elapsed()
     );
     Ok(())
@@ -208,15 +189,15 @@ mod tests {
     use std::{
         env,
         fs::File,
-        io::{Cursor, Read, Write},
+        io::{Cursor, Write},
     };
-    use tempfile::{tempdir, NamedTempFile};
+    use tempfile::NamedTempFile;
     use tracing_subscriber::{EnvFilter, FmtSubscriber};
     use zip::write::{ExtendedFileOptions, FileOptions};
     use zip::CompressionMethod;
 
-    #[tokio::test]
-    async fn test_split_zip_to_parquet_async() -> Result<()> {
+    #[test]
+    fn test_split_zip_to_parquet() -> Result<()> {
         let subscriber = FmtSubscriber::builder()
             .with_env_filter(
                 EnvFilter::try_from_default_env()
@@ -252,7 +233,7 @@ mod tests {
         }
         fs::create_dir_all(&out_dir)?;
 
-        split_zip_to_parquet_async(&zip_path, &out_dir).await?;
+        split_zip_to_parquet(&zip_path, &out_dir)?;
 
         let files: Vec<_> = fs::read_dir(&out_dir)?
             .filter_map(|e| e.ok().map(|e| e.path()))
