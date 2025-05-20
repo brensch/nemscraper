@@ -1,6 +1,6 @@
 // data/src/process/chunk.rs
 use arrow::csv::ReaderBuilder;
-use arrow::datatypes::{DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema};
+use arrow::datatypes::Schema as ArrowSchema;
 use parquet::arrow::ArrowWriter;
 use parquet::basic::Compression;
 use parquet::file::properties::WriterProperties;
@@ -10,67 +10,83 @@ use std::path::Path;
 use std::sync::Arc;
 use tracing::info;
 
-/// Split a single segment into row-chunks and write each as its own Parquet file.
+/// Split a single CSV segment into row-chunks and write each as its own Parquet file.
+///
+/// # Arguments
+/// * `table_name`   – the original CSV file name (e.g. `"aemo.csv"`)
+/// * `schema_id`    – identifier for the schema (e.g. the `fields_hash`)
+/// * `header`       – the CSV bytes from the `I,` line (metadata + trailing `\n`)
+/// * `data`         – the CSV bytes for all rows belonging to this segment
+/// * `arrow_schema` – the pre-built Arrow schema from SchemaEvolution
+/// * `out_dir`      – directory to write parquet files into
 pub fn chunk_and_write_segment(
-    name: &str,
+    table_name: &str,
     schema_id: &str,
-    header_slice: &str,
-    data_slice: &str,
+    header: &str,
+    data: &str,
+    arrow_schema: Arc<ArrowSchema>,
     out_dir: &Path,
 ) {
-    // 1) parse column names
-    let cols: Vec<String> = header_slice
-        .lines()
-        .next()
-        .unwrap()
-        .split(',')
-        .map(ToString::to_string)
-        .collect();
-
-    // 2) build Arrow schema (note the explicit Vec<ArrowField> here)
-    let arrow_schema = Arc::new(ArrowSchema::new(
-        cols.iter()
-            .map(|c| ArrowField::new(c, ArrowDataType::Utf8, true))
-            .collect::<Vec<ArrowField>>(),
-    ));
-
-    // 3) choose your chunk size
+    // max rows per Parquet file
     let chunk_size = 500_000;
-    let lines: Vec<&str> = data_slice.lines().collect();
-    let total_rows = lines.len();
 
-    info!(segment = %schema_id, rows = total_rows, "splitting into chunks");
+    // split data rows (preserves original line order)
+    let data_lines: Vec<&str> = data.lines().collect();
+    let total_rows = data_lines.len();
 
-    // 4) parallelize per-chunk
-    lines
+    info!(
+        table = %table_name,
+        schema = %schema_id,
+        rows = total_rows,
+        "splitting into chunks"
+    );
+
+    data_lines
         .par_chunks(chunk_size)
         .enumerate()
-        .for_each(|(chunk_idx, chunk_lines)| {
-            // reassemble a mini-CSV
-            let chunk_body = chunk_lines.join("\n");
-            let cursor = std::io::Cursor::new(chunk_body.as_bytes());
+        .for_each(|(chunk_idx, chunk)| {
+            // build a CSV record: header + chunk rows
+            let mut buf = String::with_capacity(header.len() + chunk.len() * 30);
+            buf.push_str(header);
+            if !header.ends_with('\n') {
+                buf.push('\n');
+            }
+            for line in chunk {
+                buf.push_str(line);
+                buf.push('\n');
+            }
 
-            // fresh CSV reader for this chunk
+            // CSV reader with no header row (we treat the `I,` line as data)
+            let cursor = std::io::Cursor::new(buf.as_bytes());
             let mut reader = ReaderBuilder::new(arrow_schema.clone())
                 .with_header(false)
                 .build(cursor)
-                .unwrap();
+                .expect("CSV reader failed");
 
-            // open per-chunk Parquet file
-            let out_file =
-                out_dir.join(format!("{}—{}—chunk{}.parquet", name, schema_id, chunk_idx));
-            let file = File::create(&out_file).unwrap();
+            // open per-chunk Parquet
+            let out_path = out_dir.join(format!(
+                "{}—{}—chunk{}.parquet",
+                table_name, schema_id, chunk_idx
+            ));
+            let file = File::create(&out_path).expect("failed to create parquet file");
             let props = WriterProperties::builder()
                 .set_compression(Compression::SNAPPY)
                 .build();
-            let mut writer = ArrowWriter::try_new(file, arrow_schema.clone(), Some(props)).unwrap();
+            let mut writer = ArrowWriter::try_new(file, arrow_schema.clone(), Some(props))
+                .expect("failed to create parquet writer");
 
-            // write all record batches
+            // write all batches
             while let Some(batch) = reader.next().transpose().unwrap() {
                 writer.write(&batch).unwrap();
             }
             writer.close().unwrap();
 
-            info!(segment = %schema_id, chunk = chunk_idx, "wrote {} rows", chunk_lines.len());
+            info!(
+                table = %table_name,
+                schema = %schema_id,
+                chunk = chunk_idx,
+                "wrote {} rows",
+                chunk.len()
+            );
         });
 }

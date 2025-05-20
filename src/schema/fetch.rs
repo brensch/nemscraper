@@ -132,6 +132,8 @@ pub async fn fetch_all<P: AsRef<Path>>(client: &Client, output_dir: P) -> Result
     }
     // sort by YYYYMM
     months.sort_by_key(|u| month_code_from_url(u));
+    // **reverse** so we process newest months first
+    months.reverse();
 
     const MAX_CONCURRENCY: usize = 3;
     const MAX_RETRIES: u32 = 3;

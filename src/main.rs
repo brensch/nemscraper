@@ -1,10 +1,13 @@
 // data/src/main.rs
 
-use nemscraper::{fetch, process, schema};
+use nemscraper::{
+    fetch, process,
+    schema::{self, SchemaEvolution},
+};
 use reqwest::Client;
 
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     fs::{self, File},
     path::{Path, PathBuf},
     sync::Arc,
@@ -36,10 +39,13 @@ async fn main() -> anyhow::Result<()> {
         .init();
     tracing::info!("startup");
 
+    std::panic::set_hook(Box::new(|info| {
+        eprintln!("panic: {:?}", info);
+    }));
+
     // ─── 2) configure dirs ───────────────────────────────────────────
     let client = Client::new();
     let schemas_dir = Path::new("schemas");
-    let evolutions_file = Path::new("schema_evolutions.json");
     let zips_dir = PathBuf::from("zips");
     let out_parquet_dir = PathBuf::from("out_parquets");
     let history_dir = PathBuf::from("history");
@@ -52,9 +58,10 @@ async fn main() -> anyhow::Result<()> {
     tracing::info!("fetch schemas → {}", schemas_dir.display());
     schema::fetch_all(&client, schemas_dir).await?;
     let evolutions = schema::extract_schema_evolutions(schemas_dir)?;
+    // build lookup once
     tracing::info!("{} evolutions", evolutions.len());
-    fs::write(evolutions_file, serde_json::to_string_pretty(&evolutions)?)?;
-    tracing::info!("wrote {}", evolutions_file.display());
+    let lookup: Arc<HashMap<String, Vec<Arc<SchemaEvolution>>>> =
+        Arc::new(SchemaEvolution::build_lookup(evolutions));
 
     // ─── 4) load history to skip processed ZIPs ──────────────────────
     let processed: HashSet<String> = fs::read_dir(&history_dir)?
@@ -133,30 +140,59 @@ async fn main() -> anyhow::Result<()> {
 
     let num_workers = num_cpus::get().max(1);
     for worker_id in 0..num_workers {
-        let rx = rx.clone();
-        let history_dir = history_dir.clone();
+        // clone all shared handles *before* entering the async block
+        let lookup = Arc::clone(&lookup);
+        let rx = Arc::clone(&rx);
         let out_parquet_dir = out_parquet_dir.clone();
-
-        // create a span that carries our worker_id
+        let history_dir = history_dir.clone();
         let worker_span = info_span!("worker", id = worker_id);
 
-        // instrument the entire async block with that span
-        proc_handles.push(tokio::spawn(
+        let handle = tokio::spawn(
             async move {
-                while let Some(msg) = { rx.lock().await.recv().await } {
+                loop {
+                    // 1) Grab one message, then immediately drop the lock
+                    let msg_opt = {
+                        let mut guard = rx.lock().await;
+                        guard.recv().await
+                    };
+                    let msg = match msg_opt {
+                        Some(m) => m,
+                        None => break, // channel closed -> exit loop
+                    };
+
                     match msg {
                         Ok(zip_path) => {
                             let name = zip_path.file_name().unwrap().to_string_lossy().to_string();
-                            info!("processing {}", name);
 
-                            if let Err(e) =
-                                process::split::split_zip_to_parquet(&zip_path, &out_parquet_dir)
-                            {
-                                error!("split {} error: {}", name, e);
+                            info!(
+                                worker = worker_id,
+                                thread = ?std::thread::current().id(),
+                                "processing {}",
+                                name
+                            );
+
+                            // 2) Offload the heavy split to the blocking pool,
+                            //    passing in our cloned lookup Arc
+                            let lookup_clone = Arc::clone(&lookup);
+                            let out_clone = out_parquet_dir.clone();
+                            let zip_clone = zip_path.clone();
+
+                            let split_result = tokio::task::spawn_blocking(move || {
+                                process::split::split_zip_to_parquet(
+                                    &zip_clone,
+                                    &out_clone,
+                                    lookup_clone,
+                                )
+                            })
+                            .await
+                            .expect("blocking task panicked");
+
+                            if let Err(e) = split_result {
+                                error!(worker = worker_id, "split {} error: {}", name, e);
                                 continue;
                             }
 
-                            // write history
+                            // 3) write history/<name>.parquet
                             let hist_file = history_dir.join(format!("{}.parquet", name));
                             {
                                 let schema = Schema::new(vec![Field::new(
@@ -170,6 +206,7 @@ async fn main() -> anyhow::Result<()> {
                                     vec![Arc::new(arr)],
                                 )
                                 .expect("make batch");
+
                                 let file = File::create(&hist_file).expect("create history file");
                                 let props = WriterProperties::builder()
                                     .set_compression(Compression::SNAPPY)
@@ -180,20 +217,30 @@ async fn main() -> anyhow::Result<()> {
                                 writer.write(&batch).expect("write batch");
                                 writer.close().expect("close writer");
                             }
-                            info!("wrote history for {}", name);
+                            info!(worker = worker_id, "wrote history for {}", name);
 
-                            // delete zip
-                            let _ = std::fs::remove_file(&zip_path);
-                            info!(zip_path = %zip_path.display(), "deleted zip");
+                            // 4) delete the ZIP
+                            if let Err(e) = std::fs::remove_file(&zip_path) {
+                                error!(worker = worker_id, "failed to delete {}: {}", name, e);
+                            } else {
+                                info!(
+                                    worker   = worker_id,
+                                    zip_path = %zip_path.display(),
+                                    "deleted zip"
+                                );
+                            }
                         }
+
                         Err((url, err)) => {
-                            error!("download error {}: {}", url, err);
+                            error!(worker = worker_id, "download error {}: {}", url, err);
                         }
                     }
                 }
             }
             .instrument(worker_span),
-        ));
+        );
+
+        proc_handles.push(handle);
     }
 
     // ─── 8) await all tasks ─────────────────────────────────────────

@@ -11,7 +11,25 @@ use std::{
 };
 use tracing::{debug, instrument, warn};
 
+use crate::schema::build_arrow_schema;
+
 use super::types::{calculate_fields_hash, Column, MonthSchema, SchemaEvolution};
+
+impl SchemaEvolution {
+    /// Build a lookup map from table name -> list of Arc<SchemaEvolution>
+    pub fn build_lookup(
+        evolutions: Vec<SchemaEvolution>,
+    ) -> HashMap<String, Vec<Arc<SchemaEvolution>>> {
+        let mut lookup: HashMap<String, Vec<Arc<SchemaEvolution>>> = HashMap::new();
+        for evo in evolutions {
+            lookup
+                .entry(evo.table_name.clone())
+                .or_default()
+                .push(Arc::new(evo));
+        }
+        lookup
+    }
+}
 
 /// Read all `<YYYYMM>.json` in `input_dir` and produce `SchemaEvolution` entries.
 #[instrument(level = "info", skip(input_dir), fields(input_path = %input_dir.as_ref().display()))]
@@ -54,12 +72,14 @@ pub fn extract_schema_evolutions<P: AsRef<Path>>(input_dir: P) -> Result<Vec<Sch
 
             if let Some((active_hash, start, cols)) = active.get_mut(&cs.table) {
                 if *active_hash != hash {
+                    let arrow_schema = build_arrow_schema(&cols);
                     evolutions.push(SchemaEvolution {
                         table_name: cs.table.clone(),
                         fields_hash: active_hash.clone(),
                         start_month: start.clone(),
                         end_month: prev_month.clone().unwrap_or_else(|| start.clone()),
                         columns: cols.clone(),
+                        arrow_schema,
                     });
                     *active_hash = hash;
                     *start = month_code.clone();
@@ -80,12 +100,14 @@ pub fn extract_schema_evolutions<P: AsRef<Path>>(input_dir: P) -> Result<Vec<Sch
                 .map(|(t, (h, s, c))| (t.clone(), h.clone(), s.clone(), c.clone()))
                 .collect();
             for (table, hash, start, cols) in ended {
+                let arrow_schema = build_arrow_schema(&cols);
                 evolutions.push(SchemaEvolution {
                     table_name: table.clone(),
                     fields_hash: hash,
                     start_month: start,
                     end_month: prev.clone(),
                     columns: cols,
+                    arrow_schema,
                 });
                 active.remove(&table);
             }

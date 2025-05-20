@@ -1,5 +1,8 @@
 // src/schema/types.rs
 
+use arrow::datatypes::Schema as ArrowSchema;
+use std::sync::Arc;
+
 use hex;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -28,14 +31,14 @@ pub struct MonthSchema {
 }
 
 /// A period during which a table’s schema stayed constant.
-#[derive(Debug, Serialize, Deserialize, PartialEq, Eq, Hash, Clone)]
+#[derive(Debug, Clone)]
 pub struct SchemaEvolution {
     pub table_name: String,
     pub fields_hash: String,
     pub start_month: String,
     pub end_month: String,
-    #[serde(skip_serializing_if = "Vec::is_empty")]
     pub columns: Vec<Column>,
+    pub arrow_schema: Arc<ArrowSchema>,
 }
 
 /// Produce a stable SHA256 hash of a column list (sorted by name/type/format).

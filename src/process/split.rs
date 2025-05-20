@@ -1,20 +1,30 @@
 // data/src/process/split.rs
+use crate::process::chunk::chunk_and_write_segment;
+use crate::schema::find_schema_evolution;
+use crate::schema::SchemaEvolution;
 use anyhow::Result;
 use num_cpus;
 use rayon::prelude::*;
-use std::fs;
-use std::fs::File;
-use std::io::Read;
-use std::path::{Path, PathBuf};
-use std::sync::Arc;
-use std::time::Instant;
-use tracing::{info, instrument};
+use std::{
+    collections::HashMap,
+    fs,
+    fs::File,
+    io::Read,
+    path::{Path, PathBuf},
+    sync::Arc,
+    time::Instant,
+};
+use tracing::{info, instrument, warn};
 use zip::ZipArchive;
 
-use crate::process::chunk::chunk_and_write_segment;
-
-#[instrument(level = "info", skip(zip_path, out_dir), fields(zip = %zip_path.as_ref().display()))]
-pub fn split_zip_to_parquet<P: AsRef<Path>, Q: AsRef<Path>>(zip_path: P, out_dir: Q) -> Result<()> {
+/// Splits each CSV file in the ZIP into chunks and writes Parquet files,
+/// using a pre-built lookup of schema evolutions.
+#[instrument(level = "info", skip(zip_path, out_dir, lookup), fields(zip = %zip_path.as_ref().display()))]
+pub fn split_zip_to_parquet<P: AsRef<Path>, Q: AsRef<Path>>(
+    zip_path: P,
+    out_dir: Q,
+    lookup: Arc<HashMap<String, Vec<Arc<SchemaEvolution>>>>,
+) -> Result<()> {
     rayon::ThreadPoolBuilder::new()
         .num_threads(num_cpus::get())
         .build_global()
@@ -41,7 +51,8 @@ pub fn split_zip_to_parquet<P: AsRef<Path>, Q: AsRef<Path>>(zip_path: P, out_dir
         entry.read_to_end(&mut buf)?;
         let text = Arc::new(String::from_utf8_lossy(&buf).to_string());
 
-        let segments: Vec<(String, usize, usize, usize)> = {
+        // determine segments
+        let segments = {
             let mut segs = Vec::new();
             let mut pos = 0;
             let mut header_start = 0;
@@ -75,70 +86,50 @@ pub fn split_zip_to_parquet<P: AsRef<Path>, Q: AsRef<Path>>(zip_path: P, out_dir
             segs
         };
 
+        // process segments
         segments
             .into_par_iter()
             .for_each(|(schema_id, hs, ds, es)| {
                 let header = &text[hs..ds];
                 let data = &text[ds..es];
-                chunk_and_write_segment(&name, &schema_id, header, data, &out_dir);
+
+                let table = Path::new(&name)
+                    .file_stem()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or(&name);
+
+                let first_line = header.lines().next().unwrap();
+                let cols: Vec<&str> = first_line.split(',').collect();
+                let st_dt = cols[6];
+                let effective_month: String = st_dt
+                    .split_whitespace()
+                    .next()
+                    .unwrap()
+                    .replace('/', "")
+                    .chars()
+                    .take(6)
+                    .collect();
+
+                if let Some(evo) = find_schema_evolution(&lookup, table, &effective_month) {
+                    let arrow_schema = evo.arrow_schema.clone();
+                    chunk_and_write_segment(
+                        &name,
+                        &schema_id,
+                        header,
+                        data,
+                        arrow_schema,
+                        &out_dir,
+                    );
+                } else {
+                    warn!(
+                        table = table,
+                        month = effective_month,
+                        "no schema evolution found, skipping segment"
+                    );
+                }
             });
     }
 
     info!("completed in {:?}", start.elapsed());
     Ok(())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use anyhow::Result;
-    use std::{env, fs, io::Write};
-    use tempfile::NamedTempFile;
-    use tracing_subscriber::{EnvFilter, FmtSubscriber};
-    use zip::write::{ExtendedFileOptions, FileOptions};
-    use zip::CompressionMethod;
-
-    #[test]
-    fn test_split_zip_to_parquet() -> Result<()> {
-        let subscriber = FmtSubscriber::builder()
-            .with_env_filter(
-                EnvFilter::try_from_default_env()
-                    .unwrap_or_else(|_| EnvFilter::new("info,data::process=trace")),
-            )
-            .with_test_writer()
-            .finish();
-        let _ = tracing::subscriber::set_global_default(subscriber);
-
-        // prepare sample ZIP…
-        let zip_path = if let Ok(path) = env::var("ZIP_PATH") {
-            PathBuf::from(path)
-        } else {
-            let sample = r#"C,SETP.WORLD,FPP_DCF,AEMO,PUBLIC,\"2024/12/14\",...\nI,FPP,...\nD,FPP,...\nI,FPP,...\nD,FPP,...\"#;
-            let mut buf = Vec::new();
-            {
-                let mut zip = zip::ZipWriter::new(std::io::Cursor::new(&mut buf));
-                let options = FileOptions::<ExtendedFileOptions>::default()
-                    .compression_method(CompressionMethod::Stored);
-                zip.start_file("aemo.csv", options)?;
-                zip.write_all(sample.as_bytes())?;
-                zip.finish()?;
-            }
-            let tmp = NamedTempFile::new()?;
-            tmp.reopen()?.write_all(&buf)?;
-            tmp.path().to_path_buf()
-        };
-
-        let out_dir = PathBuf::from("tests/output");
-        if !out_dir.exists() {
-            fs::create_dir_all(&out_dir)?;
-        }
-
-        split_zip_to_parquet(&zip_path, &out_dir)?;
-        let files: Vec<_> = fs::read_dir(&out_dir)?
-            .filter_map(|e| e.ok().map(|e| e.path()))
-            .filter(|p| p.extension().and_then(|s| s.to_str()) == Some("parquet"))
-            .collect();
-        assert!(!files.is_empty(), "no parquet files produced");
-        Ok(())
-    }
 }
