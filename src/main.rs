@@ -1,8 +1,11 @@
-use nemscraper::{duck, fetch, history, process, schema};
+// data/src/main.rs
+
+use nemscraper::{fetch, process, schema};
 use reqwest::Client;
+
 use std::{
-    collections::{HashMap, HashSet},
-    fs,
+    collections::HashSet,
+    fs::{self, File},
     path::{Path, PathBuf},
     sync::Arc,
 };
@@ -12,244 +15,196 @@ use tokio::{
 };
 use tracing_subscriber::{fmt, EnvFilter};
 
+// for Parquet‐based history
+use arrow::array::StringArray;
+use arrow::datatypes::{DataType, Field, Schema};
+use arrow::record_batch::RecordBatch;
+use parquet::arrow::ArrowWriter;
+use parquet::basic::Compression;
+use parquet::file::properties::WriterProperties;
+use tracing::Instrument;
+use tracing::{error, info, info_span};
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     // ─── 1) init logging ─────────────────────────────────────────────
     let env = EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| EnvFilter::new("info,nemscraper=info,main=info"));
+        .unwrap_or_else(|_| EnvFilter::new("info,data=info,main=info"));
     fmt::Subscriber::builder()
         .with_env_filter(env)
         .with_span_events(fmt::format::FmtSpan::CLOSE)
         .init();
-    tracing::info!("Starting up…");
+    tracing::info!("startup");
 
-    // ─── 2) config paths ────────────────────────────────────────────
+    // ─── 2) configure dirs ───────────────────────────────────────────
     let client = Client::new();
     let schemas_dir = Path::new("schemas");
     let evolutions_file = Path::new("schema_evolutions.json");
     let zips_dir = PathBuf::from("zips");
-    let base_db = "nem_data.duckdb";
-    fs::create_dir_all(schemas_dir)?;
-    fs::create_dir_all(&zips_dir)?;
+    let out_parquet_dir = PathBuf::from("out_parquets");
+    let history_dir = PathBuf::from("history");
 
-    // ─── 3) fetch & extract schemas ─────────────────────────────────
-    tracing::info!("Fetching schemas to {}", schemas_dir.display());
+    for d in &[schemas_dir, &zips_dir, &out_parquet_dir, &history_dir] {
+        fs::create_dir_all(d)?;
+    }
+
+    // ─── 3) fetch & evolve CTL schemas ───────────────────────────────
+    tracing::info!("fetch schemas → {}", schemas_dir.display());
     schema::fetch_all(&client, schemas_dir).await?;
     let evolutions = schema::extract_schema_evolutions(schemas_dir)?;
-    tracing::info!("{} schema evolutions", evolutions.len());
+    tracing::info!("{} evolutions", evolutions.len());
     fs::write(evolutions_file, serde_json::to_string_pretty(&evolutions)?)?;
-    tracing::info!("Wrote evolutions to {}", evolutions_file.display());
+    tracing::info!("wrote {}", evolutions_file.display());
 
-    // ─── 4) create base DB with all tables + history ────────────────
-    {
-        let conn = duck::open_file_db(base_db)?;
-        // create each versioned table
-        let mut created = 0;
-        for evo in &evolutions {
-            let tbl = format!("{}_{}", evo.table_name, evo.fields_hash);
-            duck::create_table_from_schema(&conn, &tbl, &evo.columns)
-                .map(|_| created += 1)
-                .map_err(|e| tracing::error!("create {} failed: {}", tbl, e))
-                .ok();
-        }
-        tracing::info!("Created {} schema tables", created);
-
-        // history table
-        history::ensure_history_table_exists(&conn)?;
-        tracing::info!("History table initialized");
-
-        conn.execute("CHECKPOINT;", [])?;
-        // drop to flush everything
-    }
-
-    // ─── 5) shard the base DB ────────────────────────────────────────
-    let num_shards = num_cpus::get().max(1);
-    let mut shard_paths = Vec::with_capacity(num_shards);
-    for id in 0..num_shards {
-        let shard = format!("nem_data_shard_{}.duckdb", id);
-        fs::copy(base_db, &shard)?;
-        shard_paths.push(shard);
-    }
-    tracing::info!("Made {} shards", num_shards);
-
-    // ─── 6) build lookup for later inserts ───────────────────────────
-    let mut lookup: HashMap<String, Vec<Arc<schema::SchemaEvolution>>> = HashMap::new();
-    for evo in &evolutions {
-        lookup
-            .entry(evo.table_name.clone())
-            .or_default()
-            .push(Arc::new(evo.clone()));
-    }
-    for versions in lookup.values_mut() {
-        versions.sort_by_key(|e| e.start_month.clone());
-    }
-
-    // ─── 7) figure out which ZIPs are new ────────────────────────────
-    let mut base_conn = duck::open_file_db(base_db)?;
-    history::ensure_history_table_exists(&base_conn)?;
-    let processed: HashSet<String> = history::get_processed_zipfiles(&base_conn)?
-        .into_iter()
+    // ─── 4) load history to skip processed ZIPs ──────────────────────
+    let processed: HashSet<String> = fs::read_dir(&history_dir)?
+        .filter_map(|e| e.ok())
+        .filter_map(|ent| {
+            ent.path()
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .map(|s| s.to_string())
+        })
         .collect();
     tracing::info!("{} ZIPs already done", processed.len());
 
+    // ─── 5) discover new ZIP URLs ────────────────────────────────────
     let feeds = fetch::urls::fetch_current_zip_urls(&client).await?;
-    let urls: Vec<_> = feeds
+    let to_process: Vec<String> = feeds
         .values()
         .flatten()
-        .cloned()
-        .filter(|u| {
+        .filter_map(|u| {
             let name = Path::new(u)
                 .file_name()
                 .unwrap()
                 .to_string_lossy()
                 .to_string();
             if processed.contains(&name) {
-                tracing::debug!("Skipping {}", name);
-                false
+                tracing::debug!("skip {}", name);
+                None
             } else {
-                true
+                Some(u.clone())
             }
         })
         .collect();
 
-    if urls.is_empty() {
-        tracing::info!("No new ZIPs—exiting");
+    if to_process.is_empty() {
+        tracing::info!("no new ZIPs; exit");
         return Ok(());
     }
-    tracing::info!("{} ZIPs to fetch + process", urls.len());
+    tracing::info!("{} ZIPs to download + split", to_process.len());
 
-    // ─── 8) start download tasks ────────────────────────────────────
+    // ─── 6) spawn downloader tasks ──────────────────────────────────
     let (tx, rx) = mpsc::channel::<Result<PathBuf, (String, String)>>(100);
-    let download_sem = Arc::new(Semaphore::new(3));
-    let mut download_handles = Vec::with_capacity(urls.len());
+    let dl_sem = Arc::new(Semaphore::new(3));
+    let mut dl_handles = Vec::with_capacity(to_process.len());
 
-    for url in urls {
+    for url in to_process {
         let client = client.clone();
         let zips_dir = zips_dir.clone();
         let tx = tx.clone();
-        let sem = download_sem.clone();
-        download_handles.push(tokio::spawn(async move {
-            let _p = sem.acquire().await.unwrap();
+        let sem = dl_sem.clone();
+        dl_handles.push(tokio::spawn(async move {
+            let _permit = sem.acquire().await.unwrap();
             let name = Path::new(&url)
                 .file_name()
                 .unwrap()
                 .to_string_lossy()
                 .to_string();
-            tracing::info!(name = %name, "Downloading…");
+            tracing::info!(name=%name, "downloading");
             let start = Instant::now();
             match fetch::zips::download_zip(&client, &url, &zips_dir).await {
                 Ok(path) => {
-                    tracing::info!(name = %name, elapsed = ?start.elapsed(), "Downloaded");
+                    tracing::info!(name=%name, elapsed=?start.elapsed(), "downloaded");
                     let _ = tx.send(Ok(path)).await;
                 }
-                Err(e) => {
-                    tracing::error!("Download failed for {}: {}", url, e);
-                    let _ = tx.send(Err((url, e.to_string()))).await;
+                Err(err) => {
+                    tracing::error!("{} failed: {}", url, err);
+                    let _ = tx.send(Err((url, err.to_string()))).await;
                 }
             }
         }));
     }
     drop(tx);
 
-    // ─── 9) spawn N writer tasks, each with its own shard DB ─────────
+    // ─── 7) spawn processor tasks ────────────────────────────────────
     let rx = Arc::new(Mutex::new(rx));
-    let mut writer_handles = Vec::with_capacity(num_shards);
+    let mut proc_handles = Vec::new();
 
-    for (shard_id, shard_path) in shard_paths.iter().enumerate() {
+    let num_workers = num_cpus::get().max(1);
+    for worker_id in 0..num_workers {
         let rx = rx.clone();
-        let lookup = lookup.clone();
-        let shard_db = shard_path.clone();
-        writer_handles.push(tokio::spawn(async move {
-            let conn = duck::open_file_db(&shard_db).expect("open shard");
-            while let Some(msg) = { rx.lock().await.recv().await } {
-                match msg {
-                    Ok(zip_path) => {
-                        let filename = zip_path.file_name().unwrap().to_string_lossy().to_string();
-                        tracing::info!("Shard#{} processing {}", shard_id, filename);
+        let history_dir = history_dir.clone();
+        let out_parquet_dir = out_parquet_dir.clone();
 
-                        // let tables = match process::load_aemo_zip(&zip_path) {
-                        //     Ok(t) => t,
-                        //     Err(e) => {
-                        //         tracing::error!("Unpack {} err: {}", filename, e);
-                        //         continue;
-                        //     }
-                        // };
-                        // let mut ok = true;
-                        // for (tbl, raw) in &tables {
-                        //     if let Some(evo) =
-                        //         schema::find_schema_evolution(&lookup, tbl, &raw.effective_month)
-                        //     {
-                        //         let target = format!("{}_{}", evo.table_name, evo.fields_hash);
-                        //         if let Err(e) =
-                        //             duck::insert_raw_table_data(&conn, &target, raw, &evo)
-                        //         {
-                        //             tracing::error!("Insert {} failed: {}", target, e);
-                        //             ok = false;
-                        //         }
-                        //     } else {
-                        //         tracing::warn!("No schema for {}@{}", tbl, raw.effective_month);
-                        //         ok = false;
-                        //     }
-                        // }
-                        // if ok {
-                        // history::record_processed_csv_data(&conn, &zip_path, &tables)
-                        //     .unwrap_or_else(|e| {
-                        //         tracing::error!("History rec err {}: {}", filename, e)
-                        //     });
-                        // let _ = fs::remove_file(&zip_path);
-                        // }
-                    }
-                    Err((url, err)) => {
-                        tracing::error!("Download error {}: {}", url, err);
+        // create a span that carries our worker_id
+        let worker_span = info_span!("worker", id = worker_id);
+
+        // instrument the entire async block with that span
+        proc_handles.push(tokio::spawn(
+            async move {
+                while let Some(msg) = { rx.lock().await.recv().await } {
+                    match msg {
+                        Ok(zip_path) => {
+                            let name = zip_path.file_name().unwrap().to_string_lossy().to_string();
+                            info!("processing {}", name);
+
+                            if let Err(e) =
+                                process::split::split_zip_to_parquet(&zip_path, &out_parquet_dir)
+                            {
+                                error!("split {} error: {}", name, e);
+                                continue;
+                            }
+
+                            // write history
+                            let hist_file = history_dir.join(format!("{}.parquet", name));
+                            {
+                                let schema = Schema::new(vec![Field::new(
+                                    "zip_name",
+                                    DataType::Utf8,
+                                    false,
+                                )]);
+                                let arr = StringArray::from(vec![name.clone()]);
+                                let batch = RecordBatch::try_new(
+                                    Arc::new(schema.clone()),
+                                    vec![Arc::new(arr)],
+                                )
+                                .expect("make batch");
+                                let file = File::create(&hist_file).expect("create history file");
+                                let props = WriterProperties::builder()
+                                    .set_compression(Compression::SNAPPY)
+                                    .build();
+                                let mut writer =
+                                    ArrowWriter::try_new(file, Arc::new(schema), Some(props))
+                                        .expect("create writer");
+                                writer.write(&batch).expect("write batch");
+                                writer.close().expect("close writer");
+                            }
+                            info!("wrote history for {}", name);
+
+                            // delete zip
+                            let _ = std::fs::remove_file(&zip_path);
+                            info!(zip_path = %zip_path.display(), "deleted zip");
+                        }
+                        Err((url, err)) => {
+                            error!("download error {}: {}", url, err);
+                        }
                     }
                 }
             }
-            tracing::info!("Shard#{} writer done", shard_id);
-        }));
+            .instrument(worker_span),
+        ));
     }
 
-    // ─── 10) wait for all downloads to finish ────────────────────────
-    for h in download_handles {
+    // ─── 8) await all tasks ─────────────────────────────────────────
+    for h in dl_handles {
+        let _ = h.await;
+    }
+    drop(rx);
+    for h in proc_handles {
         let _ = h.await;
     }
 
-    // ─── 11) wait for all writers to drain ──────────────────────────
-    drop(rx); // unlock channel
-    for w in writer_handles {
-        let _ = w.await;
-    }
-
-    // ─── 12) merge all shards back into base DB ──────────────────────
-    let conn = duck::open_file_db(base_db)?;
-    for (shard_id, shard_path) in shard_paths.iter().enumerate() {
-        let alias = format!("sh{}", shard_id);
-        conn.execute(&format!("ATTACH '{}' AS {};", shard_path, alias), [])?;
-
-        // merge each schema table
-        for evo in &evolutions {
-            let tbl = format!("{}_{}", evo.table_name, evo.fields_hash);
-            conn.execute(
-                &format!(
-                    "INSERT INTO main.{tbl} SELECT * FROM {alias}.{tbl};",
-                    tbl = tbl,
-                    alias = alias
-                ),
-                [],
-            )?;
-        }
-        // merge history
-        conn.execute(
-            &format!(
-                "INSERT INTO main.history SELECT * FROM {alias}.history;",
-                alias = alias
-            ),
-            [],
-        )?;
-        conn.execute(&format!("DETACH {};", alias), [])?;
-    }
-
-    conn.execute("CHECKPOINT;", [])?;
-    tracing::info!("All shards merged – done.");
-
+    tracing::info!("all done");
     Ok(())
 }
