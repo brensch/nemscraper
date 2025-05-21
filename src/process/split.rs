@@ -137,7 +137,12 @@ mod tests {
     use crate::schema::SchemaEvolution;
     use anyhow::Result;
     use reqwest::Client;
-    use std::{env, fs, iter::Skip, path::Path, sync::Arc};
+    use std::{
+        env, fs,
+        iter::Skip,
+        path::{Path, PathBuf},
+        sync::Arc,
+    };
     use tempfile::TempDir;
     use tracing_subscriber::{EnvFilter, FmtSubscriber};
 
@@ -162,7 +167,8 @@ mod tests {
             env::var("ZIP_PATH").expect("you must set ZIP_PATH to point at a .zip for testing");
 
         // 2) Prepare a clean temp directory for outputs
-        let out_dir = TempDir::new()?;
+        let out_dir: PathBuf = env::current_dir()?.join("parquet");
+        fs::create_dir_all(&out_dir)?;
 
         // 3) Re-run the schema fetch + evolution logic from `main`
         let schemas_dir = Path::new("schemas");
@@ -172,16 +178,16 @@ mod tests {
         let lookup = Arc::new(SchemaEvolution::build_lookup(evolutions));
 
         // 4) Invoke the function under test
-        split_zip_to_parquet(&zip_path, out_dir.path(), lookup)?;
+        split_zip_to_parquet(&zip_path, out_dir.as_path(), lookup)?;
 
         // 5) Assert that something got written
-        let entries: Vec<_> = fs::read_dir(out_dir.path())?
+        let entries: Vec<_> = fs::read_dir(out_dir.as_path())?
             .filter_map(Result::ok)
             .collect();
         assert!(
             !entries.is_empty(),
             "Expected at least one parquet file in {:?}, found none",
-            out_dir.path()
+            out_dir.as_path()
         );
 
         Ok(())
