@@ -1,0 +1,37 @@
+# File: ~/nemscraper/my_grafana_provisioning/datasources/duckdb_datasources.yaml
+apiVersion: 1
+
+# List of data sources to insert/update depending on name.
+datasources:
+  - name: 'nem'                     # A unique name for your data source in Grafana
+    type: 'motherduck-duckdb-datasource'      # This MUST be the exact plugin ID.
+                                              # This is likely the ID given your previous settings.
+    access: proxy                             # 'proxy' (Grafana backend makes requests) or 'direct' (browser makes requests).
+                                              # 'proxy' is common.
+    # uid: 'my-unique-duckdb-uid'             # Optional: unique identifier for the datasource.
+                                              # Useful if you need to refer to it in provisioned dashboards.
+                                              # If not provided, Grafana generates one.
+    # orgId: 1                                # Optional: specific organization ID, defaults to 1.
+    # version: 1                              # Optional: version of this datasource configuration.
+    # editable: false                         # Optional: if true, allows editing in UI (changes not saved to YAML).
+                                              # Defaults to false for provisioned datasources.
+
+    # jsonData contains non-sensitive configuration options specific to the plugin.
+    # These options depend heavily on the 'motherduck-duckdb-datasource' plugin.
+    # Consult the plugin's documentation for available options.
+    jsonData:
+      path: '/data/duck/duck.db' # IMPORTANT: Path to your DuckDB file *inside the container*.
+                                               # Replace 'your_database_file.db' with your actual DB file name.
+      # readOnly: true                        # Example: some plugins might have a read-only option.
+      # customOption: 'value'                 # Other plugin-specific options.
+
+    # secureJsonData contains sensitive configuration options (like API keys, passwords).
+    # These are encrypted by Grafana.
+    # secureJsonData:
+      # token: "$DUCKDB_TOKEN"                # Example: if your plugin needed a token,
+                                               # you could use an environment variable.
+      # password: "mysecretpassword"          # Direct entry (less secure if YAML is in Git).
+
+    # deleteDatasources:                      # Optional section to manage deletion of datasources
+    #  - name: 'Old DuckDB'                   # Name of datasource to delete
+    #    orgId: 1

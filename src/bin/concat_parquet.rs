@@ -10,7 +10,7 @@ fn main() -> Result<()> {
     let conn = Connection::open_in_memory().context("failed to open in-memory DuckDB")?;
 
     // 2) Point at your chunked Parquet files
-    let input_dir = Path::new("tests/output");
+    let input_dir = Path::new("parquet/parquet_string");
     let parquet_pattern = input_dir
         .join("*.parquet")
         .to_string_lossy()
