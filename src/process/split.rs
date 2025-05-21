@@ -1,5 +1,6 @@
 // data/src/process/split.rs
 use crate::process::chunk::chunk_and_write_segment;
+use crate::schema;
 use crate::schema::find_schema_evolution;
 use crate::schema::SchemaEvolution;
 use anyhow::Result;
@@ -59,19 +60,25 @@ pub fn split_zip_to_parquet<P: AsRef<Path>, Q: AsRef<Path>>(
             let mut data_start = 0;
             let mut current_schema = None;
             let mut seen_footer = false;
+            let mut date = String::new();
 
             for chunk in text.split_inclusive('\n') {
                 if chunk.starts_with("C,") {
                     if seen_footer {
                         break;
                     }
+                    // get the date of the file from the header
+                    let parts: Vec<&str> = chunk.trim_end_matches('\n').split(',').collect();
+                    // remove / from the 6th element of the line, and take the first 6 characters
+                    date = parts[5].replace('/', "").chars().take(6).collect();
+
                     seen_footer = true;
                     pos += chunk.len();
                     continue;
                 }
                 if chunk.starts_with("I,") {
                     if let Some(schema_id) = current_schema.take() {
-                        segs.push((schema_id, header_start, data_start, pos));
+                        segs.push((schema_id, header_start, data_start, pos, date.clone()));
                     }
                     header_start = pos;
                     let parts: Vec<&str> = chunk.trim_end_matches('\n').split(',').collect();
@@ -81,7 +88,7 @@ pub fn split_zip_to_parquet<P: AsRef<Path>, Q: AsRef<Path>>(
                 pos += chunk.len();
             }
             if let Some(schema_id) = current_schema {
-                segs.push((schema_id, header_start, data_start, pos));
+                segs.push((schema_id, header_start, data_start, pos, date));
             }
             segs
         };
@@ -89,41 +96,30 @@ pub fn split_zip_to_parquet<P: AsRef<Path>, Q: AsRef<Path>>(
         // process segments
         segments
             .into_par_iter()
-            .for_each(|(schema_id, hs, ds, es)| {
+            .for_each(|(schema_id, hs, ds, es, date)| {
                 let header = &text[hs..ds];
                 let data = &text[ds..es];
 
-                let table = Path::new(&name)
-                    .file_stem()
-                    .and_then(|s| s.to_str())
-                    .unwrap_or(&name);
-
-                let first_line = header.lines().next().unwrap();
-                let cols: Vec<&str> = first_line.split(',').collect();
-                let st_dt = cols[6];
-                let effective_month: String = st_dt
-                    .split_whitespace()
-                    .next()
-                    .unwrap()
-                    .replace('/', "")
-                    .chars()
-                    .take(6)
-                    .collect();
-
-                if let Some(evo) = find_schema_evolution(&lookup, table, &effective_month) {
+                if let Some(evo) = find_schema_evolution(&lookup, &schema_id, &date) {
                     let arrow_schema = evo.arrow_schema.clone();
+                    let headers = evo.columns.clone();
+
+                    // TODO: check the schema is correct from the header we have
                     chunk_and_write_segment(
                         &name,
                         &schema_id,
                         header,
                         data,
+                        headers,
                         arrow_schema,
                         &out_dir,
                     );
                 } else {
                     warn!(
-                        table = table,
-                        month = effective_month,
+                        month = &date,
+                        schema = schema_id,
+                        header = %header,
+
                         "no schema evolution found, skipping segment"
                     );
                 }
@@ -132,4 +128,62 @@ pub fn split_zip_to_parquet<P: AsRef<Path>, Q: AsRef<Path>>(
 
     info!("completed in {:?}", start.elapsed());
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::split_zip_to_parquet;
+    use crate::schema;
+    use crate::schema::SchemaEvolution;
+    use anyhow::Result;
+    use reqwest::Client;
+    use std::{env, fs, iter::Skip, path::Path, sync::Arc};
+    use tempfile::TempDir;
+    use tracing_subscriber::{EnvFilter, FmtSubscriber};
+
+    /// This test will:
+    /// 1) fetch all CTL schemas into `schemas/`
+    /// 2) extract schema evolutions and build the lookup
+    /// 3) run split_zip_to_parquet on the ZIP at $ZIP_PATH
+    /// 4) verify that at least one Parquet file was generated
+    #[tokio::test]
+    async fn test_split_zip_to_parquet() -> Result<()> {
+        let subscriber = FmtSubscriber::builder()
+            .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| {
+                // ADJUST your_crate_name to your actual crate name (e.g., nemscraper)
+                EnvFilter::new("info,your_crate_name::duck=trace,your_crate_name::process=trace")
+            }))
+            .with_test_writer()
+            .finish();
+        let _ = tracing::subscriber::set_global_default(subscriber);
+
+        // 1) Get the ZIP path from the environment
+        let zip_path =
+            env::var("ZIP_PATH").expect("you must set ZIP_PATH to point at a .zip for testing");
+
+        // 2) Prepare a clean temp directory for outputs
+        let out_dir = TempDir::new()?;
+
+        // 3) Re-run the schema fetch + evolution logic from `main`
+        let schemas_dir = Path::new("schemas");
+        fs::create_dir_all(schemas_dir)?;
+        schema::fetch_all(&Client::new(), schemas_dir).await?;
+        let evolutions = schema::extract_schema_evolutions(schemas_dir)?;
+        let lookup = Arc::new(SchemaEvolution::build_lookup(evolutions));
+
+        // 4) Invoke the function under test
+        split_zip_to_parquet(&zip_path, out_dir.path(), lookup)?;
+
+        // 5) Assert that something got written
+        let entries: Vec<_> = fs::read_dir(out_dir.path())?
+            .filter_map(Result::ok)
+            .collect();
+        assert!(
+            !entries.is_empty(),
+            "Expected at least one parquet file in {:?}, found none",
+            out_dir.path()
+        );
+
+        Ok(())
+    }
 }
