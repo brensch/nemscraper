@@ -49,16 +49,9 @@ pub fn chunk_and_write_segment(
         .par_chunks(chunk_size)
         .enumerate()
         .for_each(|(chunk_idx, chunk)| {
-            // assemble CSV text
-            let mut buf = String::with_capacity(header.len() + chunk.len() * 30);
-            buf.push_str(header);
-            if !header.ends_with('\n') { buf.push('\n'); }
-            for line in chunk {
-                buf.push_str(line);
-                buf.push('\n');
-            }
 
-            let cursor = std::io::Cursor::new(buf.as_bytes());
+
+            let cursor = std::io::Cursor::new(data.as_bytes());
             let mut reader = ReaderBuilder::new(full_schema.clone())
                 .with_header(false)
                 .build(cursor)
