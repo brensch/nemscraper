@@ -47,7 +47,7 @@ async fn main() -> anyhow::Result<()> {
     let client = Client::new();
     let schemas_dir = Path::new("schemas");
     let zips_dir = PathBuf::from("zips");
-    let out_parquet_dir = PathBuf::from("out_parquets");
+    let out_parquet_dir = PathBuf::from("parquet");
     let history_dir = PathBuf::from("history");
 
     for d in &[schemas_dir, &zips_dir, &out_parquet_dir, &history_dir] {
@@ -184,12 +184,21 @@ async fn main() -> anyhow::Result<()> {
                                     lookup_clone,
                                 )
                             })
-                            .await
-                            .expect("blocking task panicked");
+                            .await; // `Result<Result<(), E>, JoinError>`
 
-                            if let Err(e) = split_result {
-                                error!(worker = worker_id, "split {} error: {}", name, e);
-                                continue;
+                            match split_result {
+                                Ok(Ok(())) => { /* success */ }
+                                Ok(Err(e)) => {
+                                    error!(worker = worker_id, "split {} failed: {}", name, e);
+                                    continue;
+                                }
+                                Err(join_err) => {
+                                    error!(
+                                        worker = worker_id,
+                                        "blocking task panicked: {:?}", join_err
+                                    );
+                                    continue;
+                                }
                             }
 
                             // 3) write history/<name>.parquet

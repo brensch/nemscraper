@@ -25,7 +25,7 @@ pub fn chunk_and_write_segment(
     arrow_schema: Arc<ArrowSchema>,
     out_dir: &Path,
 ) {
-    let chunk_size = 500_000;
+    let chunk_size = 1_000_000;
 
     // 1) Build read_schema: DATE columns forced to Utf8 so CSV reader doesn't parse them.
     let read_schema: Arc<ArrowSchema> = {

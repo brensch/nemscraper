@@ -86,7 +86,7 @@
                             "options": {
                                 "mode": "exclude",
                                 "names": [
-                                    "value DELTA"
+                                    "value CLERMSF"
                                 ],
                                 "prefix": "All except:",
                                 "readOnly": true
@@ -135,7 +135,7 @@
                     "editorMode": "code",
                     "format": 0,
                     "rawQuery": true,
-                    "rawSql": "SELECT\r\n  time_bucket($__interval, measurement_datetime) AS time,\r\n  CAST(participantid AS VARCHAR) AS metric, -- or TEXT, depending on your SQL dialect\r\n  AVG(measured_mw) AS value\r\nFROM \"PUBLIC_NEXT_DAY_FPPMW_2_20250517070039_0000000463635113.CSV—FPP_UNIT_MW—chunk0\"\r\nWHERE $__timeFilter(measurement_datetime)\r\nGROUP BY 1, 2 -- Group by the aliased columns (time and the new metric)\r\nORDER BY 1, 2 -- Optional, but good for inspection",
+                    "rawSql": "\r\nSELECT\r\n  time_bucket($__interval, measurement_datetime) AS time,\r\n  CAST(participantid AS VARCHAR) AS metric, -- or TEXT, depending on your SQL dialect\r\n  AVG(measured_mw) AS value\r\nFROM read_parquet('/data/parquet/*FPP_UNIT_MW*.parquet')\r\nWHERE $__timeFilter(measurement_datetime)\r\nGROUP BY 1, 2 -- Group by the aliased columns (time and the new metric)\r\nORDER BY 1, 2 -- Optional, but good for inspection",
                     "refId": "A",
                     "sql": {
                         "columns": [
@@ -174,5 +174,5 @@
     "timezone": "browser",
     "title": "Thingy",
     "uid": "8d9eeecb-bd78-47df-b34a-bf1ccb39c78b",
-    "version": 3
+    "version": 1
 }
