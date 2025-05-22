@@ -13,7 +13,7 @@ use std::{
     sync::Arc,
 };
 use tokio::{
-    sync::{mpsc, Mutex, Semaphore},
+    sync::{mpsc, Semaphore},
     time::Instant,
 };
 use tracing_subscriber::{fmt, EnvFilter};
@@ -25,8 +25,7 @@ use arrow::record_batch::RecordBatch;
 use parquet::arrow::ArrowWriter;
 use parquet::basic::Compression;
 use parquet::file::properties::WriterProperties;
-use tracing::Instrument;
-use tracing::{error, info, info_span};
+use tracing::{error, info};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -37,7 +36,7 @@ async fn main() -> anyhow::Result<()> {
         .with_env_filter(env)
         .with_span_events(fmt::format::FmtSpan::CLOSE)
         .init();
-    tracing::info!("startup");
+    info!("startup");
 
     std::panic::set_hook(Box::new(|info| {
         eprintln!("panic: {:?}", info);
@@ -55,11 +54,10 @@ async fn main() -> anyhow::Result<()> {
     }
 
     // ─── 3) fetch & evolve CTL schemas ───────────────────────────────
-    tracing::info!("fetch schemas → {}", schemas_dir.display());
+    info!("fetch schemas → {}", schemas_dir.display());
     schema::fetch_all(&client, schemas_dir).await?;
     let evolutions = schema::extract_schema_evolutions(schemas_dir)?;
-    // build lookup once
-    tracing::info!("{} evolutions", evolutions.len());
+    info!("{} evolutions", evolutions.len());
     let lookup: Arc<HashMap<String, Vec<Arc<SchemaEvolution>>>> =
         Arc::new(SchemaEvolution::build_lookup(evolutions));
 
@@ -73,7 +71,7 @@ async fn main() -> anyhow::Result<()> {
                 .map(|s| s.to_string())
         })
         .collect();
-    tracing::info!("{} ZIPs already done", processed.len());
+    info!("{} ZIPs already done", processed.len());
 
     // ─── 5) discover new ZIP URLs ────────────────────────────────────
     let feeds = fetch::urls::fetch_current_zip_urls(&client).await?;
@@ -87,7 +85,6 @@ async fn main() -> anyhow::Result<()> {
                 .to_string_lossy()
                 .to_string();
             if processed.contains(&name) {
-                tracing::debug!("skip {}", name);
                 None
             } else {
                 Some(u.clone())
@@ -96,13 +93,13 @@ async fn main() -> anyhow::Result<()> {
         .collect();
 
     if to_process.is_empty() {
-        tracing::info!("no new ZIPs; exit");
+        info!("no new ZIPs; exit");
         return Ok(());
     }
-    tracing::info!("{} ZIPs to download + split", to_process.len());
+    info!("{} ZIPs to download + split", to_process.len());
 
     // ─── 6) spawn downloader tasks ──────────────────────────────────
-    let (tx, rx) = mpsc::channel::<Result<PathBuf, (String, String)>>(100);
+    let (tx, mut rx) = mpsc::channel::<Result<PathBuf, (String, String)>>(100);
     let dl_sem = Arc::new(Semaphore::new(3));
     let mut dl_handles = Vec::with_capacity(to_process.len());
 
@@ -111,6 +108,7 @@ async fn main() -> anyhow::Result<()> {
         let zips_dir = zips_dir.clone();
         let tx = tx.clone();
         let sem = dl_sem.clone();
+
         dl_handles.push(tokio::spawn(async move {
             let _permit = sem.acquire().await.unwrap();
             let name = Path::new(&url)
@@ -118,149 +116,90 @@ async fn main() -> anyhow::Result<()> {
                 .unwrap()
                 .to_string_lossy()
                 .to_string();
-            tracing::info!(name=%name, "downloading");
+            info!(name=%name, "downloading");
             let start = Instant::now();
             match fetch::zips::download_zip(&client, &url, &zips_dir).await {
                 Ok(path) => {
-                    tracing::info!(name=%name, elapsed=?start.elapsed(), "downloaded");
+                    info!(name=%name, elapsed=?start.elapsed(), "downloaded");
                     let _ = tx.send(Ok(path)).await;
                 }
                 Err(err) => {
-                    tracing::error!("{} failed: {}", url, err);
+                    error!("{} failed: {}", url, err);
                     let _ = tx.send(Err((url, err.to_string()))).await;
                 }
             }
         }));
     }
+    // drop the original sender so `rx.recv()` will end once all downloads are done
     drop(tx);
 
-    // ─── 7) spawn processor tasks ────────────────────────────────────
-    let rx = Arc::new(Mutex::new(rx));
-    let mut proc_handles = Vec::new();
+    // ─── 7) process downloaded ZIPs one at a time ────────────────────
+    // nb the processor itself is multi threaded. doing any more than 1 at a time risks OOM death.
+    while let Some(msg) = rx.recv().await {
+        match msg {
+            Ok(zip_path) => {
+                let name = zip_path.file_name().unwrap().to_string_lossy().to_string();
+                info!("processing {}", name);
 
-    let num_workers = num_cpus::get().max(1);
-    for worker_id in 0..num_workers {
-        // clone all shared handles *before* entering the async block
-        let lookup = Arc::clone(&lookup);
-        let rx = Arc::clone(&rx);
-        let out_parquet_dir = out_parquet_dir.clone();
-        let history_dir = history_dir.clone();
-        let worker_span = info_span!("worker", id = worker_id);
-
-        let handle = tokio::spawn(
-            async move {
-                loop {
-                    // 1) Grab one message, then immediately drop the lock
-                    let msg_opt = {
-                        let mut guard = rx.lock().await;
-                        guard.recv().await
-                    };
-                    let msg = match msg_opt {
-                        Some(m) => m,
-                        None => break, // channel closed -> exit loop
-                    };
-
-                    match msg {
-                        Ok(zip_path) => {
-                            let name = zip_path.file_name().unwrap().to_string_lossy().to_string();
-
-                            info!(
-                                worker = worker_id,
-                                thread = ?std::thread::current().id(),
-                                "processing {}",
-                                name
-                            );
-
-                            // 2) Offload the heavy split to the blocking pool,
-                            //    passing in our cloned lookup Arc
-                            let lookup_clone = Arc::clone(&lookup);
-                            let out_clone = out_parquet_dir.clone();
-                            let zip_clone = zip_path.clone();
-
-                            let split_result = tokio::task::spawn_blocking(move || {
-                                process::split::split_zip_to_parquet(
-                                    &zip_clone,
-                                    &out_clone,
-                                    lookup_clone,
-                                )
-                            })
-                            .await; // `Result<Result<(), E>, JoinError>`
-
-                            match split_result {
-                                Ok(Ok(())) => { /* success */ }
-                                Ok(Err(e)) => {
-                                    error!(worker = worker_id, "split {} failed: {}", name, e);
-                                    continue;
-                                }
-                                Err(join_err) => {
-                                    error!(
-                                        worker = worker_id,
-                                        "blocking task panicked: {:?}", join_err
-                                    );
-                                    continue;
-                                }
-                            }
-
-                            // 3) write history/<name>.parquet
-                            let hist_file = history_dir.join(format!("{}.parquet", name));
-                            {
-                                let schema = Schema::new(vec![Field::new(
-                                    "zip_name",
-                                    DataType::Utf8,
-                                    false,
-                                )]);
-                                let arr = StringArray::from(vec![name.clone()]);
-                                let batch = RecordBatch::try_new(
-                                    Arc::new(schema.clone()),
-                                    vec![Arc::new(arr)],
-                                )
-                                .expect("make batch");
-
-                                let file = File::create(&hist_file).expect("create history file");
-                                let props = WriterProperties::builder()
-                                    .set_compression(Compression::SNAPPY)
-                                    .build();
-                                let mut writer =
-                                    ArrowWriter::try_new(file, Arc::new(schema), Some(props))
-                                        .expect("create writer");
-                                writer.write(&batch).expect("write batch");
-                                writer.close().expect("close writer");
-                            }
-                            info!(worker = worker_id, "wrote history for {}", name);
-
-                            // 4) delete the ZIP
-                            if let Err(e) = std::fs::remove_file(&zip_path) {
-                                error!(worker = worker_id, "failed to delete {}: {}", name, e);
-                            } else {
-                                info!(
-                                    worker   = worker_id,
-                                    zip_path = %zip_path.display(),
-                                    "deleted zip"
-                                );
-                            }
-                        }
-
-                        Err((url, err)) => {
-                            error!(worker = worker_id, "download error {}: {}", url, err);
-                        }
+                // offload the heavy split to the blocking pool (but still only one at a time)
+                match tokio::task::spawn_blocking({
+                    let lookup = Arc::clone(&lookup);
+                    let out_parquet_dir = out_parquet_dir.clone();
+                    let zip_clone = zip_path.clone();
+                    move || {
+                        process::split::split_zip_to_parquet(&zip_clone, &out_parquet_dir, lookup)
+                    }
+                })
+                .await
+                {
+                    Ok(Ok(())) => { /* success */ }
+                    Ok(Err(e)) => {
+                        error!("split {} failed: {}", name, e);
+                        continue;
+                    }
+                    Err(join_err) => {
+                        error!("blocking task panicked: {:?}", join_err);
+                        continue;
                     }
                 }
-            }
-            .instrument(worker_span),
-        );
 
-        proc_handles.push(handle);
+                // write history/<name>.parquet
+                let hist_file = history_dir.join(format!("{}.parquet", name));
+                {
+                    let schema = Schema::new(vec![Field::new("zip_name", DataType::Utf8, false)]);
+                    let arr = StringArray::from(vec![name.clone()]);
+                    let batch = RecordBatch::try_new(Arc::new(schema.clone()), vec![Arc::new(arr)])
+                        .expect("make batch");
+                    let file = File::create(&hist_file).expect("create history file");
+                    let props = WriterProperties::builder()
+                        .set_compression(Compression::SNAPPY)
+                        .build();
+                    let mut writer = ArrowWriter::try_new(file, Arc::new(schema), Some(props))
+                        .expect("create writer");
+                    writer.write(&batch).expect("write batch");
+                    writer.close().expect("close writer");
+                }
+                info!("wrote history for {}", name);
+
+                // delete the ZIP file
+                if let Err(e) = std::fs::remove_file(&zip_path) {
+                    error!("failed to delete {}: {}", name, e);
+                } else {
+                    info!("deleted zip {}", zip_path.display());
+                }
+            }
+
+            Err((url, err)) => {
+                error!("download error {}: {}", url, err);
+            }
+        }
     }
 
-    // ─── 8) await all tasks ─────────────────────────────────────────
+    // ─── 8) await all downloader tasks ───────────────────────────────
     for h in dl_handles {
         let _ = h.await;
     }
-    drop(rx);
-    for h in proc_handles {
-        let _ = h.await;
-    }
 
-    tracing::info!("all done");
+    info!("all done");
     Ok(())
 }
