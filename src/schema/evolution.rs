@@ -237,6 +237,7 @@ pub fn find_schema_evolution(
         }
     }
 
+    TODO: need to go through all columns, look at historical evolutions, and try to find each one. they can come in in any order. i think it might be best to store each value separately and create them dynamically.
     // 4) if none matched, return an error
     Err(anyhow!(
         "no matching schema for `{}`. Incoming headers (after drop 4): {:?}\n\
