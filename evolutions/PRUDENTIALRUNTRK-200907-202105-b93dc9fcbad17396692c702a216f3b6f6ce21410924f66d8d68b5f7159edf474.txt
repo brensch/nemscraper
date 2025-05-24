@@ -1,0 +1,6 @@
+PRUDENTIALRUNTRK: [200907–202105] (5 columns, hash: b93dc9fcbad17396692c702a216f3b6f6ce21410924f66d8d68b5f7159edf474)
+  - PRUDENTIAL_DATE: DATE ("yyyy/mm/dd hh24:mi:ss")
+  - RUNNO: FLOAT (EXTERNAL)
+  - AUTHORISEDBY: CHAR(15) (N/A)
+  - AUTHORISEDDATE: DATE ("yyyy/mm/dd hh24:mi:ss")
+  - LASTCHANGED: DATE ("yyyy/mm/dd hh24:mi:ss")

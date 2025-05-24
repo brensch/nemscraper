@@ -1,0 +1,4 @@
+DISPATCHCASE_OCD: [200907–202505] (3 columns, hash: 9fa28204c4a0c767f3f5bc1bfe8d71e952bbef8472667a5beddb3c586509f225)
+  - SETTLEMENTDATE: DATE ("yyyy/mm/dd hh24:mi:ss")
+  - RUNNO: FLOAT (EXTERNAL)
+  - LASTCHANGED: DATE ("yyyy/mm/dd hh24:mi:ss")

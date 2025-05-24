@@ -1,11 +1,10 @@
-// src/schema/evolution.rs
-
 use anyhow::{Context, Result};
 use chrono::{Datelike, Utc};
 use serde_json;
+use std::io::Write;
 use std::{
     collections::{HashMap, HashSet},
-    fs,
+    fs::{self, File},
     path::Path,
     sync::Arc,
 };
@@ -27,7 +26,54 @@ impl SchemaEvolution {
                 .or_default()
                 .push(Arc::new(evo));
         }
+
+        // ensure each table's vector is sorted by start_month
+        for evos in lookup.values_mut() {
+            evos.sort_by(|a, b| a.start_month.cmp(&b.start_month));
+        }
+
         lookup
+    }
+
+    /// Write this evolution to `./evolutions/<table>-<start>-<end>-<hash>.txt`
+    pub fn print(&self) -> anyhow::Result<()> {
+        // Ensure the output directory exists
+        let dir = Path::new("evolutions");
+        fs::create_dir_all(dir).with_context(|| format!("creating directory {:?}", dir))?;
+
+        // Build filename
+        let filename = format!(
+            "{}-{}-{}-{}.txt",
+            self.table_name, self.start_month, self.end_month, self.fields_hash
+        );
+        let path = dir.join(filename);
+
+        // Open the file for writing
+        let mut file = File::create(&path).with_context(|| format!("creating file {:?}", path))?;
+
+        // Write header line
+        writeln!(
+            file,
+            "{}: [{}–{}] ({} columns, hash: {})",
+            self.table_name,
+            self.start_month,
+            self.end_month,
+            self.columns.len(),
+            self.fields_hash
+        )?;
+
+        // Write each column
+        for col in &self.columns {
+            writeln!(
+                file,
+                "  - {}: {} ({})",
+                col.name,
+                col.ty,
+                col.format.as_deref().unwrap_or("N/A")
+            )?;
+        }
+
+        Ok(())
     }
 }
 
@@ -116,6 +162,21 @@ pub fn extract_schema_evolutions<P: AsRef<Path>>(input_dir: P) -> Result<Vec<Sch
         prev_month = Some(month_code);
     }
 
+    // flush any schemas that never changed and never disappeared
+    if let Some(prev) = &prev_month {
+        for (table, (hash, start, cols)) in active.drain() {
+            let arrow_schema = build_arrow_schema(&cols);
+            evolutions.push(SchemaEvolution {
+                table_name: table,
+                fields_hash: hash,
+                start_month: start,
+                end_month: prev.clone(), // last seen month
+                columns: cols,
+                arrow_schema,
+            });
+        }
+    }
+
     // Final pass: extend every last evolution to today
     let now = Utc::now();
     let current = format!("{:04}{:02}", now.year(), now.month());
@@ -128,14 +189,29 @@ pub fn extract_schema_evolutions<P: AsRef<Path>>(input_dir: P) -> Result<Vec<Sch
         evolutions[i].end_month = current.clone();
     }
 
+    // ─── sort by table_name then start_month ─────────────────────────────────
     evolutions.sort_by(|a, b| {
         a.table_name
             .cmp(&b.table_name)
             .then(a.start_month.cmp(&b.start_month))
-            .then(a.end_month.cmp(&b.end_month))
     });
 
-    Ok(evolutions)
+    // ─── bridge any gaps where the hash is identical ────────────────────
+    let mut bridged: Vec<SchemaEvolution> = Vec::with_capacity(evolutions.len());
+    for evo in evolutions.into_iter() {
+        if let Some(prev) = bridged.last_mut() {
+            if prev.table_name == evo.table_name && prev.fields_hash == evo.fields_hash {
+                // same schema, just extend the end_month to cover any gap
+                if evo.end_month > prev.end_month {
+                    prev.end_month = evo.end_month.clone();
+                }
+                continue; // skip pushing a new segment
+            }
+        }
+        bridged.push(evo);
+    }
+
+    Ok(bridged)
 }
 
 /// Pick the one `SchemaEvolution` whose range covers `effective_month`.
@@ -144,24 +220,27 @@ pub fn find_schema_evolution(
     table_name: &str,
     effective_month: &str,
 ) -> Option<Arc<SchemaEvolution>> {
-    if let Some(list) = schema_lookup.get(table_name) {
-        for evo in list {
-            if effective_month >= evo.start_month.as_str()
-                && effective_month <= evo.end_month.as_str()
-            {
+    match schema_lookup.get(table_name) {
+        Some(list) => {
+            // list is sorted by start_month
+            if let Some(evo) = list.iter().find(|e| {
+                e.start_month.as_str() <= effective_month && e.end_month.as_str() >= effective_month
+            }) {
                 return Some(evo.clone());
             }
+            warn!(
+                table = table_name,
+                month = effective_month,
+                "no matching evolution; available ranges = {:?}",
+                list.iter()
+                    .map(|e| format!("{}–{}", e.start_month, e.end_month))
+                    .collect::<Vec<_>>()
+            );
+            None
         }
-        warn!(
-            table = table_name,
-            month = effective_month,
-            "no matching evolution; available ranges = {:?}",
-            list.iter()
-                .map(|e| format!("{}–{}", e.start_month, e.end_month))
-                .collect::<Vec<_>>()
-        );
-    } else {
-        warn!(table = table_name, "no evolutions for this table");
+        None => {
+            warn!(table = table_name, "no evolutions for this table");
+            None
+        }
     }
-    None
 }

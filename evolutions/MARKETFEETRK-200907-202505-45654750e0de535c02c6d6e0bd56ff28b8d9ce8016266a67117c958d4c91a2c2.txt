@@ -1,0 +1,6 @@
+MARKETFEETRK: [200907–202505] (5 columns, hash: 45654750e0de535c02c6d6e0bd56ff28b8d9ce8016266a67117c958d4c91a2c2)
+  - MARKETFEEVERSIONNO: FLOAT (EXTERNAL)
+  - EFFECTIVEDATE: DATE ("yyyy/mm/dd hh24:mi:ss")
+  - AUTHORISEDBY: CHAR(15) (N/A)
+  - AUTHORISEDDATE: DATE ("yyyy/mm/dd hh24:mi:ss")
+  - LASTCHANGED: DATE ("yyyy/mm/dd hh24:mi:ss")

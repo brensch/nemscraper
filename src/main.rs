@@ -57,6 +57,9 @@ async fn main() -> anyhow::Result<()> {
     info!("fetch schemas → {}", schemas_dir.display());
     schema::fetch_all(&client, schemas_dir).await?;
     let evolutions = schema::extract_schema_evolutions(schemas_dir)?;
+    for evo in &evolutions {
+        let _ = evo.print();
+    }
     info!("{} evolutions", evolutions.len());
     let lookup: Arc<HashMap<String, Vec<Arc<SchemaEvolution>>>> =
         Arc::new(SchemaEvolution::build_lookup(evolutions));

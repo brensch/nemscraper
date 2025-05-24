@@ -1,0 +1,7 @@
+DISPATCHOFFERTRK: [202104–202505] (6 columns, hash: 3c14693a0dbc02cf87d90aae0b9cc8aef6a0cc3c2b6ada7a3fb8fdcbaf4c10ae)
+  - SETTLEMENTDATE: DATE ("yyyy/mm/dd hh24:mi:ss")
+  - DUID: CHAR(10) (N/A)
+  - BIDTYPE: CHAR(10) (N/A)
+  - BIDSETTLEMENTDATE: DATE ("yyyy/mm/dd hh24:mi:ss")
+  - BIDOFFERDATE: TIMESTAMP(3) (N/A)
+  - LASTCHANGED: DATE ("yyyy/mm/dd hh24:mi:ss")

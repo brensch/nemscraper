@@ -1,0 +1,4 @@
+GST_BAS_CLASS: [200907–202505] (3 columns, hash: 0849858d102ae18d578b169bf06e5ffaefaf76410d47e27a479d32d27c8f0397)
+  - BAS_CLASS: CHAR(30) (N/A)
+  - DESCRIPTION: CHAR(100) (N/A)
+  - LASTCHANGED: DATE ("yyyy/mm/dd hh24:mi:ss")

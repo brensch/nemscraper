@@ -1,0 +1,5 @@
+DISPATCHABLEUNIT: [200907–202505] (4 columns, hash: d6674751db05f2185334c5edf08f37f16a0b67c28c56c7c231620f2dbfff46c7)
+  - DUID: CHAR(10) (N/A)
+  - DUNAME: CHAR(20) (N/A)
+  - UNITTYPE: CHAR(20) (N/A)
+  - LASTCHANGED: DATE ("yyyy/mm/dd hh24:mi:ss")

@@ -1,0 +1,6 @@
+EMSMASTER: [200907–202505] (5 columns, hash: 3f9d5873b1e51fdf679e0dd0a79550a5d91a6d1121e52ffe5cee3eb8df7aab7a)
+  - SPD_ID: CHAR(21) (N/A)
+  - SPD_TYPE: CHAR(1) (N/A)
+  - DESCRIPTION: CHAR(255) (N/A)
+  - GROUPING_ID: CHAR(20) (N/A)
+  - LASTCHANGED: DATE ("yyyy/mm/dd hh24:mi:ss")

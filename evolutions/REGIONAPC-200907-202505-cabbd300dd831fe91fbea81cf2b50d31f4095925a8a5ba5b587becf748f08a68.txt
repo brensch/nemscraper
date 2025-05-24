@@ -1,0 +1,7 @@
+REGIONAPC: [200907–202505] (6 columns, hash: cabbd300dd831fe91fbea81cf2b50d31f4095925a8a5ba5b587becf748f08a68)
+  - REGIONID: CHAR(10) (N/A)
+  - EFFECTIVEDATE: DATE ("yyyy/mm/dd hh24:mi:ss")
+  - VERSIONNO: FLOAT (EXTERNAL)
+  - AUTHORISEDDATE: DATE ("yyyy/mm/dd hh24:mi:ss")
+  - AUTHORISEDBY: CHAR(10) (N/A)
+  - LASTCHANGED: DATE ("yyyy/mm/dd hh24:mi:ss")

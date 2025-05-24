@@ -1,0 +1,6 @@
+DUALLOC: [202010–202407] (5 columns, hash: 996a36935d0886b9a970a51dc1b602eba9b5062d82e0052cf86e3b45e6d14a6e)
+  - EFFECTIVEDATE: DATE ("yyyy/mm/dd hh24:mi:ss")
+  - VERSIONNO: FLOAT (EXTERNAL)
+  - DUID: CHAR(10) (N/A)
+  - GENSETID: CHAR(20) (N/A)
+  - LASTCHANGED: DATE ("yyyy/mm/dd hh24:mi:ss")

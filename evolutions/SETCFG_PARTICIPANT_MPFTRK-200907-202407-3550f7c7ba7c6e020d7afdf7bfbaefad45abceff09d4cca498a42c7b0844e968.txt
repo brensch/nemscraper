@@ -1,0 +1,7 @@
+SETCFG_PARTICIPANT_MPFTRK: [200907–202407] (6 columns, hash: 3550f7c7ba7c6e020d7afdf7bfbaefad45abceff09d4cca498a42c7b0844e968)
+  - PARTICIPANTID: CHAR(10) (N/A)
+  - EFFECTIVEDATE: DATE ("yyyy/mm/dd hh24:mi:ss")
+  - VERSIONNO: FLOAT (EXTERNAL)
+  - AUTHORISEDBY: CHAR(15) (N/A)
+  - AUTHORISEDDATE: DATE ("yyyy/mm/dd hh24:mi:ss")
+  - LASTCHANGED: DATE ("yyyy/mm/dd hh24:mi:ss")

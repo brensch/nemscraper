@@ -1,0 +1,5 @@
+P5MIN_SCENARIODEMANDTRK: [202106–202407] (4 columns, hash: 4b1cb783eeacc3559c0414ae5cff5ee279f26469d61426a7ab2c200a30e08155)
+  - EFFECTIVEDATE: DATE ("yyyy/mm/dd hh24:mi:ss")
+  - VERSION_DATETIME: DATE ("yyyy/mm/dd hh24:mi:ss")
+  - AUTHORISEDDATE: DATE ("yyyy/mm/dd hh24:mi:ss")
+  - LASTCHANGED: DATE ("yyyy/mm/dd hh24:mi:ss")

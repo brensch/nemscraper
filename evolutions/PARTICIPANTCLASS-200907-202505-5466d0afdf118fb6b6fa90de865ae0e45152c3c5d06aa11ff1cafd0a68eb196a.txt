@@ -1,0 +1,4 @@
+PARTICIPANTCLASS: [200907–202505] (3 columns, hash: 5466d0afdf118fb6b6fa90de865ae0e45152c3c5d06aa11ff1cafd0a68eb196a)
+  - PARTICIPANTCLASSID: CHAR(20) (N/A)
+  - DESCRIPTION: CHAR(64) (N/A)
+  - LASTCHANGED: DATE ("yyyy/mm/dd hh24:mi:ss")

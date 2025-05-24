@@ -1,0 +1,7 @@
+BIDDUIDDETAILSTRK: [200907–202407] (6 columns, hash: 95484cf932133a292e0862fdd1261f084a51bb1ab741b5bde497b8226b62d47b)
+  - DUID: CHAR(10) (N/A)
+  - EFFECTIVEDATE: DATE ("yyyy/mm/dd hh24:mi:ss")
+  - VERSIONNO: FLOAT (EXTERNAL)
+  - AUTHORISEDDATE: DATE ("yyyy/mm/dd hh24:mi:ss")
+  - AUTHORISEDBY: CHAR(15) (N/A)
+  - LASTCHANGED: DATE ("yyyy/mm/dd hh24:mi:ss")
