@@ -1,14 +1,14 @@
-// data/src/main.rs
-
+use anyhow::Result;
 use nemscraper::{
-    fetch, process,
+    fetch,
+    history::{load_processed, record_processed},
+    process,
     schema::{self, SchemaEvolution},
 };
 use reqwest::Client;
-
 use std::{
     collections::{HashMap, HashSet},
-    fs::{self, File},
+    fs,
     path::{Path, PathBuf},
     sync::Arc,
 };
@@ -16,19 +16,11 @@ use tokio::{
     sync::{mpsc, Semaphore},
     time::Instant,
 };
+use tracing::{error, info};
 use tracing_subscriber::{fmt, EnvFilter};
 
-// for Parquet‐based history
-use arrow::array::StringArray;
-use arrow::datatypes::{DataType, Field, Schema};
-use arrow::record_batch::RecordBatch;
-use parquet::arrow::ArrowWriter;
-use parquet::basic::Compression;
-use parquet::file::properties::WriterProperties;
-use tracing::{error, info};
-
 #[tokio::main]
-async fn main() -> anyhow::Result<()> {
+async fn main() -> Result<()> {
     // ─── 1) init logging ─────────────────────────────────────────────
     let env = EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| EnvFilter::new("info,data=info,main=info"));
@@ -65,15 +57,7 @@ async fn main() -> anyhow::Result<()> {
         Arc::new(SchemaEvolution::build_lookup(evolutions));
 
     // ─── 4) load history to skip processed ZIPs ──────────────────────
-    let processed: HashSet<String> = fs::read_dir(&history_dir)?
-        .filter_map(|e| e.ok())
-        .filter_map(|ent| {
-            ent.path()
-                .file_stem()
-                .and_then(|s| s.to_str())
-                .map(|s| s.to_string())
-        })
-        .collect();
+    let processed: HashSet<String> = load_processed(&history_dir)?;
     info!("{} ZIPs already done", processed.len());
 
     // ─── 5) discover new ZIP URLs ────────────────────────────────────
@@ -128,7 +112,7 @@ async fn main() -> anyhow::Result<()> {
                 }
                 Err(err) => {
                     error!("{} failed: {}", url, err);
-                    let _ = tx.send(Err((url, err.to_string()))).await;
+                    let _ = tx.send(Err((url.clone(), err.to_string()))).await;
                 }
             }
         }));
@@ -137,15 +121,14 @@ async fn main() -> anyhow::Result<()> {
     drop(tx);
 
     // ─── 7) process downloaded ZIPs one at a time ────────────────────
-    // nb the processor itself is multi threaded. doing any more than 1 at a time risks OOM death.
     while let Some(msg) = rx.recv().await {
         match msg {
             Ok(zip_path) => {
                 let name = zip_path.file_name().unwrap().to_string_lossy().to_string();
                 info!("processing {}", name);
 
-                // offload the heavy split to the blocking pool (but still only one at a time)
-                match tokio::task::spawn_blocking({
+                // offload the heavy split to the blocking pool
+                if let Err(e) = tokio::task::spawn_blocking({
                     let lookup = Arc::clone(&lookup);
                     let out_parquet_dir = out_parquet_dir.clone();
                     let zip_clone = zip_path.clone();
@@ -153,39 +136,18 @@ async fn main() -> anyhow::Result<()> {
                         process::split::split_zip_to_parquet(&zip_clone, &out_parquet_dir, lookup)
                     }
                 })
-                .await
+                .await?
                 {
-                    Ok(Ok(())) => { /* success */ }
-                    Ok(Err(e)) => {
-                        error!("split {} failed: {}", name, e);
-                        continue;
-                    }
-                    Err(join_err) => {
-                        error!("blocking task panicked: {:?}", join_err);
-                        continue;
-                    }
+                    error!("split {} failed: {}", name, e);
+                    continue;
                 }
 
-                // write history/<name>.parquet
-                let hist_file = history_dir.join(format!("{}.parquet", name));
-                {
-                    let schema = Schema::new(vec![Field::new("zip_name", DataType::Utf8, false)]);
-                    let arr = StringArray::from(vec![name.clone()]);
-                    let batch = RecordBatch::try_new(Arc::new(schema.clone()), vec![Arc::new(arr)])
-                        .expect("make batch");
-                    let file = File::create(&hist_file).expect("create history file");
-                    let props = WriterProperties::builder()
-                        .set_compression(Compression::SNAPPY)
-                        .build();
-                    let mut writer = ArrowWriter::try_new(file, Arc::new(schema), Some(props))
-                        .expect("create writer");
-                    writer.write(&batch).expect("write batch");
-                    writer.close().expect("close writer");
-                }
+                // write history record
+                record_processed(&history_dir, &name)?;
                 info!("wrote history for {}", name);
 
                 // delete the ZIP file
-                if let Err(e) = std::fs::remove_file(&zip_path) {
+                if let Err(e) = fs::remove_file(&zip_path) {
                     error!("failed to delete {}: {}", name, e);
                 } else {
                     info!("deleted zip {}", zip_path.display());

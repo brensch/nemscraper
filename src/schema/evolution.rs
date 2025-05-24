@@ -1,57 +1,55 @@
-use anyhow::{Context, Result};
+// data/src/schema.rs
+use anyhow::{anyhow, Context, Result};
 use chrono::{Datelike, Utc};
 use serde_json;
-use std::io::Write;
 use std::{
     collections::{HashMap, HashSet},
-    fs::{self, File},
+    fs,
+    io::Write,
     path::Path,
     sync::Arc,
 };
 use tracing::{debug, instrument, warn};
 
+use super::types::{calculate_fields_hash, Column, MonthSchema, SchemaEvolution};
 use crate::schema::build_arrow_schema;
 
-use super::types::{calculate_fields_hash, Column, MonthSchema, SchemaEvolution};
-
 impl SchemaEvolution {
-    /// Build a lookup map from table name -> list of Arc<SchemaEvolution>
+    /// Build a lookup map from table name -> list of Arc<SchemaEvolution>.
+    ///
+    /// The returned `HashMap` maps each table name (String) to a vector of
+    /// `SchemaEvolution` entries, **sorted by their `start_month`**.
+    /// This lets you quickly pull the evolution history for a given table
+    /// and binary-search or linearly scan for the right month.
     pub fn build_lookup(
         evolutions: Vec<SchemaEvolution>,
     ) -> HashMap<String, Vec<Arc<SchemaEvolution>>> {
         let mut lookup: HashMap<String, Vec<Arc<SchemaEvolution>>> = HashMap::new();
         for evo in evolutions {
+            // Group all evolutions under their table name
             lookup
                 .entry(evo.table_name.clone())
                 .or_default()
                 .push(Arc::new(evo));
         }
-
-        // ensure each table's vector is sorted by start_month
+        // Sort each table’s evolution history by start_month
         for evos in lookup.values_mut() {
             evos.sort_by(|a, b| a.start_month.cmp(&b.start_month));
         }
-
         lookup
     }
 
     /// Write this evolution to `./evolutions/<table>-<start>-<end>-<hash>.txt`
     pub fn print(&self) -> anyhow::Result<()> {
-        // Ensure the output directory exists
         let dir = Path::new("evolutions");
         fs::create_dir_all(dir).with_context(|| format!("creating directory {:?}", dir))?;
-
-        // Build filename
         let filename = format!(
             "{}-{}-{}-{}.txt",
             self.table_name, self.start_month, self.end_month, self.fields_hash
         );
         let path = dir.join(filename);
-
-        // Open the file for writing
-        let mut file = File::create(&path).with_context(|| format!("creating file {:?}", path))?;
-
-        // Write header line
+        let mut file =
+            fs::File::create(&path).with_context(|| format!("creating file {:?}", path))?;
         writeln!(
             file,
             "{}: [{}–{}] ({} columns, hash: {})",
@@ -61,8 +59,6 @@ impl SchemaEvolution {
             self.columns.len(),
             self.fields_hash
         )?;
-
-        // Write each column
         for col in &self.columns {
             writeln!(
                 file,
@@ -72,10 +68,11 @@ impl SchemaEvolution {
                 col.format.as_deref().unwrap_or("N/A")
             )?;
         }
-
         Ok(())
     }
 }
+
+/// Read all `<YYYYMM>.json` in `input_dir` and produce `SchemaEvolution` entries.
 
 /// Read all `<YYYYMM>.json` in `input_dir` and produce `SchemaEvolution` entries.
 #[instrument(level = "info", skip(input_dir), fields(input_path = %input_dir.as_ref().display()))]
@@ -214,33 +211,41 @@ pub fn extract_schema_evolutions<P: AsRef<Path>>(input_dir: P) -> Result<Vec<Sch
     Ok(bridged)
 }
 
-/// Pick the one `SchemaEvolution` whose range covers `effective_month`.
 pub fn find_schema_evolution(
     schema_lookup: &HashMap<String, Vec<Arc<SchemaEvolution>>>,
     table_name: &str,
-    effective_month: &str,
-) -> Option<Arc<SchemaEvolution>> {
-    match schema_lookup.get(table_name) {
-        Some(list) => {
-            // list is sorted by start_month
-            if let Some(evo) = list.iter().find(|e| {
-                e.start_month.as_str() <= effective_month && e.end_month.as_str() >= effective_month
-            }) {
-                return Some(evo.clone());
-            }
-            warn!(
-                table = table_name,
-                month = effective_month,
-                "no matching evolution; available ranges = {:?}",
-                list.iter()
-                    .map(|e| format!("{}–{}", e.start_month, e.end_month))
-                    .collect::<Vec<_>>()
-            );
-            None
-        }
-        None => {
-            warn!(table = table_name, "no evolutions for this table");
-            None
+    _effective_month: &str, // still accepted but unused
+    header_names: &[String],
+) -> Result<Arc<SchemaEvolution>> {
+    // 1) pull the list of all evolutions for this table
+    let evolutions = schema_lookup
+        .get(table_name)
+        .ok_or_else(|| anyhow!("no evolutions found for table `{}`", table_name))?;
+
+    // 2) strip the first four CSV header rows
+    let trimmed_headers = if header_names.len() > 4 {
+        &header_names[4..]
+    } else {
+        &[]
+    };
+
+    // 3) iterate and compare against each evolution’s column list
+    for evo in evolutions {
+        let expected: Vec<String> = evo.columns.iter().map(|c| c.name.clone()).collect();
+        if expected == trimmed_headers {
+            return Ok(evo.clone());
         }
     }
+
+    // 4) if none matched, return an error
+    Err(anyhow!(
+        "no matching schema for `{}`. Incoming headers (after drop 4): {:?}\n\
+         Known schemas had these column sets: {:?}",
+        table_name,
+        trimmed_headers,
+        evolutions
+            .iter()
+            .map(|e| e.columns.iter().map(|c| c.name.clone()).collect::<Vec<_>>())
+            .collect::<Vec<_>>()
+    ))
 }

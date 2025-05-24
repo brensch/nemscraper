@@ -1,9 +1,7 @@
 // data/src/process/split.rs
 use crate::process::chunk::chunk_and_write_segment;
-use crate::schema;
-use crate::schema::find_schema_evolution;
-use crate::schema::SchemaEvolution;
-use anyhow::Result;
+use crate::schema::{find_schema_evolution, SchemaEvolution};
+use anyhow::{anyhow, Context, Result};
 use num_cpus;
 use rayon::prelude::*;
 use std::{
@@ -15,17 +13,22 @@ use std::{
     sync::Arc,
     time::Instant,
 };
-use tracing::{info, instrument, warn};
+use tracing::{error, info, instrument};
 use zip::ZipArchive;
 
 /// Splits each CSV file in the ZIP into chunks and writes Parquet files,
-/// using a pre-built lookup of schema evolutions.
+/// using a pre-built lookup of schema evolutions.  For each segment:
+/// 1. Parse out the CSV header row into `Vec<String>`.
+/// 2. Call `find_schema_evolution(.., &header_names)`, which will error
+///    if no matching evolution covers that month **or** the headers differ.
+/// 3. Only if it passes, write the Parquet via `chunk_and_write_segment`.
 #[instrument(level = "info", skip(zip_path, out_dir, lookup), fields(zip = %zip_path.as_ref().display()))]
 pub fn split_zip_to_parquet<P: AsRef<Path>, Q: AsRef<Path>>(
     zip_path: P,
     out_dir: Q,
     lookup: Arc<HashMap<String, Vec<Arc<SchemaEvolution>>>>,
 ) -> Result<()> {
+    // Initialize Rayon thread pool
     rayon::ThreadPoolBuilder::new()
         .num_threads(num_cpus::get())
         .build_global()
@@ -41,24 +44,25 @@ pub fn split_zip_to_parquet<P: AsRef<Path>, Q: AsRef<Path>>(
     let file = File::open(&zip_path)?;
     let mut archive = ZipArchive::new(file)?;
 
-    for i in 0..archive.len() {
-        let mut entry = archive.by_index(i)?;
+    for idx in 0..archive.len() {
+        let mut entry = archive.by_index(idx)?;
         let name = entry.name().to_string();
         if !name.to_lowercase().ends_with(".csv") {
             continue;
         }
 
+        // Read the entire CSV into memory once
         let mut buf = Vec::new();
         entry.read_to_end(&mut buf)?;
         let text = Arc::new(String::from_utf8_lossy(&buf).to_string());
 
-        // determine segments
+        // 1) Identify all (schema_id, header_start, data_start, end_pos, date) segments
         let segments = {
             let mut segs = Vec::new();
             let mut pos = 0;
             let mut header_start = 0;
             let mut data_start = 0;
-            let mut current_schema = None;
+            let mut current_schema: Option<String> = None;
             let mut seen_footer = false;
             let mut date = String::new();
 
@@ -77,62 +81,66 @@ pub fn split_zip_to_parquet<P: AsRef<Path>, Q: AsRef<Path>>(
                     continue;
                 }
                 if chunk.starts_with("I,") {
+                    // When switching schemas, flush previous
                     if let Some(schema_id) = current_schema.take() {
                         segs.push((schema_id, header_start, data_start, pos, date.clone()));
                     }
                     header_start = pos;
                     let parts: Vec<&str> = chunk.trim_end_matches('\n').split(',').collect();
-                    let part1 = parts[1];
-                    let part2 = parts[2];
-                    let schema_name = if part2.starts_with(part1) {
-                        // part2 already includes part1 as a prefix, so just use part2
-                        part2.to_string()
+                    let schema_id = if parts[2].starts_with(parts[1]) {
+                        parts[2].to_string()
                     } else {
-                        // otherwise glue them together
-                        format!("{}_{}", part1, part2)
+                        format!("{}_{}", parts[1], parts[2])
                     };
-                    current_schema = Some(schema_name);
+                    current_schema = Some(schema_id);
                     data_start = pos + chunk.len();
                 }
                 pos += chunk.len();
             }
+            // Flush last segment
             if let Some(schema_id) = current_schema {
                 segs.push((schema_id, header_start, data_start, pos, date));
             }
             segs
         };
 
-        // process segments
+        // 2) Process each segment in parallel, validating headers; any error aborts entire run
         segments
             .into_par_iter()
-            .for_each(|(schema_id, hs, ds, es, date)| {
-                let header = &text[hs..ds];
-                let data = &text[ds..es];
+            .try_for_each(|(schema_id, hs, ds, es, date)| -> Result<()> {
+                // Extract the raw header text (usually a single CSV header line)
+                let header_str = &text[hs..ds];
+                let header_line = header_str
+                    .lines()
+                    .next()
+                    .ok_or_else(|| anyhow!("empty header for table `{}` on {}", schema_id, date))?;
+                let header_names: Vec<String> =
+                    header_line.split(',').map(|s| s.to_string()).collect();
 
-                if let Some(evo) = find_schema_evolution(&lookup, &schema_id, &date) {
-                    let arrow_schema = evo.arrow_schema.clone();
-                    let headers = evo.columns.clone();
+                // Find the matching evolution *and* verify those header names
+                let evo = find_schema_evolution(&lookup, &schema_id, &date, &header_names)
+                    // Log the full error chain to your logger:
+                    .inspect_err(|e| {
+                        error!(
+                            table = %schema_id,
+                            month = %date,
+                            error = %e,
+                            "schema validation error"
+                        )
+                    })?;
 
-                    // TODO: check the schema is correct from the header we have
-                    chunk_and_write_segment(
-                        &name,
-                        &schema_id,
-                        header,
-                        data,
-                        headers,
-                        arrow_schema,
-                        &out_dir,
-                    );
-                } else {
-                    warn!(
-                        month = &date,
-                        schema = schema_id,
-                        header = %header,
-
-                        "no schema evolution found, skipping segment"
-                    );
-                }
-            });
+                // Now write the parquet using the validated schema
+                chunk_and_write_segment(
+                    &name,
+                    &schema_id,
+                    header_str,
+                    &text[ds..es],
+                    evo.columns.clone(),
+                    evo.arrow_schema.clone(),
+                    &out_dir,
+                );
+                Ok(())
+            })?;
     }
 
     info!("completed in {:?}", start.elapsed());
