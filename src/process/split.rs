@@ -82,7 +82,16 @@ pub fn split_zip_to_parquet<P: AsRef<Path>, Q: AsRef<Path>>(
                     }
                     header_start = pos;
                     let parts: Vec<&str> = chunk.trim_end_matches('\n').split(',').collect();
-                    current_schema = Some(format!("{}_{}", parts[1], parts[2]));
+                    let part1 = parts[1];
+                    let part2 = parts[2];
+                    let schema_name = if part2.starts_with(part1) {
+                        // part2 already includes part1 as a prefix, so just use part2
+                        part2.to_string()
+                    } else {
+                        // otherwise glue them together
+                        format!("{}_{}", part1, part2)
+                    };
+                    current_schema = Some(schema_name);
                     data_start = pos + chunk.len();
                 }
                 pos += chunk.len();

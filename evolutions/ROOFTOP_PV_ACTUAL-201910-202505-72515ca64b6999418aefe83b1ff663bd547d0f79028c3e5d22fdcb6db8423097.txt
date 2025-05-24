@@ -1,7 +1,0 @@
-ROOFTOP_PV_ACTUAL: [201910–202505] (6 columns, hash: 72515ca64b6999418aefe83b1ff663bd547d0f79028c3e5d22fdcb6db8423097)
-  - INTERVAL_DATETIME: DATE ("yyyy/mm/dd hh24:mi:ss")
-  - REGIONID: CHAR(20) (N/A)
-  - POWER: FLOAT (EXTERNAL)
-  - QI: FLOAT (EXTERNAL)
-  - TYPE: CHAR(20) (N/A)
-  - LASTCHANGED: DATE ("yyyy/mm/dd hh24:mi:ss")

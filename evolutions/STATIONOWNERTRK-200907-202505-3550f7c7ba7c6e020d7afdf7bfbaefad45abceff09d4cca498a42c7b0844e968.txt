@@ -1,7 +1,0 @@
-STATIONOWNERTRK: [200907–202505] (6 columns, hash: 3550f7c7ba7c6e020d7afdf7bfbaefad45abceff09d4cca498a42c7b0844e968)
-  - EFFECTIVEDATE: DATE ("yyyy/mm/dd hh24:mi:ss")
-  - VERSIONNO: FLOAT (EXTERNAL)
-  - PARTICIPANTID: CHAR(10) (N/A)
-  - AUTHORISEDDATE: DATE ("yyyy/mm/dd hh24:mi:ss")
-  - AUTHORISEDBY: CHAR(15) (N/A)
-  - LASTCHANGED: DATE ("yyyy/mm/dd hh24:mi:ss")

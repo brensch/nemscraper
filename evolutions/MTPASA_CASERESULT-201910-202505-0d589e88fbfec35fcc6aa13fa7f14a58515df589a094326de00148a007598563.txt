@@ -1,5 +1,0 @@
-MTPASA_CASERESULT: [201910–202505] (4 columns, hash: 0d589e88fbfec35fcc6aa13fa7f14a58515df589a094326de00148a007598563)
-  - RUN_DATETIME: DATE ("yyyy/mm/dd hh24:mi:ss")
-  - RUN_NO: FLOAT (EXTERNAL)
-  - PLEXOS_VERSION: CHAR(20) (N/A)
-  - LASTCHANGED: DATE ("yyyy/mm/dd hh24:mi:ss")
