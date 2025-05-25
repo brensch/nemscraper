@@ -3,7 +3,7 @@ use nemscraper::{
     fetch,
     history::{load_processed, record_processed},
     process,
-    schema::{self, SchemaEvolution},
+    schema::{self, extract_column_types},
 };
 use reqwest::Client;
 use std::{
@@ -45,16 +45,13 @@ async fn main() -> Result<()> {
         fs::create_dir_all(d)?;
     }
 
-    // ─── 3) fetch & evolve CTL schemas ───────────────────────────────
+    // ─── 3) fetch & extract column types ──────────────────────────────
     info!("fetch schemas → {}", schemas_dir.display());
     schema::fetch_all(&client, schemas_dir).await?;
-    let evolutions = schema::extract_schema_evolutions(schemas_dir)?;
-    for evo in &evolutions {
-        let _ = evo.print();
-    }
-    info!("{} evolutions", evolutions.len());
-    let lookup: Arc<HashMap<String, Vec<Arc<SchemaEvolution>>>> =
-        Arc::new(SchemaEvolution::build_lookup(evolutions));
+    let column_lookup: HashMap<String, HashMap<String, HashSet<String>>> =
+        extract_column_types(schemas_dir)?;
+    info!("extracted column types for {} tables", column_lookup.len());
+    let lookup = Arc::new(column_lookup);
 
     // ─── 4) load history to skip processed ZIPs ──────────────────────
     let processed: HashSet<String> = load_processed(&history_dir)?;
@@ -117,7 +114,7 @@ async fn main() -> Result<()> {
             }
         }));
     }
-    // drop the original sender so `rx.recv()` will end once all downloads are done
+    // drop the original sender so `rx.recv()` will end once all downloads complete
     drop(tx);
 
     // ─── 7) process downloaded ZIPs one at a time ────────────────────
