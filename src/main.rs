@@ -23,7 +23,7 @@ use tracing::{error, info, level_filters::LevelFilter};
 use tracing_subscriber::{fmt, EnvFilter};
 
 mod history;
-use history::History;
+use history::{Event, History};
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -66,7 +66,7 @@ async fn main() -> Result<()> {
 
     // ─── 4) history manager & load processed ZIPs ────────────────────
     let history = Arc::new(History::new(&history_dir)?);
-    let processed = Arc::new(Mutex::new(history.load_event_names("processed")?));
+    let processed = Arc::new(Mutex::new(history.load_event_names(Event::Processed)?));
 
     // ─── 5) channels ──────────────────────────────────────────────────
     let (tx, mut rx) = mpsc::unbounded_channel::<Result<PathBuf, (String, String)>>();
@@ -116,7 +116,7 @@ async fn main() -> Result<()> {
                                     "attempt {}/3 for {} failed: {}, retrying...",
                                     attempt, url, e
                                 );
-                                sleep(Duration::from_secs(1)).await;
+                                sleep(Duration::from_secs(2)).await;
                             }
                             Err(e) => return Err(e),
                         }
@@ -126,7 +126,7 @@ async fn main() -> Result<()> {
 
                 match path_result {
                     Ok(path) => {
-                        if let Err(e) = history.record_event(&name, "downloaded") {
+                        if let Err(e) = history.record_event(&name, Event::Downloaded) {
                             error!("history.record_event failed: {}", e);
                         }
                         let _ = tx.send(Ok(path));
@@ -155,6 +155,7 @@ async fn main() -> Result<()> {
             let mut ticker = interval(Duration::from_secs(60));
             loop {
                 if let Err(e) = async {
+                    info!("scheduler tick");
                     // refresh schemas
                     schema::fetch_all(&client, &schemas_dir).await?;
                     let new_map = extract_column_types(&schemas_dir)?;
@@ -175,14 +176,14 @@ async fn main() -> Result<()> {
 
                     // fetch new URLs and skip already-processed
                     let feeds = fetch::urls::fetch_current_zip_urls(&client).await?;
-                    let processed = history.load_event_names("processed")?;
+                    let downloaded = history.load_event_names(Event::Downloaded)?;
                     for url in feeds.values().flatten() {
                         let name = Path::new(url)
                             .file_name()
                             .unwrap()
                             .to_string_lossy()
                             .to_string();
-                        if !processed.contains(&name) {
+                        if !downloaded.contains(&name) {
                             url_tx
                                 .send(url.clone())
                                 .map_err(|e| anyhow::anyhow!(e.to_string()))?;
@@ -241,8 +242,15 @@ async fn main() -> Result<()> {
                 }
 
                 // record processed event
-                if let Err(e) = history.record_event(&name, "processed") {
+                if let Err(e) = history.record_event(&name, Event::Processed) {
                     error!("record_event processed failed: {}", e);
+                }
+
+                //  delete zip file
+                if let Err(e) = fs::remove_file(&zip_path) {
+                    error!("failed to delete zip {}: {}", name, e);
+                } else {
+                    info!("deleted zip {}", name);
                 }
             }
             Err((url, _)) => {
