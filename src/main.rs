@@ -1,23 +1,29 @@
+// src/main.rs
+
 use anyhow::Result;
 use nemscraper::{
-    fetch,
-    history::{load_processed, record_processed},
-    process,
+    fetch, process,
     schema::{self, extract_column_types},
 };
 use reqwest::Client;
 use std::{
     collections::{HashMap, HashSet},
+    ffi::OsStr,
     fs,
     path::{Path, PathBuf},
     sync::Arc,
+    time::Duration,
 };
 use tokio::{
-    sync::{mpsc, Semaphore},
-    time::Instant,
+    sync::{mpsc, Mutex},
+    task,
+    time::{interval, Instant},
 };
 use tracing::{error, info};
 use tracing_subscriber::{fmt, EnvFilter};
+
+mod history;
+use history::History;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -30,159 +36,198 @@ async fn main() -> Result<()> {
         .init();
     info!("startup");
 
-    std::panic::set_hook(Box::new(|info| {
-        eprintln!("panic: {:?}", info);
-    }));
-
     // ─── 2) configure dirs ───────────────────────────────────────────
     let client = Client::new();
-    let schemas_dir = Path::new("schemas");
-    let zips_dir = PathBuf::from("zips");
-    let out_parquet_dir = PathBuf::from("parquet");
-    let history_dir = PathBuf::from("history");
-    let failed_zips_dir = PathBuf::from("failed_zips");
+    let assets = PathBuf::from("assets");
+    let schemas_dir = assets.join("schemas");
+    let zips_dir = assets.join("zips");
+    let parquet_dir = assets.join("parquet");
+    let tmp_dir = assets.join("parquet_tmp");
+    let history_dir = assets.join("history");
+    let failed_dir = assets.join("failed_zips");
 
-    for d in &[
-        schemas_dir,
+    for d in [
+        &schemas_dir,
         &zips_dir,
-        &out_parquet_dir,
+        &parquet_dir,
+        &tmp_dir,
         &history_dir,
-        &failed_zips_dir,
+        &failed_dir,
     ] {
         fs::create_dir_all(d)?;
     }
 
-    // ─── 3) fetch & extract column types ──────────────────────────────
+    // ─── 3) initial schema fetch & extract ──────────────────────────
     info!("fetch schemas → {}", schemas_dir.display());
-    schema::fetch_all(&client, schemas_dir).await?;
-    let column_lookup: HashMap<String, HashMap<String, HashSet<String>>> =
-        extract_column_types(schemas_dir)?;
-    info!("extracted column types for {} tables", column_lookup.len());
-    let lookup = Arc::new(column_lookup);
+    schema::fetch_all(&client, &schemas_dir).await?;
+    let init_map: HashMap<String, HashMap<String, HashSet<String>>> =
+        extract_column_types(&schemas_dir)?;
+    let lookup = Arc::new(Mutex::new(init_map));
 
-    // ─── 4) load history to skip processed ZIPs ──────────────────────
-    let processed: HashSet<String> = load_processed(&history_dir)?;
-    info!("{} ZIPs already done", processed.len());
+    // ─── 4) history manager & load processed ZIPs ────────────────────
+    let history = Arc::new(History::new(&history_dir)?);
+    let processed = Arc::new(Mutex::new(history.load_event_names("processed")?));
 
-    // ─── 5) discover new ZIP URLs ────────────────────────────────────
-    let feeds = fetch::urls::fetch_current_zip_urls(&client).await?;
-    let to_process: Vec<String> = feeds
-        .values()
-        .flatten()
-        .filter_map(|u| {
-            let name = Path::new(u)
-                .file_name()
-                .unwrap()
-                .to_string_lossy()
-                .to_string();
-            if processed.contains(&name) {
-                None
-            } else {
-                Some(u.clone())
+    // ─── 5) channels ──────────────────────────────────────────────────
+    let (tx, mut rx) = mpsc::unbounded_channel::<Result<PathBuf, (String, String)>>();
+    let (url_tx, url_rx) = mpsc::unbounded_channel::<String>();
+    let url_rx = Arc::new(Mutex::new(url_rx));
+
+    // ─── 6) queue existing ZIPs ───────────────────────────────────────
+    {
+        let seen = processed.lock().await.clone();
+        for entry in fs::read_dir(&zips_dir)? {
+            let path = entry?.path();
+            if path.extension() == Some(OsStr::new("zip")) {
+                let name = path.file_name().unwrap().to_string_lossy().to_string();
+                if !seen.contains(&name) {
+                    tx.send(Ok(path.clone()))?;
+                }
             }
-        })
-        .collect();
-
-    if to_process.is_empty() {
-        info!("no new ZIPs; exit");
-        return Ok(());
+        }
     }
-    info!("{} ZIPs to download + split", to_process.len());
 
-    // ─── 6) spawn downloader tasks ──────────────────────────────────
-    let (tx, mut rx) = mpsc::channel::<Result<PathBuf, (String, String)>>(100);
-    let dl_sem = Arc::new(Semaphore::new(3));
-    let mut dl_handles = Vec::with_capacity(to_process.len());
-
-    for url in to_process {
+    // ─── 7) spawn download workers ───────────────────────────────────
+    for _ in 0..2 {
         let client = client.clone();
         let zips_dir = zips_dir.clone();
         let tx = tx.clone();
-        let sem = dl_sem.clone();
+        let url_rx = url_rx.clone();
+        let history = history.clone();
 
-        dl_handles.push(tokio::spawn(async move {
-            let _permit = sem.acquire().await.unwrap();
-            let name = Path::new(&url)
-                .file_name()
-                .unwrap()
-                .to_string_lossy()
-                .to_string();
-            info!(name=%name, "downloading");
-            let start = Instant::now();
-            match fetch::zips::download_zip(&client, &url, &zips_dir).await {
-                Ok(path) => {
-                    info!(name=%name, elapsed=?start.elapsed(), "downloaded");
-                    let _ = tx.send(Ok(path)).await;
-                }
-                Err(err) => {
-                    error!("{} download failed: {}", url, err);
-                    let _ = tx.send(Err((url.clone(), err.to_string()))).await;
+        task::spawn(async move {
+            while let Some(url) = url_rx.lock().await.recv().await {
+                let name = PathBuf::from(&url)
+                    .file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .to_string();
+                info!(name=%name, "downloading {}", url);
+                match fetch::zips::download_zip(&client, &url, &zips_dir).await {
+                    Ok(path) => {
+                        if let Err(e) = history.record_event(&name, "downloaded") {
+                            error!("history.record_event failed: {}", e);
+                        }
+                        let _ = tx.send(Ok(path));
+                    }
+                    Err(e) => {
+                        error!("download failed {}: {}", url, e);
+                        let _ = tx.send(Err((url.clone(), e.to_string())));
+                    }
                 }
             }
-        }));
+        });
     }
-    drop(tx);
+    // ─── scheduler: every 60s ──────────────────────────────────────
+    {
+        let lookup = lookup.clone();
+        let url_tx = url_tx.clone();
+        let history = history.clone();
+        let client = client.clone();
+        let schemas_dir = schemas_dir.clone();
+        let zips_dir = zips_dir.clone();
+        let failed_dir = failed_dir.clone();
 
-    // ─── 7) process downloaded ZIPs one at a time ────────────────────
+        task::spawn(async move {
+            let mut ticker = interval(Duration::from_secs(60));
+            loop {
+                // wrap the fallible work in an async block returning Result
+                if let Err(e) = async {
+                    // 1) refresh schemas
+                    schema::fetch_all(&client, &schemas_dir).await?;
+                    let new_map = extract_column_types(&schemas_dir)?;
+                    *lookup.lock().await = new_map;
+
+                    // 2) re-enqueue failed splits
+                    for entry in fs::read_dir(&failed_dir)? {
+                        let path = entry?.path();
+                        if path.extension() == Some(OsStr::new("zip")) {
+                            let name = path.file_name().unwrap().to_string_lossy().to_string();
+                            let dest = zips_dir.join(&name);
+                            fs::rename(&path, &dest)?;
+                            info!("re-queued failed zip {}", name);
+                            tx.send(Ok(dest.clone()))
+                                .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+                        }
+                    }
+
+                    // 3) fetch new URLs and skip already-processed
+                    let feeds = fetch::urls::fetch_current_zip_urls(&client).await?;
+                    let processed = history.load_event_names("processed")?;
+                    for url in feeds.values().flatten() {
+                        let name = Path::new(url)
+                            .file_name()
+                            .unwrap()
+                            .to_string_lossy()
+                            .to_string();
+                        if !processed.contains(&name) {
+                            url_tx
+                                .send(url.clone())
+                                .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+                        }
+                    }
+
+                    Ok::<(), anyhow::Error>(())
+                }
+                .await
+                {
+                    error!("scheduler loop failed: {}", e);
+                }
+
+                ticker.tick().await;
+            }
+        });
+    }
+
+    // ─── 9) single-threaded processor ─────────────────────────────────
     while let Some(msg) = rx.recv().await {
         match msg {
             Ok(zip_path) => {
                 let name = zip_path.file_name().unwrap().to_string_lossy().to_string();
                 info!("processing {}", name);
 
-                // offload the heavy split to the blocking pool
-                let split_result = tokio::task::spawn_blocking({
-                    let lookup = Arc::clone(&lookup);
-                    let out_parquet_dir = out_parquet_dir.clone();
-                    let zip_clone = zip_path.clone();
-                    move || {
-                        process::split::split_zip_to_parquet(&zip_clone, &out_parquet_dir, lookup)
-                    }
+                let lookup_map = lookup.lock().await.clone();
+                let temp_out = tmp_dir.clone();
+                let temp_out_split = temp_out.clone();
+                let final_out = parquet_dir.clone();
+                let history = history.clone();
+                let split_path = zip_path.clone();
+
+                // split in blocking thread
+                let split_res = task::spawn_blocking(move || {
+                    let arc = Arc::new(lookup_map);
+                    process::split::split_zip_to_parquet(&split_path.clone(), &temp_out_split, arc)
                 })
                 .await?;
 
-                if let Err(e) = split_result {
+                if let Err(e) = split_res {
                     error!("split {} failed: {}", name, e);
-                    // record failure
-                    let failed_marker = failed_zips_dir.join(&name);
-                    fs::File::create(&failed_marker)?;
+                    let _ = fs::rename(&zip_path, failed_dir.join(&name));
                     continue;
                 }
 
-                // write history record
-                record_processed(&history_dir, &name)?;
-                info!("wrote history for {}", name);
-
-                // NOTE: we no longer delete the ZIP here, so you can inspect
-            }
-
-            Err((url, err)) => {
-                error!("{} download error: {}", url, err);
-                // optionally record download failures too:
-                if let Some(name) = Path::new(&url)
-                    .file_name()
-                    .map(|s| s.to_string_lossy().to_string())
-                {
-                    let failed_marker = failed_zips_dir.join(&name);
-                    fs::File::create(&failed_marker)?;
+                // move .parquet files
+                if let Err(e) = (|| -> Result<()> {
+                    for entry in fs::read_dir(&temp_out)? {
+                        let entry = entry?;
+                        let path = entry.path();
+                        fs::rename(&path, final_out.join(path.file_name().unwrap()))?;
+                    }
+                    Ok(())
+                })() {
+                    error!("moving parquet for {} failed: {}", name, e);
                 }
+
+                // record processed event
+                if let Err(e) = history.record_event(&name, "processed") {
+                    error!("record_event processed failed: {}", e);
+                }
+            }
+            Err((url, _)) => {
+                error!("upstream download error for URL {}", url);
             }
         }
     }
 
-    // ─── 8) await all downloader tasks ───────────────────────────────
-    for h in dl_handles {
-        let _ = h.await;
-    }
-
-    // ─── 9) report total ZIP disk usage ─────────────────────────────
-    let total_size: u64 = fs::read_dir(&zips_dir)?
-        .filter_map(|entry| entry.ok())
-        .filter_map(|entry| entry.metadata().ok())
-        .map(|meta| meta.len())
-        .sum();
-    info!("total size of remaining ZIPs: {} bytes", total_size);
-
-    info!("all done");
     Ok(())
 }

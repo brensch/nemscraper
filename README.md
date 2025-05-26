@@ -11,7 +11,7 @@ docker run -d \
   -v "$(pwd)/grafana/dashboards:/etc/grafana/provisioned_dashboards" \
   -v "$(pwd)/grafana/provisioning/dashboards:/etc/grafana/provisioning/dashboards" \
   -v "$(pwd)/grafana/provisioning/datasources:/etc/grafana/provisioning/datasources" \
-  -v $(pwd)/parquet:/data/parquet \
+  -v $(pwd)/assets:/data/ \
   -e "GF_PLUGINS_ALLOW_LOADING_UNSIGNED_PLUGINS=motherduck-duckdb-datasource" \
   grafana/grafana:latest-ubuntu
 

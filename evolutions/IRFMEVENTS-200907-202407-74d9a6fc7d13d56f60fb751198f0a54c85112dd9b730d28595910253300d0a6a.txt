@@ -1,7 +1,0 @@
-IRFMEVENTS: [200907–202407] (6 columns, hash: 74d9a6fc7d13d56f60fb751198f0a54c85112dd9b730d28595910253300d0a6a)
-  - IRFMID: CHAR(10) (N/A)
-  - STARTDATE: DATE ("yyyy/mm/dd hh24:mi:ss")
-  - STARTPERIOD: FLOAT (EXTERNAL)
-  - ENDDATE: DATE ("yyyy/mm/dd hh24:mi:ss")
-  - ENDPERIOD: FLOAT (EXTERNAL)
-  - LASTCHANGED: DATE ("yyyy/mm/dd hh24:mi:ss")

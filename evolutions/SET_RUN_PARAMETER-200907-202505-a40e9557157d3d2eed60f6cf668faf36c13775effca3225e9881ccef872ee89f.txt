@@ -1,6 +1,0 @@
-SET_RUN_PARAMETER: [200907–202505] (5 columns, hash: a40e9557157d3d2eed60f6cf668faf36c13775effca3225e9881ccef872ee89f)
-  - SETTLEMENTDATE: DATE ("yyyy/mm/dd hh24:mi:ss")
-  - VERSIONNO: FLOAT (EXTERNAL)
-  - PARAMETERID: CHAR(20) (N/A)
-  - NUMVALUE: FLOAT (EXTERNAL)
-  - LASTCHANGED: DATE ("yyyy/mm/dd hh24:mi:ss")

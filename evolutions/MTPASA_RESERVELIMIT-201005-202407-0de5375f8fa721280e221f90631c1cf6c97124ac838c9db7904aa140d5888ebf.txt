@@ -1,7 +1,0 @@
-MTPASA_RESERVELIMIT: [201005–202407] (6 columns, hash: 0de5375f8fa721280e221f90631c1cf6c97124ac838c9db7904aa140d5888ebf)
-  - EFFECTIVEDATE: DATE ("yyyy/mm/dd hh24:mi:ss")
-  - VERSION_DATETIME: DATE ("yyyy/mm/dd hh24:mi:ss")
-  - RESERVELIMITID: CHAR(20) (N/A)
-  - DESCRIPTION: CHAR(200) (N/A)
-  - RHS: FLOAT (EXTERNAL)
-  - LASTCHANGED: DATE ("yyyy/mm/dd hh24:mi:ss")

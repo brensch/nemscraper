@@ -1,28 +1,30 @@
 // data/src/process/chunk.rs
-use arrow::array::{Array, ArrayRef, PrimitiveBuilder, StringArray, TimestampMicrosecondArray};
+
+use crate::schema::Column;
+use arrow::array::Array;
+use arrow::array::{ArrayRef, PrimitiveBuilder, StringArray, TimestampMicrosecondArray};
 use arrow::csv::ReaderBuilder;
 use arrow::datatypes::{DataType, Field, Schema as ArrowSchema, TimestampMicrosecondType};
 use arrow::record_batch::RecordBatch;
 use arrow_schema::TimeUnit;
-use chrono::{NaiveDate, NaiveDateTime};
+use chrono::TimeZone;
+use chrono::{FixedOffset, NaiveDate, NaiveDateTime};
 use parquet::arrow::ArrowWriter;
-use parquet::basic::Compression;
+use parquet::basic::{BrotliLevel, Compression};
 use parquet::file::properties::WriterProperties;
 use rayon::prelude::*;
 use std::{fs::File, path::Path, sync::Arc};
 use tracing::info;
 
-use crate::schema::Column;
-
 /// Split a single CSV segment into row-chunks and write each as its own Parquet file,
-/// converting CTL-style DATE columns ("yyyy/mm/dd hh24:mi:ss") into timestamps.
+/// converting CTL-style DATE columns ("yyyy/mm/dd hh24:mi:ss") (in UTC+10) into true UTC timestamps.
 pub fn chunk_and_write_segment(
     table_name: &str,
     schema_id: &str,
     header: &str,
     data: &str,
-    headers: Vec<Column>, // takes ownership of headers metadata
-    arrow_schema: Arc<ArrowSchema>,
+    headers: Vec<Column>,           // takes ownership of headers metadata
+    arrow_schema: Arc<ArrowSchema>, // schema of *data* columns only
     out_dir: &Path,
 ) {
     let chunk_size = 1_000_000;
@@ -46,13 +48,9 @@ pub fn chunk_and_write_segment(
         Arc::new(ArrowSchema::new(fields))
     };
 
-    // 2) Build write_schema: DATE columns as TimestampMicrosecond, matching converted arrays
+    // 2) Build write_schema for data columns only: DATE → Timestamp(Microsecond)
     let write_schema: Arc<ArrowSchema> = {
-        let mut fields = Vec::with_capacity(arrow_schema.fields().len() + 4);
-        fields.push(Field::new("rec_type", DataType::Utf8, false));
-        fields.push(Field::new("domain", DataType::Utf8, false));
-        fields.push(Field::new("measure", DataType::Utf8, false));
-        fields.push(Field::new("seq", DataType::Utf8, false));
+        let mut fields = Vec::with_capacity(arrow_schema.fields().len());
         for (i, f) in arrow_schema.fields().iter().enumerate() {
             if headers[i].ty.eq_ignore_ascii_case("DATE") {
                 fields.push(Field::new(
@@ -71,22 +69,28 @@ pub fn chunk_and_write_segment(
     let total_rows = data_lines.len();
     info!(table=%table_name, schema=%schema_id, rows=total_rows, "splitting into chunks");
 
+    let compression = Compression::BROTLI(BrotliLevel::try_new(5).unwrap());
     data_lines
         .par_chunks(chunk_size)
         .enumerate()
         .for_each(|(chunk_idx, _chunk)| {
-            // Setup CSV reader with read_schema
+            // Setup CSV reader with read_schema, projecting away first 4 metadata columns
             let cursor = std::io::Cursor::new(data.as_bytes());
+            let total_fields = read_schema.fields().len();
+            let projection: Vec<usize> = (4..total_fields).collect();
             let mut reader = ReaderBuilder::new(read_schema.clone())
                 .with_header(false)
+                .with_projection(projection)
                 .build(cursor)
                 .expect("CSV reader failed");
 
-            // Prepare Parquet writer with write_schema
+            // Prepare Parquet writer with *data-only* write_schema
             let out_path = out_dir.join(format!("{}—{}—chunk{}.parquet", table_name, schema_id, chunk_idx));
             let file = File::create(&out_path).expect("failed to create parquet file");
-            let props = WriterProperties::builder().set_compression(Compression::SNAPPY).build();
-            let mut writer = ArrowWriter::try_new(file, write_schema.clone(), Some(props))
+                let props = WriterProperties::builder()
+                    .set_compression(compression)
+                    .set_dictionary_enabled(true) // disable dictionary encoding for simplicity
+                    .build();            let mut writer = ArrowWriter::try_new(file, write_schema.clone(), Some(props))
                 .expect("failed to create parquet writer");
 
             // Process each RecordBatch
@@ -94,22 +98,28 @@ pub fn chunk_and_write_segment(
                 let converted = convert_date_columns(batch, &headers, &write_schema);
                 writer.write(&converted).unwrap();
             }
+
             writer.close().unwrap();
             info!(table=%table_name, schema=%schema_id, chunk=chunk_idx, "wrote {} rows", _chunk.len());
         });
 }
 
-/// Convert CTL DATE columns (utf8) to TimestampMicrosecondArray in the RecordBatch,
-/// parsing digits directly for performance, and log types for debugging.
+/// Convert CTL DATE columns (utf8, in UTC+10) to TimestampMicrosecondArray in the RecordBatch,
+/// parsing digits directly for performance.
 fn convert_date_columns(
     batch: RecordBatch,
     headers: &[Column],
-    write_schema: &Arc<ArrowSchema>,
+    write_schema: &Arc<ArrowSchema>, // now only data columns, in the same order as `headers`
 ) -> RecordBatch {
     let mut columns: Vec<ArrayRef> = batch.columns().to_vec();
+
+    // fixed +10h offset
+    let offset = FixedOffset::east(10 * 3600);
+
     for (i, col_meta) in headers.iter().enumerate() {
         if col_meta.ty.eq_ignore_ascii_case("DATE") {
-            let idx = 4 + i;
+            // data-only batch: DATE columns are at the same index as headers
+            let idx = i;
             let str_arr = columns[idx]
                 .as_any()
                 .downcast_ref::<StringArray>()
@@ -141,9 +151,12 @@ fn convert_date_columns(
                         date,
                         chrono::NaiveTime::from_hms_opt(hh, mm, ss).unwrap(),
                     );
-                    builder.append_value(dt.and_utc().timestamp_micros());
+                    // interpret `dt` in UTC+10, then get UTC microseconds
+                    let dt_utc = offset.from_local_datetime(&dt).unwrap().timestamp_micros();
+                    builder.append_value(dt_utc);
                 }
             }
+
             let ts_arr = TimestampMicrosecondArray::from(builder.finish());
             columns[idx] = Arc::new(ts_arr);
         }

@@ -29,7 +29,7 @@ fn main() -> Result<()> {
     info!("nemscraper_munge starting up");
 
     let input_dir = Path::new("./parquet");
-    let output_dir = Path::new("./munged2");
+    let output_dir = Path::new("./munged");
     fs::create_dir_all(output_dir)?;
     debug!(dir = %output_dir.display(), "Ensured output dir exists");
 

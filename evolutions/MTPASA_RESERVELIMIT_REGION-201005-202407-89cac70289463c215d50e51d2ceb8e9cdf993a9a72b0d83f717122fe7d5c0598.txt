@@ -1,7 +1,0 @@
-MTPASA_RESERVELIMIT_REGION: [201005–202407] (6 columns, hash: 89cac70289463c215d50e51d2ceb8e9cdf993a9a72b0d83f717122fe7d5c0598)
-  - EFFECTIVEDATE: DATE ("yyyy/mm/dd hh24:mi:ss")
-  - VERSION_DATETIME: DATE ("yyyy/mm/dd hh24:mi:ss")
-  - RESERVELIMITID: CHAR(20) (N/A)
-  - REGIONID: CHAR(20) (N/A)
-  - COEF: FLOAT (EXTERNAL)
-  - LASTCHANGED: DATE ("yyyy/mm/dd hh24:mi:ss")

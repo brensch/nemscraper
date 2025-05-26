@@ -1,5 +1,0 @@
-REGION: [200907–202407] (4 columns, hash: f9a3f14dfc2f052e3d14038b92257ea45514b50a91c4024d47c698dd3ca147b3)
-  - REGIONID: CHAR(10) (N/A)
-  - DESCRIPTION: CHAR(64) (N/A)
-  - REGIONSTATUS: CHAR(8) (N/A)
-  - LASTCHANGED: DATE ("yyyy/mm/dd hh24:mi:ss")

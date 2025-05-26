@@ -1,2 +1,0 @@
-MCC_CASESOLUTION: [201011–202407] (1 columns, hash: 44ad8e6f2fae3cf0271931e2a2677bd8d013963b62357644b70ebd1762472b9f)
-  - RUN_DATETIME: DATE ("yyyy/mm/dd hh24:mi:ss")

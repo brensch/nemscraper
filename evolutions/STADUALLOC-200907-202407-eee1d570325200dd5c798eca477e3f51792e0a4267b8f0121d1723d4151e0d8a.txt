@@ -1,6 +1,0 @@
-STADUALLOC: [200907–202407] (5 columns, hash: eee1d570325200dd5c798eca477e3f51792e0a4267b8f0121d1723d4151e0d8a)
-  - DUID: CHAR(10) (N/A)
-  - EFFECTIVEDATE: DATE ("yyyy/mm/dd hh24:mi:ss")
-  - STATIONID: CHAR(10) (N/A)
-  - VERSIONNO: FLOAT (EXTERNAL)
-  - LASTCHANGED: DATE ("yyyy/mm/dd hh24:mi:ss")

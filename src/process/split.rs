@@ -1,4 +1,5 @@
 // data/src/process/split.rs
+
 use crate::process::chunk::chunk_and_write_segment;
 use crate::schema::build_arrow_schema;
 use crate::schema::find_column_types;
@@ -19,11 +20,7 @@ use tracing::{error, info, instrument};
 use zip::ZipArchive;
 
 /// Splits each CSV file in the ZIP into chunks and writes Parquet files,
-/// using a pre-built lookup of column types per table.  For each segment:
-/// 1. Parse out the CSV header row into `Vec<String>`.
-/// 2. Call `find_column_types(.., &header_names)`, which will warn on missing
-///    columns (defaulting to utf8) but error only if the table is missing.
-/// 3. Always write the Parquet via `chunk_and_write_segment` using the resolved columns.
+/// using a pre-built lookup of column types per table.
 #[instrument(level = "info", skip(zip_path, out_dir, column_lookup), fields(zip = %zip_path.as_ref().display()))]
 pub fn split_zip_to_parquet<P: AsRef<Path>, Q: AsRef<Path>>(
     zip_path: P,
@@ -111,13 +108,13 @@ pub fn split_zip_to_parquet<P: AsRef<Path>, Q: AsRef<Path>>(
                     .next()
                     .ok_or_else(|| anyhow!("empty header for table `{}` on {}", table, date))?;
 
-
-                
+                // **skip first 4 metadata columns** rec_type/domain/measure/seq
                 let header_names: Vec<String> = header_line
                     .split(',')
                     .skip(4)
                     .map(String::from)
                     .collect();
+
                 // Resolve columns by name, warn on missing, error only if table missing
                 let cols = find_column_types(&column_lookup, &table, &header_names)
                     .inspect_err(|e| {

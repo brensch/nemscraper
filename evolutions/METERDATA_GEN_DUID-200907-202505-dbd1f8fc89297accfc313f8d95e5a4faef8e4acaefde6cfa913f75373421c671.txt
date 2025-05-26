@@ -1,5 +1,0 @@
-METERDATA_GEN_DUID: [200907–202505] (4 columns, hash: dbd1f8fc89297accfc313f8d95e5a4faef8e4acaefde6cfa913f75373421c671)
-  - INTERVAL_DATETIME: DATE ("yyyy/mm/dd hh24:mi:ss")
-  - DUID: CHAR(10) (N/A)
-  - MWH_READING: FLOAT (EXTERNAL)
-  - LASTCHANGED: DATE ("yyyy/mm/dd hh24:mi:ss")
