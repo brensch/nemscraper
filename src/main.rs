@@ -17,7 +17,7 @@ use std::{
 use tokio::{
     sync::{mpsc, Mutex},
     task,
-    time::{interval, Instant},
+    time::{interval, sleep, Instant},
 };
 use tracing::{error, info};
 use tracing_subscriber::{fmt, EnvFilter};
@@ -103,7 +103,28 @@ async fn main() -> Result<()> {
                     .to_string_lossy()
                     .to_string();
                 info!(name=%name, "downloading {}", url);
-                match fetch::zips::download_zip(&client, &url, &zips_dir).await {
+
+                // retry up to 3 times with 1s backoff
+                let path_result = async {
+                    let mut attempt = 0;
+                    loop {
+                        attempt += 1;
+                        match fetch::zips::download_zip(&client, &url, &zips_dir).await {
+                            Ok(path) => return Ok(path),
+                            Err(e) if attempt < 3 => {
+                                error!(
+                                    "attempt {}/3 for {} failed: {}, retrying...",
+                                    attempt, url, e
+                                );
+                                sleep(Duration::from_secs(1)).await;
+                            }
+                            Err(e) => return Err(e),
+                        }
+                    }
+                }
+                .await;
+
+                match path_result {
                     Ok(path) => {
                         if let Err(e) = history.record_event(&name, "downloaded") {
                             error!("history.record_event failed: {}", e);
@@ -111,14 +132,15 @@ async fn main() -> Result<()> {
                         let _ = tx.send(Ok(path));
                     }
                     Err(e) => {
-                        error!("download failed {}: {}", url, e);
+                        error!("download failed after retries {}: {}", url, e);
                         let _ = tx.send(Err((url.clone(), e.to_string())));
                     }
                 }
             }
         });
     }
-    // ─── scheduler: every 60s ──────────────────────────────────────
+
+    // ─── 8) scheduler: every 60s ──────────────────────────────────────
     {
         let lookup = lookup.clone();
         let url_tx = url_tx.clone();
@@ -127,18 +149,18 @@ async fn main() -> Result<()> {
         let schemas_dir = schemas_dir.clone();
         let zips_dir = zips_dir.clone();
         let failed_dir = failed_dir.clone();
+        let tx = tx.clone();
 
         task::spawn(async move {
             let mut ticker = interval(Duration::from_secs(60));
             loop {
-                // wrap the fallible work in an async block returning Result
                 if let Err(e) = async {
-                    // 1) refresh schemas
+                    // refresh schemas
                     schema::fetch_all(&client, &schemas_dir).await?;
                     let new_map = extract_column_types(&schemas_dir)?;
                     *lookup.lock().await = new_map;
 
-                    // 2) re-enqueue failed splits
+                    // re-enqueue failed splits
                     for entry in fs::read_dir(&failed_dir)? {
                         let path = entry?.path();
                         if path.extension() == Some(OsStr::new("zip")) {
@@ -151,7 +173,7 @@ async fn main() -> Result<()> {
                         }
                     }
 
-                    // 3) fetch new URLs and skip already-processed
+                    // fetch new URLs and skip already-processed
                     let feeds = fetch::urls::fetch_current_zip_urls(&client).await?;
                     let processed = history.load_event_names("processed")?;
                     for url in feeds.values().flatten() {
@@ -196,7 +218,7 @@ async fn main() -> Result<()> {
                 // split in blocking thread
                 let split_res = task::spawn_blocking(move || {
                     let arc = Arc::new(lookup_map);
-                    process::split::split_zip_to_parquet(&split_path.clone(), &temp_out_split, arc)
+                    process::split::split_zip_to_parquet(&split_path, &temp_out_split, arc)
                 })
                 .await?;
 
