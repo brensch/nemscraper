@@ -38,7 +38,6 @@ async fn main() -> Result<()> {
     let client = Client::new();
     let assets = PathBuf::from("assets");
     let schemas_dir = assets.join("schemas");
-    let temp_schemas_dir = assets.join("schemas_temp");
     let schema_proposals = assets.join("schema_proposals");
     let zips_dir = assets.join("zips");
     let parquet_dir = assets.join("parquet");
@@ -48,19 +47,22 @@ async fn main() -> Result<()> {
 
     for d in [
         &schemas_dir,
-        &temp_schemas_dir,
         &zips_dir,
         &parquet_dir,
         &tmp_dir,
         &history_dir,
         &failed_dir,
+        &schema_proposals,
     ] {
         fs::create_dir_all(d)?;
     }
 
     // ─── 3) history & lookup store ───────────────────────────────────
     let history = Arc::new(History::new(&history_dir)?);
-    let lookup = Arc::new(Mutex::new(HashMap::new()));
+    info!("initial schema fetch → {}", schemas_dir.display());
+    schema::fetch_all(&client, &schemas_dir).await?;
+    let dirs = vec![&schemas_dir, &schema_proposals];
+    let lookup = Arc::new(Mutex::new(extract_column_types(dirs)?));
 
     // ─── 4) channels ──────────────────────────────────────────────────
     let (processor_tx, mut processor_rx) =
@@ -152,7 +154,7 @@ async fn main() -> Result<()> {
         let history = history.clone();
         let client = client.clone();
         let schemas_dir = schemas_dir.clone();
-        let temp_schemas_dir = temp_schemas_dir.clone();
+        let schema_proposals = schema_proposals.clone();
         let zips_dir = zips_dir.clone();
         let failed_dir = failed_dir.clone();
         let processor_tx = processor_tx.clone();
@@ -167,7 +169,7 @@ async fn main() -> Result<()> {
                     // ─── a) refresh schemas ─────────────────────────
                     info!("fetch schemas → {}", schemas_dir.display());
                     schema::fetch_all(&client, &schemas_dir).await?;
-                    let dirs = vec![&schemas_dir, &temp_schemas_dir];
+                    let dirs = vec![&schemas_dir, &schema_proposals];
                     let new_map = extract_column_types(dirs)?;
                     *lookup.lock().await = new_map;
 

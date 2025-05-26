@@ -2,7 +2,7 @@
 //! and map header names to Column definitions without date logic.
 
 use anyhow::{anyhow, Context, Result};
-use chrono::{NaiveDate, NaiveDateTime};
+use chrono::NaiveDateTime;
 use serde_json;
 use std::{
     collections::{HashMap, HashSet},
@@ -107,37 +107,80 @@ pub fn find_column_types(
 
 /// Fallback schema derivation when no CTL info exists:
 /// for each column, look through up to the first 1 000 rows
-/// to grab an example non‐empty value; then infer a (ty, format).
-/// Defaults to utf8 if no example was ever found.
+/// to infer every non‐empty value’s type; if they’re all the same,
+/// use that (ty, format), otherwise default to utf8.
 pub fn derive_types(
     table_name: &str,
     header_names: &[String],
     rows: &[Vec<String>],
 ) -> Result<Vec<Column>> {
-    // 1) collect first non‐empty example for each column
-    let mut examples: Vec<Option<&str>> = vec![None; header_names.len()];
+    // 1) Prepare state: for each column we track
+    //    - the first seen type+format (Option<(ty, fmt)>)
+    //    - whether we've already spotted an inconsistency
+    let mut seen: Vec<Option<(String, Option<String>)>> = vec![None; header_names.len()];
+    let mut inconsistent: Vec<bool> = vec![false; header_names.len()];
+    let mut examples_scanned = vec![0usize; header_names.len()]; // count of samples per col
+
+    // 2) Walk rows
     for row in rows.iter().take(1_000) {
         for (i, cell) in row.iter().enumerate() {
-            if examples[i].is_none() && !cell.trim().is_empty() {
-                examples[i] = Some(cell.trim());
+            let v = cell.trim();
+            if v.is_empty() {
+                continue;
             }
+
+            // Skip if we've already marked inconsistent and seen > 1 sample
+            if inconsistent[i] {
+                // Still count up to 1 000 rows, but no further checks needed
+                examples_scanned[i] += 1;
+                continue;
+            }
+
+            // Infer this sample’s type
+            let inferred = infer_type_and_format(v);
+
+            match &seen[i] {
+                None => {
+                    // first non‐empty sample for this column
+                    seen[i] = Some(inferred.clone());
+                }
+                Some(prev) => {
+                    if *prev != inferred {
+                        // mismatch! mark inconsistent
+                        debug!(
+                            "derive_types: column `{}` in table `{}` has conflicting types: {:?} vs {:?}",
+                            header_names[i], table_name, prev, inferred
+                        );
+                        inconsistent[i] = true;
+                    }
+                }
+            }
+
+            examples_scanned[i] += 1;
         }
-        if examples.iter().all(Option::is_some) {
-            break;
-        }
+        // if every column has at least one sample *and* is either consistent or flagged,
+        // we could stop early; but here we scan the full 1 000 rows to be thorough
     }
 
-    // 2) infer (ty, format) per column
+    // 3) Build result columns
     let mut cols = Vec::with_capacity(header_names.len());
     for (i, name) in header_names.iter().enumerate() {
-        let (ty, format) = match examples[i] {
-            Some(sample) => infer_type_and_format(sample),
-            None => {
-                warn!(
-                    "derive_types: no example for `{}` on table `{}`, defaulting to utf8",
-                    name, table_name
-                );
-                ("utf8".into(), None)
+        let (ty, format) = if inconsistent[i] {
+            warn!(
+                "derive_types: inconsistent samples for `{}` on table `{}`, defaulting to utf8",
+                name, table_name
+            );
+            ("utf8".into(), None)
+        } else {
+            match &seen[i] {
+                Some((t, f)) => (t.clone(), f.clone()),
+                None => {
+                    warn!(
+                        "derive_types: no non-empty sample for `{}` on table `{}`, defaulting to utf8",
+                        name, table_name
+                    );
+                    ("utf8".into(), None)
+                }
             }
         };
 
@@ -150,6 +193,7 @@ pub fn derive_types(
 
     Ok(cols)
 }
+
 fn infer_type_and_format(raw: &str) -> (String, Option<String>) {
     // strip wrapping quotes
     let v = raw.trim().trim_matches('"');
@@ -172,4 +216,49 @@ fn infer_type_and_format(raw: &str) -> (String, Option<String>) {
     // 3) string ⇒ CHAR(length)
     let len = v.len();
     (format!("CHAR({})", len), None)
+}
+// In your lib.rs or extract.rs, keep only the test module below:
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use anyhow::Result;
+    use std::{
+        fs::File,
+        io::{self, Write},
+        path::Path,
+    };
+    use tempfile::tempdir;
+
+    /// Manual schema existence check:
+    /// Reads JSON schema files from a real directory and prompts for a table name.
+    #[test]
+    #[ignore]
+    fn manual_schema_check() -> Result<(), anyhow::Error> {
+        // Path to your real schema directory
+        let schema_dir = Path::new("./assets/schemas");
+        let schema_dir_temp = Path::new("./assets/schemas_temp");
+        assert!(schema_dir.is_dir(), "'schemas' directory not found");
+
+        // Build lookup from JSON files in that directory
+        let lookup = extract_column_types(vec![schema_dir, schema_dir_temp])?;
+        println!("Available tables: {:?}", lookup.keys());
+
+        let col_types = find_column_types(
+            &lookup,
+            "P5MIN_FCAS_REQ_CONSTRAINT",
+            &["BIDTYPE".to_string(), "REGIONAL_ENABLEMENT".to_string()],
+        )
+        .context("Failed to find column types ")?;
+
+        println!("Column types: {:?}", col_types);
+        // let name = "MCC_CONSTRAINTSOLUTION"; // Replace with the table you want to check
+        // assert!(
+        //     lookup.contains_key(name),
+        //     "Table '{}' not found in schemas",
+        //     name
+        // );
+        // println!("Table '{}' exists!", name);
+        Ok(())
+    }
 }
