@@ -11,11 +11,11 @@ use url::Url;
 
 // static CURRENT_FEED_URLS: &[&str] = &[
 //     "https://nemweb.com.au/Reports/Current/FPP/",
-//     "https://nemweb.com.au/Reports/Current/FPPDAILY/",
-//     "https://nemweb.com.au/Reports/Current/FPPRATES/",
-//     "https://nemweb.com.au/Reports/Current/FPPRUN/",
-//     "https://nemweb.com.au/Reports/Current/PD7Day/",
-//     "https://nemweb.com.au/Reports/Current/P5_Reports/",
+//     // "https://nemweb.com.au/Reports/Current/FPPDAILY/",
+//     // "https://nemweb.com.au/Reports/Current/FPPRATES/",
+//     // "https://nemweb.com.au/Reports/Current/FPPRUN/",
+//     // "https://nemweb.com.au/Reports/Current/PD7Day/",
+//     // "https://nemweb.com.au/Reports/Current/P5_Reports/",
 // ];
 
 static CURRENT_FEED_URLS: &[&str] = &[

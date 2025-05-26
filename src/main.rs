@@ -17,7 +17,7 @@ use tokio::{
     task,
     time::{interval, sleep},
 };
-use tracing::{error, info};
+use tracing::{debug, error, info};
 use tracing_subscriber::{fmt, EnvFilter};
 
 mod history;
@@ -84,9 +84,17 @@ async fn main() -> Result<()> {
                     .to_string();
 
                 // if the zip was already downloaded, skip
-                if history.get_one(&name, Event::Downloaded).is_ok() {
-                    info!(name=%name, "already downloaded, skipping {}", url);
-                    continue;
+                match history.get_one(&name, Event::Downloaded) {
+                    Ok(Some(path)) => {
+                        info!(name=%name, "found already downloaded in download loop {:?}, skipping {}", path, url);
+                        continue;
+                    }
+                    Ok(None) => {
+                        // not downloaded yet, fall through to download
+                    }
+                    Err(e) => {
+                        error!(name=%name, "history lookup failed, proceeding with download: {}", e);
+                    }
                 }
 
                 info!(name=%name, "downloading {}", url);
@@ -180,12 +188,24 @@ async fn main() -> Result<()> {
 
                     // ─── d) fetch new URLs and enqueue ────────────────
                     let feeds = fetch::urls::fetch_current_zip_urls(&client).await?;
+                    let already_downloaded = history
+                        .get_all(Event::Downloaded)
+                        .expect("couldn't get downloaded history");
+
+                    //
                     let unique_urls: HashSet<String> = feeds
                         .values()
                         .flat_map(|urls| urls.iter().cloned())
                         .collect();
 
                     for url in unique_urls {
+                        // check if the csv filename in the url is already downloaded
+                        let url_path = PathBuf::from(&url);
+                        let name = url_path.file_name().unwrap().to_string_lossy().to_string();
+                        if already_downloaded.contains(&name) {
+                            debug!(url=%url, "already downloaded, skipping");
+                            continue;
+                        }
                         // sending to url_tx triggers download workers to download
                         url_tx
                             .send(url.clone())
@@ -211,9 +231,17 @@ async fn main() -> Result<()> {
                 let name = zip_path.file_name().unwrap().to_string_lossy().to_string();
 
                 // if the zip was already processed, skip
-                if history.get_one(&name, Event::Processed).is_ok() {
-                    info!(name=%name, "already processed, skipping");
-                    continue;
+                match history.get_one(&name, Event::Processed) {
+                    Ok(Some(path)) => {
+                        debug!(name=%name, "already processed at {:?}, skipping {}", path, &name);
+                        continue;
+                    }
+                    Ok(None) => {
+                        // not downloaded yet, fall through to download
+                    }
+                    Err(e) => {
+                        error!(name=%name, "history lookup failed, proceeding with processing: {}", e);
+                    }
                 }
                 info!("processing {}", name);
 

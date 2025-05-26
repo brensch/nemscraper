@@ -4,6 +4,7 @@ use duckdb::{params, Connection};
 use glob::glob;
 
 use std::{
+    collections::HashSet,
     fmt, fs,
     path::PathBuf,
     sync::{Arc, Mutex},
@@ -57,7 +58,7 @@ impl History {
             CREATE TABLE IF NOT EXISTS history (
               zip_name    VARCHAR,
               event       VARCHAR,
-              event_time  BIGINT,
+              event_time  TIMESTAMP,
               file_name   VARCHAR
             )
             "#,
@@ -81,7 +82,7 @@ impl History {
                 INSERT INTO history
                 SELECT zip_name::VARCHAR,
                        event::VARCHAR,
-                       event_time::BIGINT,
+                       event_time::TIMESTAMP,
                        filename::VARCHAR AS file_name
                 FROM read_parquet('{pattern}', filename=true)
                 "#,
@@ -100,7 +101,10 @@ impl History {
         let db = self.conn.lock().unwrap();
 
         // Timestamp and filenames
-        let ts = Utc::now().timestamp_micros();
+        // Use a chrono DateTime and its ISO8601 representation for DuckDB
+        let now = Utc::now();
+        let ts = now.timestamp_micros(); // still use for filename
+        let ts_iso = now.to_rfc3339_opts(chrono::SecondsFormat::Micros, true);
         let fname = format!("{}---{}---{}.parquet", zip_name, event.as_str(), ts);
         let final_path = self.history_dir.join(&fname);
         let tmp_path = final_path.with_extension("parquet.tmp");
@@ -111,7 +115,7 @@ impl History {
         // 1) Insert into the in-memory history table
         db.execute(
             "INSERT INTO history (zip_name, event, event_time, file_name) VALUES (?, ?, ?, ?)",
-            params![zip_name, event.as_str(), ts, &fname],
+            params![zip_name, event.as_str(), ts_iso, &fname],
         )
         .context("inserting new history row into DuckDB")?;
 
@@ -161,6 +165,28 @@ impl History {
         } else {
             Ok(None)
         }
+    }
+
+    /// Return all csv files for a given `event`.
+    pub fn get_all(&self, event: Event) -> Result<HashSet<String>> {
+        let db = self.conn.lock().unwrap();
+        let mut stmt = db
+            .prepare(
+                "SELECT zip_name
+                 FROM history
+                 WHERE event = ?
+                 ORDER BY event_time DESC",
+            )
+            .context("preparing get_all query")?;
+        let rows = stmt
+            .query_map(params![event.as_str()], |row| row.get::<_, String>(0))
+            .context("executing get_all query")?;
+
+        let mut set = HashSet::new();
+        for row in rows {
+            set.insert(row.context("reading zip_name from row")?);
+        }
+        Ok(set)
     }
 }
 
