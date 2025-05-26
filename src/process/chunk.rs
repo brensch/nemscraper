@@ -1,6 +1,7 @@
 // data/src/process/chunk.rs
 
 use crate::schema::Column;
+use anyhow::{anyhow, Context, Result};
 use arrow::array::Array;
 use arrow::array::{ArrayRef, PrimitiveBuilder, StringArray, TimestampMicrosecondArray};
 use arrow::csv::ReaderBuilder;
@@ -8,7 +9,7 @@ use arrow::datatypes::{DataType, Field, Schema as ArrowSchema, TimestampMicrosec
 use arrow::record_batch::RecordBatch;
 use arrow_schema::TimeUnit;
 use chrono::TimeZone;
-use chrono::{FixedOffset, NaiveDate, NaiveDateTime};
+use chrono::{FixedOffset, NaiveDate, NaiveDateTime, NaiveTime};
 use parquet::arrow::ArrowWriter;
 use parquet::basic::{BrotliLevel, Compression};
 use parquet::file::properties::WriterProperties;
@@ -95,7 +96,7 @@ pub fn chunk_and_write_segment(
 
             // Process each RecordBatch
             while let Some(batch) = reader.next().transpose().unwrap() {
-                let converted = convert_date_columns(batch, &headers, &write_schema);
+                let converted = convert_date_columns(batch, &headers, &write_schema).unwrap();
                 writer.write(&converted).unwrap();
             }
 
@@ -107,55 +108,97 @@ pub fn chunk_and_write_segment(
 
 /// Convert CTL DATE columns (utf8, in UTC+10) to TimestampMicrosecondArray in the RecordBatch,
 /// parsing digits directly for performance.
+
 fn convert_date_columns(
     batch: RecordBatch,
     headers: &[Column],
-    write_schema: &Arc<ArrowSchema>, // now only data columns, in the same order as `headers`
-) -> RecordBatch {
+    write_schema: &Arc<ArrowSchema>,
+) -> Result<RecordBatch> {
     let mut columns: Vec<ArrayRef> = batch.columns().to_vec();
 
     // fixed +10h offset
-    let offset = FixedOffset::east_opt(10 * 3600).expect("Invalid offset");
+    let offset =
+        FixedOffset::east_opt(10 * 3600).ok_or_else(|| anyhow!("invalid fixed offset +10h"))?;
 
     for (i, col_meta) in headers.iter().enumerate() {
         if col_meta.ty.eq_ignore_ascii_case("DATE") {
-            // data-only batch: DATE columns are at the same index as headers
             let idx = i;
             let str_arr = columns[idx]
                 .as_any()
                 .downcast_ref::<StringArray>()
-                .expect("DATE column not StringArray");
+                .ok_or_else(|| {
+                    anyhow!(
+                        "column {} was expected to be StringArray for DATE, got {:?}",
+                        idx,
+                        columns[idx].data_type()
+                    )
+                })?;
 
             let mut builder =
                 PrimitiveBuilder::<TimestampMicrosecondType>::with_capacity(str_arr.len());
+
             for row in 0..str_arr.len() {
                 if str_arr.is_null(row) {
                     builder.append_null();
-                } else {
-                    let s = str_arr.value(row);
-                    let b = s.as_bytes();
-                    // handle possible surrounding quotes
-                    let start = if b.first() == Some(&b'"') { 1 } else { 0 };
-                    // parse YYYY/MM/DD HH:MM:SS
-                    let y = (b[start + 0] - b'0') as i32 * 1000
-                        + (b[start + 1] - b'0') as i32 * 100
-                        + (b[start + 2] - b'0') as i32 * 10
-                        + (b[start + 3] - b'0') as i32;
-                    let m = ((b[start + 5] - b'0') as u32) * 10 + (b[start + 6] - b'0') as u32;
-                    let d = ((b[start + 8] - b'0') as u32) * 10 + (b[start + 9] - b'0') as u32;
-                    let hh = ((b[start + 11] - b'0') as u32) * 10 + (b[start + 12] - b'0') as u32;
-                    let mm = ((b[start + 14] - b'0') as u32) * 10 + (b[start + 15] - b'0') as u32;
-                    let ss = ((b[start + 17] - b'0') as u32) * 10 + (b[start + 18] - b'0') as u32;
-
-                    let date = NaiveDate::from_ymd_opt(y, m, d).unwrap();
-                    let dt = NaiveDateTime::new(
-                        date,
-                        chrono::NaiveTime::from_hms_opt(hh, mm, ss).unwrap(),
-                    );
-                    // interpret `dt` in UTC+10, then get UTC microseconds
-                    let dt_utc = offset.from_local_datetime(&dt).unwrap().timestamp_micros();
-                    builder.append_value(dt_utc);
+                    continue;
                 }
+
+                let s = str_arr.value(row);
+                let b = s.as_bytes();
+                // allow optional surrounding quotes
+                let start = if b.first() == Some(&b'"') { 1 } else { 0 };
+                // need at least "YYYY/MM/DD HH:MM:SS"
+                if b.len() < start + 19 {
+                    return Err(anyhow!("date too short at row {}: {:?}", row, s));
+                }
+
+                // fast digit-to-int parsing
+                let y = (b[start] - b'0') as i32 * 1000
+                    + (b[start + 1] - b'0') as i32 * 100
+                    + (b[start + 2] - b'0') as i32 * 10
+                    + (b[start + 3] - b'0') as i32;
+                let m = ((b[start + 5] - b'0') as u32) * 10 + (b[start + 6] - b'0') as u32;
+                let d = ((b[start + 8] - b'0') as u32) * 10 + (b[start + 9] - b'0') as u32;
+                let hh = ((b[start + 11] - b'0') as u32) * 10 + (b[start + 12] - b'0') as u32;
+                let mm = ((b[start + 14] - b'0') as u32) * 10 + (b[start + 15] - b'0') as u32;
+                let ss = ((b[start + 17] - b'0') as u32) * 10 + (b[start + 18] - b'0') as u32;
+
+                // parse optional fractional seconds into microseconds
+                let mut micros = 0u32;
+                if b.len() > start + 19 && b[start + 19] == b'.' {
+                    // up to 6 digits of fraction
+                    let mut factor = 100_000;
+                    let mut pos = start + 20;
+                    while pos < b.len() && b[pos].is_ascii_digit() && factor > 0 {
+                        micros += (b[pos] - b'0') as u32 * factor;
+                        factor /= 10;
+                        pos += 1;
+                    }
+                }
+
+                // safe constructors that return Option
+                let date = NaiveDate::from_ymd_opt(y, m, d)
+                    .ok_or_else(|| anyhow!("invalid date {}/{}/{} at row {}", y, m, d, row))?;
+                let time = NaiveTime::from_hms_micro_opt(hh, mm, ss, micros).ok_or_else(|| {
+                    anyhow!(
+                        "invalid time {:02}:{:02}:{:02}.{:06} at row {}",
+                        hh,
+                        mm,
+                        ss,
+                        micros,
+                        row
+                    )
+                })?;
+                let dt = NaiveDateTime::new(date, time);
+
+                // apply offset and get UTC microseconds
+                let dt_utc = offset
+                    .from_local_datetime(&dt)
+                    .earliest()
+                    .ok_or_else(|| anyhow!("ambiguous or invalid local datetime at row {}", row))?
+                    .timestamp_micros();
+
+                builder.append_value(dt_utc);
             }
 
             let ts_arr = TimestampMicrosecondArray::from(builder.finish());
@@ -163,5 +206,5 @@ fn convert_date_columns(
         }
     }
 
-    RecordBatch::try_new(write_schema.clone(), columns).expect("failed to build converted batch")
+    RecordBatch::try_new(write_schema.clone(), columns).context("building converted RecordBatch")
 }
