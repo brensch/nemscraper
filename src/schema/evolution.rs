@@ -12,35 +12,42 @@ use tracing::{debug, warn};
 
 use super::types::{Column, MonthSchema};
 
-/// Read all `<YYYYMM>.json` in `input_dir` and produce a lookup of column types per table.
-/// Returns a map from table name -> (column name -> set of types encountered).
-pub fn extract_column_types<P: AsRef<Path>>(
-    input_dir: P,
-) -> Result<HashMap<String, HashMap<String, HashSet<String>>>> {
-    let input = input_dir.as_ref();
+/// Read **all** `.json` files in any of the `input_dirs`, parse out their
+/// `month` plus `schemas`, and build a map of (table → column → seen types).
+pub fn extract_column_types<P, I>(
+    input_dirs: I,
+) -> Result<HashMap<String, HashMap<String, HashSet<String>>>>
+where
+    P: AsRef<Path>,
+    I: IntoIterator<Item = P>,
+{
     let mut column_types: HashMap<String, HashMap<String, HashSet<String>>> = HashMap::new();
+    let mut json_files = Vec::new();
 
-    // Gather all month files
-    let month_files: Vec<_> = fs::read_dir(input)
-        .with_context(|| format!("reading {:?}", input))?
-        .filter_map(|e| e.ok())
-        .map(|e| e.path())
-        .filter(|p| {
-            p.is_file()
-                && p.extension().and_then(|s| s.to_str()) == Some("json")
-                && p.file_stem()
+    // 1) Gather every `.json` file from each provided directory
+    for input_dir in input_dirs {
+        let dir = input_dir.as_ref();
+        for entry in fs::read_dir(dir).with_context(|| format!("reading directory {:?}", dir))? {
+            let path = entry?.path();
+            if path.is_file()
+                && path
+                    .extension()
                     .and_then(|s| s.to_str())
-                    .map_or(false, |stem| {
-                        stem.len() == 6 && stem.chars().all(|c| c.is_ascii_digit())
-                    })
-        })
-        .collect();
+                    .map_or(false, |ext| ext.eq_ignore_ascii_case("json"))
+            {
+                json_files.push(path);
+            }
+        }
+    }
 
-    for file in month_files {
-        let data: MonthSchema = {
-            let text = fs::read_to_string(&file).with_context(|| format!("read {:?}", file))?;
-            serde_json::from_str(&text).with_context(|| format!("parse {:?}", file))?
-        };
+    // 2) Parse each file and merge its column‐type info
+    for file in json_files {
+        // read + parse
+        let text = fs::read_to_string(&file).with_context(|| format!("reading {:?}", file))?;
+        let data: MonthSchema =
+            serde_json::from_str(&text).with_context(|| format!("parsing {:?}", file))?;
+
+        // merge schemas
         for cs in data.schemas {
             let table_entry = column_types.entry(cs.table.clone()).or_default();
             for col in cs.columns {
@@ -54,7 +61,6 @@ pub fn extract_column_types<P: AsRef<Path>>(
 
     Ok(column_types)
 }
-
 /// Given a lookup from `extract_column_types`, a table name, and header names,
 /// return a Vec<Column> matching each header to its type.
 /// - If a header name is not found, defaults to `utf8`, logs a warning, but still includes it.

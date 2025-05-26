@@ -38,6 +38,7 @@ async fn main() -> Result<()> {
     let client = Client::new();
     let assets = PathBuf::from("assets");
     let schemas_dir = assets.join("schemas");
+    let temp_schemas_dir = assets.join("schemas_temp");
     let zips_dir = assets.join("zips");
     let parquet_dir = assets.join("parquet");
     let tmp_dir = assets.join("parquet_tmp");
@@ -46,6 +47,7 @@ async fn main() -> Result<()> {
 
     for d in [
         &schemas_dir,
+        &temp_schemas_dir,
         &zips_dir,
         &parquet_dir,
         &tmp_dir,
@@ -134,6 +136,7 @@ async fn main() -> Result<()> {
         let history = history.clone();
         let client = client.clone();
         let schemas_dir = schemas_dir.clone();
+        let temp_schemas_dir = temp_schemas_dir.clone();
         let zips_dir = zips_dir.clone();
         let failed_dir = failed_dir.clone();
         let processor_tx = processor_tx.clone();
@@ -148,7 +151,8 @@ async fn main() -> Result<()> {
                     // ─── a) refresh schemas ─────────────────────────
                     info!("fetch schemas → {}", schemas_dir.display());
                     schema::fetch_all(&client, &schemas_dir).await?;
-                    let new_map = extract_column_types(&schemas_dir)?;
+                    let dirs = vec![&schemas_dir, &temp_schemas_dir];
+                    let new_map = extract_column_types(dirs)?;
                     *lookup.lock().await = new_map;
 
                     // ─── b) re-enqueue failed zips ───────────────────
