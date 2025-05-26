@@ -82,6 +82,13 @@ async fn main() -> Result<()> {
                     .unwrap()
                     .to_string_lossy()
                     .to_string();
+
+                // if the zip was already downloaded, skip
+                if history.get_one(&name, Event::Downloaded).is_ok() {
+                    info!(name=%name, "already downloaded, skipping {}", url);
+                    continue;
+                }
+
                 info!(name=%name, "downloading {}", url);
 
                 // retry up to 3 times with 2s backoff
@@ -96,7 +103,7 @@ async fn main() -> Result<()> {
                                     "attempt {}/3 for {} failed: {}, retrying...",
                                     attempt, url, e
                                 );
-                                sleep(Duration::from_secs(2)).await;
+                                sleep(Duration::from_secs(1 * attempt)).await;
                             }
                             Err(e) => return Err(e),
                         }
@@ -173,21 +180,12 @@ async fn main() -> Result<()> {
 
                     // ─── d) fetch new URLs and enqueue ────────────────
                     let feeds = fetch::urls::fetch_current_zip_urls(&client).await?;
-                    let downloaded = history.load_event_names(Event::Downloaded)?;
                     let unique_urls: HashSet<String> = feeds
                         .values()
                         .flat_map(|urls| urls.iter().cloned())
                         .collect();
 
                     for url in unique_urls {
-                        let name = Path::new(&url)
-                            .file_name()
-                            .unwrap()
-                            .to_string_lossy()
-                            .into_owned();
-                        if downloaded.contains(&name) {
-                            continue;
-                        }
                         // sending to url_tx triggers download workers to download
                         url_tx
                             .send(url.clone())
@@ -211,6 +209,12 @@ async fn main() -> Result<()> {
         match msg {
             Ok(zip_path) => {
                 let name = zip_path.file_name().unwrap().to_string_lossy().to_string();
+
+                // if the zip was already processed, skip
+                if history.get_one(&name, Event::Processed).is_ok() {
+                    info!(name=%name, "already processed, skipping");
+                    continue;
+                }
                 info!("processing {}", name);
 
                 let lookup_map = lookup.lock().await.clone();

@@ -1,18 +1,12 @@
 use anyhow::{Context, Result};
-use arrow::array::{StringArray, TimestampMicrosecondArray};
-use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
-use arrow::record_batch::RecordBatch;
 use chrono::Utc;
+use duckdb::{params, Connection};
 use glob::glob;
-use parquet::arrow::ArrowWriter;
-use parquet::basic::Compression;
-use parquet::file::properties::WriterProperties;
+
 use std::{
-    collections::HashSet,
     fmt, fs,
-    fs::File,
-    path::{Path, PathBuf},
-    sync::Arc,
+    path::PathBuf,
+    sync::{Arc, Mutex},
 };
 
 /// Events that can be recorded in history.
@@ -40,155 +34,259 @@ impl fmt::Display for Event {
     }
 }
 
-/// A simple history manager backed by Parquet files.
+/// A history manager backed by an in-memory DuckDB instance *and* Parquet files.
 pub struct History {
     history_dir: PathBuf,
+    conn: Arc<Mutex<Connection>>,
 }
 
 impl History {
-    /// Construct a new History store at `history_dir`, creating the directory if needed.
+    /// Construct a new History store at `history_dir`, creating the directory if needed,
+    /// and loading any existing `.parquet` history files into the in-memory DB.
     pub fn new(history_dir: impl Into<PathBuf>) -> Result<Self> {
         let history_dir = history_dir.into();
-        fs::create_dir_all(&history_dir)
-            .with_context(|| format!("creating history directory {:?}", &history_dir))?;
-        Ok(Self { history_dir })
+        fs::create_dir_all(&history_dir)?;
+
+        let conn = Arc::new(Mutex::new(Connection::open_in_memory()?));
+        {
+            let db = conn.lock().unwrap();
+
+            // 1) Create the in-memory table
+            db.execute(
+                r#"
+            CREATE TABLE IF NOT EXISTS history (
+              zip_name    VARCHAR,
+              event       VARCHAR,
+              event_time  BIGINT,
+              file_name   VARCHAR
+            )
+            "#,
+                params![],
+            )?;
+
+            // 2) Only if there are any .parquet files, bulk-load them
+            let glob_pattern = format!("{}/{}.parquet", history_dir.display(), "*");
+            let mut any = false;
+            for entry in glob(&glob_pattern)? {
+                if entry.is_ok() {
+                    any = true;
+                    break;
+                }
+            }
+
+            if any {
+                let safe_pattern = glob_pattern.replace('\'', "''");
+                let load_sql = format!(
+                    r#"
+                INSERT INTO history
+                SELECT zip_name::VARCHAR,
+                       event::VARCHAR,
+                       event_time::BIGINT,
+                       filename::VARCHAR AS file_name
+                FROM read_parquet('{pattern}', filename=true)
+                "#,
+                    pattern = safe_pattern
+                );
+                db.execute(&load_sql, params![])?;
+            }
+        }
+
+        Ok(History { history_dir, conn })
     }
 
-    /// Record an event for `zip_name`.
-    /// Writes a single-row Parquet file named `<zip>_<event>_<ts>.parquet`.
+    /// Record an event for `zip_name` in one DB transaction and parquet write.
     pub fn record_event(&self, zip_name: &str, event: Event) -> Result<()> {
-        // Timestamp in microseconds
+        // Grab the lock so nobody else races us on the DB or the FS.
+        let db = self.conn.lock().unwrap();
+
+        // Timestamp and filenames
         let ts = Utc::now().timestamp_micros();
-        let filename = format!("{}---{}---{}.parquet", zip_name, event.as_str(), ts);
-        let path = self.history_dir.join(filename);
+        let fname = format!("{}---{}---{}.parquet", zip_name, event.as_str(), ts);
+        let final_path = self.history_dir.join(&fname);
+        let tmp_path = final_path.with_extension("parquet.tmp");
 
-        // Define schema: zip_name, event, event_time
-        let schema = Schema::new(vec![
-            Field::new("zip_name", DataType::Utf8, false),
-            Field::new("event", DataType::Utf8, false),
-            Field::new(
-                "event_time",
-                DataType::Timestamp(TimeUnit::Microsecond, None),
-                false,
-            ),
-        ]);
+        // Begin a single transaction
+        db.execute("BEGIN", params![])?;
 
-        // Build Arrow arrays
-        let arr_zip =
-            Arc::new(StringArray::from(vec![zip_name.to_string()])) as Arc<dyn arrow::array::Array>;
-        let arr_event = Arc::new(StringArray::from(vec![event.as_str().to_string()]))
-            as Arc<dyn arrow::array::Array>;
-        let arr_time = Arc::new(TimestampMicrosecondArray::from_iter_values(vec![ts]))
-            as Arc<dyn arrow::array::Array>;
+        // 1) Insert into the in-memory history table
+        db.execute(
+            "INSERT INTO history (zip_name, event, event_time, file_name) VALUES (?, ?, ?, ?)",
+            params![zip_name, event.as_str(), ts, &fname],
+        )
+        .context("inserting new history row into DuckDB")?;
 
-        let batch =
-            RecordBatch::try_new(Arc::new(schema.clone()), vec![arr_zip, arr_event, arr_time])
-                .context("building history record batch")?;
-        let file =
-            File::create(&path).with_context(|| format!("creating history file {:?}", &path))?;
-        let props = WriterProperties::builder()
-            .set_compression(Compression::SNAPPY)
-            .build();
-        let mut writer = ArrowWriter::try_new(file, Arc::new(schema), Some(props))
-            .context("creating Arrow writer for history")?;
-        writer.write(&batch).context("writing history batch")?;
-        writer.close().context("closing history writer")?;
+        // 2) Emit exactly that row out to Parquet via DuckDB’s COPY command
+        //
+        //    COPY (SELECT zip_name, event, event_time
+        //          FROM history
+        //          WHERE file_name = '<fname>')
+        //    TO '<tmp_path>' (FORMAT PARQUET, COMPRESSION SNAPPY)
+        //
+        let copy_sql = format!(
+            "COPY (SELECT zip_name, event, event_time \
+                  FROM history WHERE file_name = '{fname}') \
+             TO '{path}' (FORMAT PARQUET, COMPRESSION SNAPPY)",
+            fname = fname.replace('\'', "''"),
+            path = tmp_path.to_string_lossy().replace('\'', "''"),
+        );
+        db.execute(&copy_sql, params![])
+            .context("writing parquet via DuckDB COPY")?;
+
+        // Commit the DB side
+        db.execute("COMMIT", params![])?;
+
+        // 3) Finally, atomically rename the .tmp → .parquet
+        fs::rename(&tmp_path, &final_path)
+            .with_context(|| format!("renaming {:?} to {:?}", tmp_path, final_path))?;
+
         Ok(())
     }
 
-    /// Load all distinct `zip_name`s for the given `event` by scanning filenames.
-    pub fn load_event_names(&self, event: Event) -> Result<HashSet<String>> {
-        let mut set = HashSet::new();
-        let pattern = format!(
-            "{}/**/*---{}---*.parquet",
-            self.history_dir.display(),
-            event.as_str()
-        );
-        for entry in glob(&pattern)? {
-            if let Ok(path) = entry {
-                if let Some(fname) = path.file_stem().and_then(|s| s.to_str()) {
-                    // fname = "<zip>_<event>_<ts>"
-                    if let Some(idx) = fname.rfind(&format!("---{}---", event.as_str())) {
-                        let zip = &fname[..idx];
-                        set.insert(zip.to_string());
-                    }
-                }
-            }
+    /// Get the latest history file path for a given `zip_name` and `event`.
+    pub fn get_one(&self, zip_name: &str, event: Event) -> Result<Option<PathBuf>> {
+        let db = self.conn.lock().unwrap();
+        let mut stmt = db
+            .prepare(
+                "SELECT file_name FROM history
+                 WHERE zip_name = ? AND event = ?
+                 ORDER BY event_time DESC LIMIT 1",
+            )
+            .context("preparing get_latest_event_file query")?;
+        let mut rows = stmt
+            .query_map(params![&zip_name, &event.as_str()], |row| row.get(0))
+            .context("executing get_latest_event_file query")?;
+        if let Some(res) = rows.next() {
+            let fname: String = res.context("reading file_name from row")?;
+            Ok(Some(self.history_dir.join(fname)))
+        } else {
+            Ok(None)
         }
-        Ok(set)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::HashSet;
-    use std::fs;
-    use std::thread::sleep;
-    use std::time::Duration;
+    use std::{
+        fs,
+        thread::sleep,
+        time::{Duration, Instant},
+    };
     use tempfile::TempDir;
 
     #[test]
-    fn record_event_and_load_event_names() -> Result<()> {
-        // 1) Create a temporary directory for history
-        let tmp = TempDir::new().expect("failed to create temp dir");
-        let history_dir = tmp.path().join("history_store");
+    fn record_and_get_one() -> Result<()> {
+        // — setup a clean history directory —
+        let tmp = TempDir::new().unwrap();
+        let hist_dir = tmp.path().join("history_store");
+        let history = History::new(&hist_dir)?;
 
-        // 2) Construct the History; should create the directory
-        let history = History::new(&history_dir)?;
-        assert!(history_dir.exists() && history_dir.is_dir());
-
-        // 3) Record two events for two different zip_names
+        // — record three events: zip1, zip2, then zip1 again —
         let zip1 = "archive1.zip";
         let zip2 = "archive2.zip";
-        let event = Event::Processed;
-
-        history.record_event(zip1, event)?;
-        // Sleep a tiny bit so timestamps differ
+        history.record_event(zip1, Event::Processed)?;
         sleep(Duration::from_millis(1));
-        history.record_event(zip2, event)?;
+        history.record_event(zip2, Event::Processed)?;
+        sleep(Duration::from_millis(1));
+        history.record_event(zip1, Event::Processed)?;
 
-        // 4) Ensure that parquet files actually exist on disk
-        let entries: Vec<_> = fs::read_dir(&history_dir)?
-            .map(|e| e.expect("read_dir error").path())
+        // the directory should now contain exactly 3 Parquet files
+        let files: Vec<_> = fs::read_dir(&hist_dir)?
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name())
             .collect();
-        assert_eq!(entries.len(), 2, "should have written 2 parquet files");
+        assert_eq!(files.len(), 3, "expected 3 parquet files, got {:?}", files);
 
-        // 5) Load back the set of zip names for our event
-        let names = history.load_event_names(event)?;
-        let mut expected = HashSet::new();
-        expected.insert(zip1.to_string());
-        expected.insert(zip2.to_string());
+        // — latest for zip1 —
+        let latest1 = history
+            .get_one(zip1, Event::Processed)?
+            .expect("zip1 should have a latest file");
+        let fname1 = latest1.file_name().unwrap().to_str().unwrap();
+        assert!(fname1.starts_with("archive1.zip---processed---"));
 
-        assert_eq!(names, expected);
+        // — only file for zip2 —
+        let latest2 = history
+            .get_one(zip2, Event::Processed)?
+            .expect("zip2 should have a file");
+        let fname2 = latest2.file_name().unwrap().to_str().unwrap();
+        assert!(fname2.starts_with("archive2.zip---processed---"));
+
+        // — unknown zip returns None —
+        assert!(history.get_one("no_such.zip", Event::Downloaded)?.is_none());
+
         Ok(())
     }
 
     #[test]
-    fn load_event_names_from_existing_directory() -> Result<()> {
-        // specify an actual directory for history relative to current path
-        let history_dir = PathBuf::from("./assets/history");
-
-        // Create dummy files matching and not matching the pattern
-        let files = vec![
-            format!("zipA_{}_123.parquet", Event::Downloaded.as_str()),
-            format!("zipB_{}_456.parquet", Event::Downloaded.as_str()),
-            format!("zipA_{}_789.parquet", Event::Processed.as_str()),
-            "not_history.txt".to_string(),
-            format!("zipC_other_000.parquet"),
-        ];
-        for f in &files {
-            fs::write(history_dir.join(f), b"")?;
+    fn persist_and_reload_store() -> Result<()> {
+        // — first instance: write two events —
+        let tmp = TempDir::new().unwrap();
+        let hist_dir = tmp.path().join("history_store");
+        {
+            let history = History::new(&hist_dir)?;
+            history.record_event("X.zip", Event::Downloaded)?;
+            sleep(Duration::from_millis(1));
+            history.record_event("Y.zip", Event::Downloaded)?;
         }
 
-        let history = History::new(&history_dir)?;
-        let names = history.load_event_names(Event::Downloaded)?;
+        // — new instance: should pick up the on-disk files —
+        let history2 = History::new(&hist_dir)?;
+        let got_x = history2.get_one("X.zip", Event::Downloaded)?;
+        let got_y = history2.get_one("Y.zip", Event::Downloaded)?;
+        assert!(got_x.is_some(), "expected X.zip after reload");
+        assert!(got_y.is_some(), "expected Y.zip after reload");
 
-        let mut expected = HashSet::new();
-        expected.insert("zipA".to_string());
-        expected.insert("zipB".to_string());
+        // — verify filenames —
+        let fx = got_x
+            .unwrap()
+            .file_name()
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_owned();
+        let fy = got_y
+            .unwrap()
+            .file_name()
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_owned();
+        assert!(fx.starts_with("X.zip---downloaded---"));
+        assert!(fy.starts_with("Y.zip---downloaded---"));
 
-        assert_eq!(names, expected);
+        Ok(())
+    }
+
+    #[test]
+    fn many_events_performance_smoke() -> Result<()> {
+        // — smoke-test writing 1 000 events across 10 zip names —
+        let tmp = TempDir::new().unwrap();
+        let hist_dir = tmp.path().join("history_store");
+        let history = History::new(&hist_dir)?;
+
+        const N: usize = 1_000;
+        let start = Instant::now();
+        let mut last = None;
+
+        for i in 0..N {
+            let zip = format!("bulk{}.zip", i % 10);
+            history.record_event(&zip, Event::Processed)?;
+            if i == N - 1 {
+                last = history.get_one(&zip, Event::Processed)?;
+            }
+        }
+        let elapsed = start.elapsed();
+        println!("Wrote {} events in {:?}", N, elapsed);
+
+        // — sanity: last get_one returns correct file for bulk9.zip —
+        let path = last.expect("expected last event");
+        let fname = path.file_name().unwrap().to_str().unwrap();
+        assert!(fname.starts_with("bulk9.zip---processed---"));
+
+        // — ensure we have N files on disk —
+        let count = fs::read_dir(&hist_dir)?.count();
+        assert_eq!(count, N, "expected {} parquet files, found {}", N, count);
+
         Ok(())
     }
 }
