@@ -40,8 +40,15 @@ async fn main() -> Result<()> {
     let zips_dir = PathBuf::from("zips");
     let out_parquet_dir = PathBuf::from("parquet");
     let history_dir = PathBuf::from("history");
+    let failed_zips_dir = PathBuf::from("failed_zips");
 
-    for d in &[schemas_dir, &zips_dir, &out_parquet_dir, &history_dir] {
+    for d in &[
+        schemas_dir,
+        &zips_dir,
+        &out_parquet_dir,
+        &history_dir,
+        &failed_zips_dir,
+    ] {
         fs::create_dir_all(d)?;
     }
 
@@ -108,13 +115,12 @@ async fn main() -> Result<()> {
                     let _ = tx.send(Ok(path)).await;
                 }
                 Err(err) => {
-                    error!("{} failed: {}", url, err);
+                    error!("{} download failed: {}", url, err);
                     let _ = tx.send(Err((url.clone(), err.to_string()))).await;
                 }
             }
         }));
     }
-    // drop the original sender so `rx.recv()` will end once all downloads complete
     drop(tx);
 
     // ─── 7) process downloaded ZIPs one at a time ────────────────────
@@ -125,7 +131,7 @@ async fn main() -> Result<()> {
                 info!("processing {}", name);
 
                 // offload the heavy split to the blocking pool
-                if let Err(e) = tokio::task::spawn_blocking({
+                let split_result = tokio::task::spawn_blocking({
                     let lookup = Arc::clone(&lookup);
                     let out_parquet_dir = out_parquet_dir.clone();
                     let zip_clone = zip_path.clone();
@@ -133,9 +139,13 @@ async fn main() -> Result<()> {
                         process::split::split_zip_to_parquet(&zip_clone, &out_parquet_dir, lookup)
                     }
                 })
-                .await?
-                {
+                .await?;
+
+                if let Err(e) = split_result {
                     error!("split {} failed: {}", name, e);
+                    // record failure
+                    let failed_marker = failed_zips_dir.join(&name);
+                    fs::File::create(&failed_marker)?;
                     continue;
                 }
 
@@ -143,16 +153,19 @@ async fn main() -> Result<()> {
                 record_processed(&history_dir, &name)?;
                 info!("wrote history for {}", name);
 
-                // delete the ZIP file
-                if let Err(e) = fs::remove_file(&zip_path) {
-                    error!("failed to delete {}: {}", name, e);
-                } else {
-                    info!("deleted zip {}", zip_path.display());
-                }
+                // NOTE: we no longer delete the ZIP here, so you can inspect
             }
 
             Err((url, err)) => {
-                error!("download error {}: {}", url, err);
+                error!("{} download error: {}", url, err);
+                // optionally record download failures too:
+                if let Some(name) = Path::new(&url)
+                    .file_name()
+                    .map(|s| s.to_string_lossy().to_string())
+                {
+                    let failed_marker = failed_zips_dir.join(&name);
+                    fs::File::create(&failed_marker)?;
+                }
             }
         }
     }
@@ -161,6 +174,14 @@ async fn main() -> Result<()> {
     for h in dl_handles {
         let _ = h.await;
     }
+
+    // ─── 9) report total ZIP disk usage ─────────────────────────────
+    let total_size: u64 = fs::read_dir(&zips_dir)?
+        .filter_map(|entry| entry.ok())
+        .filter_map(|entry| entry.metadata().ok())
+        .map(|meta| meta.len())
+        .sum();
+    info!("total size of remaining ZIPs: {} bytes", total_size);
 
     info!("all done");
     Ok(())
