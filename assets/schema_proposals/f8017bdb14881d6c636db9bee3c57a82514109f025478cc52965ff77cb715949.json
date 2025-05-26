@@ -1,0 +1,36 @@
+{
+  "month": "202505",
+  "schemas": [
+    {
+      "table": "SEVENDAYOUTLOOK_PEAK",
+      "month": "202505",
+      "columns": [
+        {
+          "name": "REGIONID",
+          "ty": "CHAR(4)",
+          "format": null
+        },
+        {
+          "name": "DATATYPE",
+          "ty": "CHAR(18)",
+          "format": null
+        },
+        {
+          "name": "DATAVALUE",
+          "ty": "FLOAT",
+          "format": "EXTERNAL"
+        },
+        {
+          "name": "CALENDAR_DATE",
+          "ty": "DATE",
+          "format": "\"yyyy/mm/dd hh24:mi:ss\""
+        },
+        {
+          "name": "PRETTYDATE",
+          "ty": "CHAR(9)",
+          "format": null
+        }
+      ]
+    }
+  ]
+}

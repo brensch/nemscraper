@@ -39,6 +39,7 @@ async fn main() -> Result<()> {
     let assets = PathBuf::from("assets");
     let schemas_dir = assets.join("schemas");
     let temp_schemas_dir = assets.join("schemas_temp");
+    let schema_proposals = assets.join("schema_proposals");
     let zips_dir = assets.join("zips");
     let parquet_dir = assets.join("parquet");
     let tmp_dir = assets.join("parquet_tmp");
@@ -237,7 +238,7 @@ async fn main() -> Result<()> {
                         continue;
                     }
                     Ok(None) => {
-                        // not downloaded yet, fall through to download
+                        // not processed yet, fall through to process
                     }
                     Err(e) => {
                         error!(name=%name, "history lookup failed, proceeding with processing: {}", e);
@@ -251,11 +252,17 @@ async fn main() -> Result<()> {
                 let final_out = parquet_dir.clone();
                 let history = history.clone();
                 let split_path = zip_path.clone();
+                let schema_proposals = schema_proposals.clone();
 
                 // split in blocking thread
                 let split_res = task::spawn_blocking(move || {
                     let arc = Arc::new(lookup_map);
-                    process::split::split_zip_to_parquet(&split_path, &split_temp_out, arc)
+                    process::split::split_zip_to_parquet(
+                        &split_path,
+                        &split_temp_out,
+                        arc,
+                        &schema_proposals,
+                    )
                 })
                 .await?;
 

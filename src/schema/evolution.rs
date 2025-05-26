@@ -107,14 +107,14 @@ pub fn find_column_types(
 
 /// Fallback schema derivation when no CTL info exists:
 /// for each column, look through up to the first 1 000 rows
-/// to grab an example non‐empty value; then infer a type.
-/// Defaults to `utf8` if no example was ever found.
+/// to grab an example non‐empty value; then infer a (ty, format).
+/// Defaults to utf8 if no example was ever found.
 pub fn derive_types(
     table_name: &str,
     header_names: &[String],
     rows: &[Vec<String>],
 ) -> Result<Vec<Column>> {
-    // 1) pick first non‐empty example for each column
+    // 1) collect first non‐empty example for each column
     let mut examples: Vec<Option<&str>> = vec![None; header_names.len()];
     for row in rows.iter().take(1_000) {
         for (i, cell) in row.iter().enumerate() {
@@ -127,57 +127,49 @@ pub fn derive_types(
         }
     }
 
-    // 2) infer a type per column (or default to utf8)
+    // 2) infer (ty, format) per column
     let mut cols = Vec::with_capacity(header_names.len());
     for (i, name) in header_names.iter().enumerate() {
-        let ty = match examples[i] {
-            Some(sample) => infer_type(sample),
+        let (ty, format) = match examples[i] {
+            Some(sample) => infer_type_and_format(sample),
             None => {
                 warn!(
                     "derive_types: no example for `{}` on table `{}`, defaulting to utf8",
                     name, table_name
                 );
-                "utf8".into()
+                ("utf8".into(), None)
             }
         };
 
         cols.push(Column {
             name: name.clone(),
             ty,
-            format: None,
+            format,
         });
     }
 
     Ok(cols)
 }
+fn infer_type_and_format(raw: &str) -> (String, Option<String>) {
+    // strip wrapping quotes
+    let v = raw.trim().trim_matches('"');
 
-/// Very basic scalar inference:
-/// - integer or float ⇒ "FLOAT"
-/// - ISO / "YYYY/MM/DD hh:mm:ss" ⇒ "DATE"
-/// - otherwise ⇒ "utf8"
-fn infer_type(v: &str) -> String {
-    // try integer first
-    if v.parse::<i64>().is_ok() {
-        return "FLOAT".into();
+    // 1) numeric ⇒ FLOAT + EXTERNAL
+    if v.parse::<i64>().is_ok() || v.parse::<f64>().is_ok() {
+        return ("FLOAT".into(), Some("EXTERNAL".into()));
     }
-    // then float
-    if v.parse::<f64>().is_ok() {
-        return "FLOAT".into();
+
+    // 2) datetime full
+    const SLASH_TS: &str = "%Y/%m/%d %H:%M:%S";
+    const DASH_TS: &str = "%Y-%m-%d %H:%M:%S";
+    if NaiveDateTime::parse_from_str(v, SLASH_TS).is_ok() {
+        return ("DATE".into(), Some("\"yyyy/mm/dd hh24:mi:ss\"".into()));
     }
-    // then common datetime patterns
-    const FMT1: &str = "%Y-%m-%d %H:%M:%S";
-    const FMT2: &str = "%Y/%m/%d %H:%M:%S";
-    if NaiveDateTime::parse_from_str(v, FMT1).is_ok()
-        || NaiveDateTime::parse_from_str(v, FMT2).is_ok()
-    {
-        return "DATE".into();
+    if NaiveDateTime::parse_from_str(v, DASH_TS).is_ok() {
+        return ("DATE".into(), Some("\"yyyy-mm-dd hh24:mi:ss\"".into()));
     }
-    // then date‐only
-    const D1: &str = "%Y-%m-%d";
-    const D2: &str = "%Y/%m/%d";
-    if NaiveDate::parse_from_str(v, D1).is_ok() || NaiveDate::parse_from_str(v, D2).is_ok() {
-        return "DATE".into();
-    }
-    // fallback
-    "utf8".into()
+
+    // 3) string ⇒ CHAR(length)
+    let len = v.len();
+    (format!("CHAR({})", len), None)
 }

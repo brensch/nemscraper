@@ -1,0 +1,26 @@
+{
+  "month": "202505",
+  "schemas": [
+    {
+      "table": "P5MIN_FCAS_REQ_RUN",
+      "month": "202505",
+      "columns": [
+        {
+          "name": "RUN_DATETIME",
+          "ty": "utf8",
+          "format": null
+        },
+        {
+          "name": "RUNNO",
+          "ty": "utf8",
+          "format": null
+        },
+        {
+          "name": "LASTCHANGED",
+          "ty": "utf8",
+          "format": null
+        }
+      ]
+    }
+  ]
+}

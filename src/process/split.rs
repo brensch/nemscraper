@@ -1,44 +1,48 @@
-// data/src/process/split.rs
-
+// src/process/split.rs
 use crate::process::chunk::chunk_and_write_segment;
-use crate::schema::build_arrow_schema;
-use crate::schema::find_column_types;
-use anyhow::{anyhow, Context, Result};
+use crate::schema::evolution::derive_types;
+use crate::schema::types::{calculate_fields_hash, CtlSchema, MonthSchema};
+use crate::schema::{build_arrow_schema, find_column_types};
+use anyhow::Result;
 use arrow::datatypes::Schema as ArrowSchema;
 use num_cpus;
 use rayon::prelude::*;
+use serde_json;
+use std::io::Read;
 use std::{
     collections::{HashMap, HashSet},
     fs,
     fs::File,
-    io::Read,
-    path::{Path, PathBuf},
+    path::Path,
     sync::Arc,
-    time::Instant,
 };
-use tracing::{error, info, instrument};
+use tracing::{info, instrument, warn};
 use zip::ZipArchive;
 
 /// Splits each CSV file in the ZIP into chunks and writes Parquet files,
-/// using a pre-built lookup of column types per table.
-#[instrument(level = "info", skip(zip_path, out_dir, column_lookup), fields(zip = %zip_path.as_ref().display()))]
-pub fn split_zip_to_parquet<P: AsRef<Path>, Q: AsRef<Path>>(
+/// using a pre-built lookup of column types per table, with a fallback
+/// to `derive_types` when lookup fails, emitting schema proposals.
+#[instrument(level = "info", skip(zip_path, out_dir, column_lookup, schema_proposals_dir), fields(zip = %zip_path.as_ref().display()))]
+pub fn split_zip_to_parquet<P: AsRef<Path>, Q: AsRef<Path>, R: AsRef<Path>>(
     zip_path: P,
     out_dir: Q,
     column_lookup: Arc<HashMap<String, HashMap<String, HashSet<String>>>>,
+    schema_proposals_dir: R,
 ) -> Result<()> {
-    // Initialize Rayon thread pool
     rayon::ThreadPoolBuilder::new()
         .num_threads(num_cpus::get())
         .build_global()
         .ok();
 
-    let start = Instant::now();
     info!("starting split_zip_to_parquet");
 
-    let zip_path = zip_path.as_ref().to_path_buf();
-    let out_dir = out_dir.as_ref().to_path_buf();
-    fs::create_dir_all(&out_dir)?;
+    let out_dir = out_dir.as_ref();
+    let proposals_dir = schema_proposals_dir.as_ref();
+    let temp_dir = proposals_dir.join("tmp");
+
+    fs::create_dir_all(out_dir)?;
+    fs::create_dir_all(proposals_dir)?;
+    fs::create_dir_all(&temp_dir)?;
 
     let file = File::open(&zip_path)?;
     let mut archive = ZipArchive::new(file)?;
@@ -50,12 +54,10 @@ pub fn split_zip_to_parquet<P: AsRef<Path>, Q: AsRef<Path>>(
             continue;
         }
 
-        // Read the entire CSV into memory once
         let mut buf = Vec::new();
         entry.read_to_end(&mut buf)?;
         let text = Arc::new(String::from_utf8_lossy(&buf).to_string());
 
-        // 1) Identify all (table_name, header_start, data_start, end_pos, date) segments
         let segments = {
             let mut segs = Vec::new();
             let mut pos = 0;
@@ -98,41 +100,71 @@ pub fn split_zip_to_parquet<P: AsRef<Path>, Q: AsRef<Path>>(
             segs
         };
 
-        // 2) Process each segment in parallel; any error aborts run
         segments
             .into_par_iter()
             .try_for_each(|(table, hs, ds, es, date)| -> Result<()> {
-                let header_str = &text[hs..ds];
-                let header_line = header_str
+                let headers: Vec<String> = text[hs..ds]
                     .lines()
                     .next()
-                    .ok_or_else(|| anyhow!("empty header for table `{}` on {}", table, date))?;
-
-                // **skip first 4 metadata columns** rec_type/domain/measure/seq
-                let header_names: Vec<String> = header_line
+                    .unwrap()
                     .split(',')
                     .skip(4)
                     .map(String::from)
                     .collect();
 
-                // Resolve columns by name, warn on missing, error only if table missing
-                let cols = find_column_types(&column_lookup, &table, &header_names)
-                    .inspect_err(|e| {
-                        error!(table = %table, month = %date, error = %e, "column type resolution error");
-                    })?;
+                let cols = match find_column_types(&column_lookup, &table, &headers) {
+                    Ok(c) => c,
+                    Err(e) => {
+                        warn!(table=%table,month=%date,error=%e,"lookup failed, deriving types");
+                        let sample_rows: Vec<Vec<String>> = text[ds..es]
+                            .lines()
+                            .skip(1)
+                            .map(|l| l.split(',').skip(4).map(str::to_string).collect())
+                            .take(1000)
+                            .collect();
+                        let proposal_cols = derive_types(&table, &headers, &sample_rows)?;
 
-                // Build an Arrow schema from resolved columns
+                        // wrap in MonthSchema/CtlSchema
+                        let ctl = CtlSchema {
+                            table: table.clone(),
+                            month: date.clone(),
+                            columns: proposal_cols.clone(),
+                        };
+                        let month_schema = MonthSchema {
+                            month: date.clone(),
+                            schemas: vec![ctl],
+                        };
+
+                        // compute filename by hash of columns
+                        let mut ordered = proposal_cols.clone();
+                        ordered.sort_by(|a, b| a.name.cmp(&b.name));
+                        let hash = calculate_fields_hash(&ordered);
+                        let filename = format!("{}.json", hash);
+                        let final_path = proposals_dir.join(&filename);
+
+                        if !final_path.exists() {
+                            let tmp_path = temp_dir.join(&filename);
+                            let json = serde_json::to_string_pretty(&month_schema)?;
+                            fs::write(&tmp_path, json)?;
+                            fs::rename(&tmp_path, &final_path)?;
+                            info!(proposal=%filename,"wrote schema proposal");
+                        } else {
+                            info!(proposal=%filename,"proposal exists, skipping");
+                        }
+
+                        proposal_cols
+                    }
+                };
+
                 let arrow_schema: Arc<ArrowSchema> = build_arrow_schema(&cols);
-
-                // Write the parquet using resolved types
                 chunk_and_write_segment(
                     &name,
                     &table,
-                    header_str,
+                    &text[hs..ds],
                     &text[ds..es],
                     cols.clone(),
                     arrow_schema.clone(),
-                    &out_dir,
+                    out_dir,
                 );
                 Ok(())
             })?;
