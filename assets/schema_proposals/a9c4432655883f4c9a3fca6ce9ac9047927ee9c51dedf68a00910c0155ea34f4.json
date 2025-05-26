@@ -1,0 +1,26 @@
+{
+  "month": "202203",
+  "schemas": [
+    {
+      "table": "DAILY_WDR_NO_SCADA",
+      "month": "202203",
+      "columns": [
+        {
+          "name": "CALENDAR_DAY",
+          "ty": "DATE",
+          "format": "\"yyyy/mm/dd hh24:mi:ss\""
+        },
+        {
+          "name": "REGIONID",
+          "ty": "utf8",
+          "format": null
+        },
+        {
+          "name": "MW_CAPACITY_NO_SCADA",
+          "ty": "FLOAT",
+          "format": "EXTERNAL"
+        }
+      ]
+    }
+  ]
+}

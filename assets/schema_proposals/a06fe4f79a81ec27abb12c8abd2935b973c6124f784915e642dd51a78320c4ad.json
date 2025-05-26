@@ -1,0 +1,66 @@
+{
+  "month": "202402",
+  "schemas": [
+    {
+      "table": "SETTLEMENTS_CPDATAREGION",
+      "month": "202402",
+      "columns": [
+        {
+          "name": "SETTLEMENTDATE",
+          "ty": "DATE",
+          "format": "\"yyyy/mm/dd hh24:mi:ss\""
+        },
+        {
+          "name": "VERSIONNO",
+          "ty": "FLOAT",
+          "format": "EXTERNAL"
+        },
+        {
+          "name": "PERIODID",
+          "ty": "FLOAT",
+          "format": "EXTERNAL"
+        },
+        {
+          "name": "REGIONID",
+          "ty": "utf8",
+          "format": null
+        },
+        {
+          "name": "SUMIGENERGY",
+          "ty": "utf8",
+          "format": null
+        },
+        {
+          "name": "SUMXGENERGY",
+          "ty": "utf8",
+          "format": null
+        },
+        {
+          "name": "SUMINENERGY",
+          "ty": "FLOAT",
+          "format": "EXTERNAL"
+        },
+        {
+          "name": "SUMXNENERGY",
+          "ty": "FLOAT",
+          "format": "EXTERNAL"
+        },
+        {
+          "name": "SUMIPOWER",
+          "ty": "utf8",
+          "format": null
+        },
+        {
+          "name": "SUMXPOWER",
+          "ty": "utf8",
+          "format": null
+        },
+        {
+          "name": "LASTCHANGED",
+          "ty": "DATE",
+          "format": "\"yyyy/mm/dd hh24:mi:ss\""
+        }
+      ]
+    }
+  ]
+}

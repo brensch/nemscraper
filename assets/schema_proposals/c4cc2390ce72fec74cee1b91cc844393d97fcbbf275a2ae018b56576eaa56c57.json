@@ -1,0 +1,186 @@
+{
+  "month": "202505",
+  "schemas": [
+    {
+      "table": "PREDISPATCH_REGION_PRICES",
+      "month": "202505",
+      "columns": [
+        {
+          "name": "PREDISPATCHSEQNO",
+          "ty": "FLOAT",
+          "format": "EXTERNAL"
+        },
+        {
+          "name": "RUNNO",
+          "ty": "FLOAT",
+          "format": "EXTERNAL"
+        },
+        {
+          "name": "REGIONID",
+          "ty": "utf8",
+          "format": null
+        },
+        {
+          "name": "PERIODID",
+          "ty": "FLOAT",
+          "format": "EXTERNAL"
+        },
+        {
+          "name": "INTERVENTION",
+          "ty": "FLOAT",
+          "format": "EXTERNAL"
+        },
+        {
+          "name": "RRP",
+          "ty": "FLOAT",
+          "format": "EXTERNAL"
+        },
+        {
+          "name": "EEP",
+          "ty": "FLOAT",
+          "format": "EXTERNAL"
+        },
+        {
+          "name": "RRP1",
+          "ty": "utf8",
+          "format": null
+        },
+        {
+          "name": "EEP1",
+          "ty": "utf8",
+          "format": null
+        },
+        {
+          "name": "RRP2",
+          "ty": "utf8",
+          "format": null
+        },
+        {
+          "name": "EEP2",
+          "ty": "utf8",
+          "format": null
+        },
+        {
+          "name": "RRP3",
+          "ty": "utf8",
+          "format": null
+        },
+        {
+          "name": "EEP3",
+          "ty": "utf8",
+          "format": null
+        },
+        {
+          "name": "RRP4",
+          "ty": "utf8",
+          "format": null
+        },
+        {
+          "name": "EEP4",
+          "ty": "utf8",
+          "format": null
+        },
+        {
+          "name": "RRP5",
+          "ty": "utf8",
+          "format": null
+        },
+        {
+          "name": "EEP5",
+          "ty": "utf8",
+          "format": null
+        },
+        {
+          "name": "RRP6",
+          "ty": "utf8",
+          "format": null
+        },
+        {
+          "name": "EEP6",
+          "ty": "utf8",
+          "format": null
+        },
+        {
+          "name": "RRP7",
+          "ty": "utf8",
+          "format": null
+        },
+        {
+          "name": "EEP7",
+          "ty": "utf8",
+          "format": null
+        },
+        {
+          "name": "RRP8",
+          "ty": "utf8",
+          "format": null
+        },
+        {
+          "name": "EEP8",
+          "ty": "utf8",
+          "format": null
+        },
+        {
+          "name": "LASTCHANGED",
+          "ty": "DATE",
+          "format": "\"yyyy/mm/dd hh24:mi:ss\""
+        },
+        {
+          "name": "DATETIME",
+          "ty": "DATE",
+          "format": "\"yyyy/mm/dd hh24:mi:ss\""
+        },
+        {
+          "name": "RAISE6SECRRP",
+          "ty": "FLOAT",
+          "format": "EXTERNAL"
+        },
+        {
+          "name": "RAISE60SECRRP",
+          "ty": "FLOAT",
+          "format": "EXTERNAL"
+        },
+        {
+          "name": "RAISE5MINRRP",
+          "ty": "FLOAT",
+          "format": "EXTERNAL"
+        },
+        {
+          "name": "RAISEREGRRP",
+          "ty": "FLOAT",
+          "format": "EXTERNAL"
+        },
+        {
+          "name": "LOWER6SECRRP",
+          "ty": "FLOAT",
+          "format": "EXTERNAL"
+        },
+        {
+          "name": "LOWER60SECRRP",
+          "ty": "FLOAT",
+          "format": "EXTERNAL"
+        },
+        {
+          "name": "LOWER5MINRRP",
+          "ty": "FLOAT",
+          "format": "EXTERNAL"
+        },
+        {
+          "name": "LOWERREGRRP",
+          "ty": "FLOAT",
+          "format": "EXTERNAL"
+        },
+        {
+          "name": "RAISE1SECRRP",
+          "ty": "FLOAT",
+          "format": "EXTERNAL"
+        },
+        {
+          "name": "LOWER1SECRRP",
+          "ty": "FLOAT",
+          "format": "EXTERNAL"
+        }
+      ]
+    }
+  ]
+}

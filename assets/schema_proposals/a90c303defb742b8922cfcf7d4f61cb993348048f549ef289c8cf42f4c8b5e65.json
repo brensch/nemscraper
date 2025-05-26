@@ -1,0 +1,56 @@
+{
+  "month": "202305",
+  "schemas": [
+    {
+      "table": "SETTLEMENTS_DAYTRACK",
+      "month": "202305",
+      "columns": [
+        {
+          "name": "SETTLEMENTDATE",
+          "ty": "utf8",
+          "format": null
+        },
+        {
+          "name": "REGIONID",
+          "ty": "utf8",
+          "format": null
+        },
+        {
+          "name": "EXANTERUNSTATUS",
+          "ty": "utf8",
+          "format": null
+        },
+        {
+          "name": "EXANTERUNNO",
+          "ty": "utf8",
+          "format": null
+        },
+        {
+          "name": "EXPOSTRUNSTATUS",
+          "ty": "utf8",
+          "format": null
+        },
+        {
+          "name": "EXPOSTRUNNO",
+          "ty": "utf8",
+          "format": null
+        },
+        {
+          "name": "LASTCHANGED",
+          "ty": "utf8",
+          "format": null
+        },
+        {
+          "name": "METERDATA_SOURCE",
+          "ty": "utf8",
+          "format": null
+        },
+        {
+          "name": "SETTLEMENTINTERVALLENGTH",
+          "ty": "utf8",
+          "format": null
+        }
+      ]
+    }
+  ]
+}

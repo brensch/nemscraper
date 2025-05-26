@@ -1,0 +1,36 @@
+{
+  "month": "202505",
+  "schemas": [
+    {
+      "table": "PDIREGION_",
+      "month": "202505",
+      "columns": [
+        {
+          "name": "PREDISPATCHSEQNO",
+          "ty": "DATE",
+          "format": "\"yyyy/mm/dd hh24:mi:ss\""
+        },
+        {
+          "name": "RUNNO",
+          "ty": "FLOAT",
+          "format": "EXTERNAL"
+        },
+        {
+          "name": "REGIONID",
+          "ty": "utf8",
+          "format": null
+        },
+        {
+          "name": "DEMANDFORECAST",
+          "ty": "FLOAT",
+          "format": "EXTERNAL"
+        },
+        {
+          "name": "INTERVENTION",
+          "ty": "FLOAT",
+          "format": "EXTERNAL"
+        }
+      ]
+    }
+  ]
+}

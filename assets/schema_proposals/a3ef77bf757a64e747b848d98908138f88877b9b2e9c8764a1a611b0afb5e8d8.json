@@ -1,0 +1,31 @@
+{
+  "month": "202402",
+  "schemas": [
+    {
+      "table": "SETTLEMENTS_SUBST_RUN_VERSION",
+      "month": "202402",
+      "columns": [
+        {
+          "name": "SETTLEMENTDATE",
+          "ty": "DATE",
+          "format": "\"yyyy/mm/dd hh24:mi:ss\""
+        },
+        {
+          "name": "SETTLEMENTRUNNO",
+          "ty": "FLOAT",
+          "format": "EXTERNAL"
+        },
+        {
+          "name": "REFERENCESETTLEMENTDATE",
+          "ty": "DATE",
+          "format": "\"yyyy/mm/dd hh24:mi:ss\""
+        },
+        {
+          "name": "REFERENCESETTLEMENTRUNNO",
+          "ty": "FLOAT",
+          "format": "EXTERNAL"
+        }
+      ]
+    }
+  ]
+}

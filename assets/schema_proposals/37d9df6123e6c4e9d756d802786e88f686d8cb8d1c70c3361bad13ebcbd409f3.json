@@ -1,0 +1,81 @@
+{
+  "month": "202402",
+  "schemas": [
+    {
+      "table": "SETTLEMENTS_GENDATAREGION",
+      "month": "202402",
+      "columns": [
+        {
+          "name": "SETTLEMENTDATE",
+          "ty": "DATE",
+          "format": "\"yyyy/mm/dd hh24:mi:ss\""
+        },
+        {
+          "name": "VERSIONNO",
+          "ty": "FLOAT",
+          "format": "EXTERNAL"
+        },
+        {
+          "name": "PERIODID",
+          "ty": "FLOAT",
+          "format": "EXTERNAL"
+        },
+        {
+          "name": "REGIONID",
+          "ty": "utf8",
+          "format": null
+        },
+        {
+          "name": "GENERGY",
+          "ty": "utf8",
+          "format": null
+        },
+        {
+          "name": "AENERGY",
+          "ty": "utf8",
+          "format": null
+        },
+        {
+          "name": "GPOWER",
+          "ty": "utf8",
+          "format": null
+        },
+        {
+          "name": "APOWER",
+          "ty": "utf8",
+          "format": null
+        },
+        {
+          "name": "NETENERGY",
+          "ty": "FLOAT",
+          "format": "EXTERNAL"
+        },
+        {
+          "name": "ENERGYCOST",
+          "ty": "FLOAT",
+          "format": "EXTERNAL"
+        },
+        {
+          "name": "EXCESSENERGYCOST",
+          "ty": "FLOAT",
+          "format": "EXTERNAL"
+        },
+        {
+          "name": "EXPENERGY",
+          "ty": "FLOAT",
+          "format": "EXTERNAL"
+        },
+        {
+          "name": "EXPENERGYCOST",
+          "ty": "FLOAT",
+          "format": "EXTERNAL"
+        },
+        {
+          "name": "LASTCHANGED",
+          "ty": "DATE",
+          "format": "\"yyyy/mm/dd hh24:mi:ss\""
+        }
+      ]
+    }
+  ]
+}

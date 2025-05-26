@@ -1,0 +1,81 @@
+{
+  "month": "202410",
+  "schemas": [
+    {
+      "table": "SETTLEMENTS_FCASREGIONRECOVERY",
+      "month": "202410",
+      "columns": [
+        {
+          "name": "SETTLEMENTDATE",
+          "ty": "DATE",
+          "format": "\"yyyy/mm/dd hh24:mi:ss\""
+        },
+        {
+          "name": "VERSIONNO",
+          "ty": "FLOAT",
+          "format": "EXTERNAL"
+        },
+        {
+          "name": "BIDTYPE",
+          "ty": "CHAR(9)",
+          "format": null
+        },
+        {
+          "name": "REGIONID",
+          "ty": "utf8",
+          "format": null
+        },
+        {
+          "name": "PERIODID",
+          "ty": "FLOAT",
+          "format": "EXTERNAL"
+        },
+        {
+          "name": "GENERATORREGIONENERGY",
+          "ty": "utf8",
+          "format": null
+        },
+        {
+          "name": "CUSTOMERREGIONENERGY",
+          "ty": "utf8",
+          "format": null
+        },
+        {
+          "name": "REGIONRECOVERY",
+          "ty": "utf8",
+          "format": null
+        },
+        {
+          "name": "REGION_ACE_MWH",
+          "ty": "FLOAT",
+          "format": "EXTERNAL"
+        },
+        {
+          "name": "REGION_ASOE_MWH",
+          "ty": "FLOAT",
+          "format": "EXTERNAL"
+        },
+        {
+          "name": "REGIONRECOVERYAMOUNT_ACE",
+          "ty": "FLOAT",
+          "format": "EXTERNAL"
+        },
+        {
+          "name": "REGIONRECOVERYAMOUNT_ASOE",
+          "ty": "FLOAT",
+          "format": "EXTERNAL"
+        },
+        {
+          "name": "REGIONRECOVERYAMOUNT",
+          "ty": "FLOAT",
+          "format": "EXTERNAL"
+        },
+        {
+          "name": "LASTCHANGED",
+          "ty": "DATE",
+          "format": "\"yyyy/mm/dd hh24:mi:ss\""
+        }
+      ]
+    }
+  ]
+}
