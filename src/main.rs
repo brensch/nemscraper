@@ -19,7 +19,7 @@ use tokio::{
     task,
     time::{interval, sleep, Instant},
 };
-use tracing::{error, info};
+use tracing::{error, info, level_filters::LevelFilter};
 use tracing_subscriber::{fmt, EnvFilter};
 
 mod history;
@@ -29,7 +29,7 @@ use history::History;
 async fn main() -> Result<()> {
     // ─── 1) init logging ─────────────────────────────────────────────
     let env = EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| EnvFilter::new("info,data=info,main=info"));
+        .unwrap_or_else(|_| EnvFilter::new("info,fetch_all=info,selectors::matching=info"));
     fmt::Subscriber::builder()
         .with_env_filter(env)
         .with_span_events(fmt::format::FmtSpan::CLOSE)

@@ -8,7 +8,7 @@ use std::{
     fs,
     path::Path,
 };
-use tracing::warn;
+use tracing::{debug, warn};
 
 use super::types::{Column, MonthSchema};
 
@@ -75,7 +75,7 @@ pub fn find_column_types(
                 let ty = if types.len() == 1 {
                     types.iter().next().unwrap().clone()
                 } else {
-                    warn!("multiple types found for column `{}`: {:?}", header, types);
+                    debug!("multiple types found for column `{}`: {:?}", header, types);
                     types.iter().next().unwrap().clone()
                 };
                 cols.push(Column {

@@ -138,6 +138,5 @@ pub fn split_zip_to_parquet<P: AsRef<Path>, Q: AsRef<Path>>(
             })?;
     }
 
-    info!("completed in {:?}", start.elapsed());
     Ok(())
 }

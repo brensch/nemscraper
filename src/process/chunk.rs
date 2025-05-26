@@ -14,7 +14,7 @@ use parquet::basic::{BrotliLevel, Compression};
 use parquet::file::properties::WriterProperties;
 use rayon::prelude::*;
 use std::{fs::File, path::Path, sync::Arc};
-use tracing::info;
+use tracing::{debug, info};
 
 /// Split a single CSV segment into row-chunks and write each as its own Parquet file,
 /// converting CTL-style DATE columns ("yyyy/mm/dd hh24:mi:ss") (in UTC+10) into true UTC timestamps.
@@ -67,7 +67,7 @@ pub fn chunk_and_write_segment(
 
     let data_lines: Vec<&str> = data.lines().collect();
     let total_rows = data_lines.len();
-    info!(table=%table_name, schema=%schema_id, rows=total_rows, "splitting into chunks");
+    debug!(table=%table_name, schema=%schema_id, rows=total_rows, "splitting into chunks");
 
     let compression = Compression::BROTLI(BrotliLevel::try_new(5).unwrap());
     data_lines
@@ -100,8 +100,9 @@ pub fn chunk_and_write_segment(
             }
 
             writer.close().unwrap();
-            info!(table=%table_name, schema=%schema_id, chunk=chunk_idx, "wrote {} rows", _chunk.len());
+            debug!(table=%table_name, schema=%schema_id, chunk=chunk_idx, rows=_chunk.len(), "wrote rows"  );
         });
+    info!(table=%table_name, schema=%schema_id, rows=total_rows, "processed file");
 }
 
 /// Convert CTL DATE columns (utf8, in UTC+10) to TimestampMicrosecondArray in the RecordBatch,
@@ -114,7 +115,7 @@ fn convert_date_columns(
     let mut columns: Vec<ArrayRef> = batch.columns().to_vec();
 
     // fixed +10h offset
-    let offset = FixedOffset::east(10 * 3600);
+    let offset = FixedOffset::east_opt(10 * 3600).expect("Invalid offset");
 
     for (i, col_meta) in headers.iter().enumerate() {
         if col_meta.ty.eq_ignore_ascii_case("DATE") {
