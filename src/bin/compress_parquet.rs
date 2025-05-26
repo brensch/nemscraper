@@ -1,6 +1,7 @@
 use anyhow::Result;
 use arrow::record_batch::RecordBatch;
 use num_cpus;
+use parquet::basic::BrotliLevel;
 use parquet::file::reader::FileReader;
 use parquet::{
     // <-- here’s the change:
@@ -81,8 +82,6 @@ fn main() -> Result<()> {
     let n_threads = 8;
     info!("Processing {} groups on {} threads", tasks.len(), n_threads);
 
-    let zstd_level = ZstdLevel::try_new(22)
-        .expect("22 is too high for this version of parquet; pick a lower level");
     // ─── run tasks in parallel with a fixed thread-pool ───────
     rayon::ThreadPoolBuilder::new()
         .num_threads(n_threads)
@@ -100,7 +99,7 @@ fn main() -> Result<()> {
 
                 // infer schema
                 let first = &files[0];
-                let mut first_reader = ParquetRecordBatchReaderBuilder::try_new(
+                let first_reader = ParquetRecordBatchReaderBuilder::try_new(
                     File::open(first).expect("open first parquet"),
                 )
                 .expect("build reader")
@@ -109,7 +108,7 @@ fn main() -> Result<()> {
 
                 // writer props
                 let props = WriterProperties::builder()
-                    .set_compression(Compression::ZSTD(zstd_level))
+                    .set_compression(Compression::BROTLI(BrotliLevel::try_new(5).unwrap()))
                     .build();
 
                 let out_path = output_dir.join(format!("{}—{}.parquet", ymd, table));

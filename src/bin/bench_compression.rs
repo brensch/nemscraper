@@ -31,7 +31,7 @@ fn main() -> Result<()> {
     info!("nemscraper_munge benchmarking start");
 
     let input_dir = Path::new("./parquet");
-    let output_dir = Path::new("./munged_bench");
+    let output_dir = Path::new("./munged_bench3");
     fs::create_dir_all(output_dir)?;
 
     // ─── group files by (table, YYYYMMDD) ────────────────────
@@ -87,18 +87,18 @@ fn main() -> Result<()> {
 
     // ─── prepare compressors ─────────────────────────────────
     let compressors = vec![
-        ("UNCOMPRESSED", Compression::UNCOMPRESSED, "0"),
-        ("SNAPPY", Compression::SNAPPY, "-"),
-        (
-            "GZIP",
-            Compression::GZIP(GzipLevel::try_new(9).unwrap()),
-            "9",
-        ),
-        (
-            "GZIP",
-            Compression::GZIP(GzipLevel::try_new(1).unwrap()),
-            "1",
-        ),
+        // ("UNCOMPRESSED", Compression::UNCOMPRESSED, "0"),
+        // ("SNAPPY", Compression::SNAPPY, "-"),
+        // (
+        //     "GZIP",
+        //     Compression::GZIP(GzipLevel::try_new(9).unwrap()),
+        //     "9",
+        // ),
+        // (
+        //     "GZIP",
+        //     Compression::GZIP(GzipLevel::try_new(1).unwrap()),
+        //     "1",
+        // ),
         (
             "BROTLI",
             Compression::BROTLI(BrotliLevel::try_new(5).unwrap()),
@@ -106,10 +106,10 @@ fn main() -> Result<()> {
         ),
         (
             "BROTLI",
-            Compression::BROTLI(BrotliLevel::try_new(5).unwrap()),
-            "11",
+            Compression::BROTLI(BrotliLevel::try_new(7).unwrap()),
+            "7",
         ),
-        ("LZ4", Compression::LZ4, "-"),
+        // ("LZ4", Compression::LZ4, "-"),
         (
             "ZSTD",
             Compression::ZSTD(ZstdLevel::try_new(1).unwrap()),
@@ -122,7 +122,7 @@ fn main() -> Result<()> {
         ),
         (
             "ZSTD",
-            Compression::ZSTD(ZstdLevel::try_new(22).unwrap()),
+            Compression::ZSTD(ZstdLevel::try_new(12).unwrap()),
             "15",
         ),
     ];
