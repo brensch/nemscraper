@@ -146,7 +146,7 @@ pub async fn fetch_all<P: AsRef<Path>>(client: &Client, output_dir: P) -> Result
         if let Some(code) = month_code_from_url(&month_url) {
             // 3. Skip if we've already fetched this month
             if done.contains(&code) {
-                info!(month = %code, "skipping (already fetched)");
+                debug!(month = %code, "skipping (already fetched)");
                 continue;
             }
             let ctl_dir = month_url.join("MMSDM_Historical_Data_SQLLoader/CTL/")?;
