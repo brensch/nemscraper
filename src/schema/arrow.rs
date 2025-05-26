@@ -1,6 +1,6 @@
 // src/schema/arrow.rs
 use super::types::Column;
-use arrow::datatypes::{DataType, Field as ArrowField, Schema as ArrowSchema, TimeUnit};
+use arrow::datatypes::{DataType, Field as ArrowField, Schema as ArrowSchema};
 use std::sync::Arc;
 
 /// Map a CTL column type + format into an Arrow DataType.

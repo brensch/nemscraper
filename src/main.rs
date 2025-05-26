@@ -5,10 +5,10 @@ use nemscraper::{
 };
 use reqwest::Client;
 use std::{
-    collections::{HashMap, HashSet},
+    collections::HashSet,
     ffi::OsStr,
     fs,
-    path::{Path, PathBuf},
+    path::PathBuf,
     sync::Arc,
     time::Duration,
 };

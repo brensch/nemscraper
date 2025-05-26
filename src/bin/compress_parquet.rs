@@ -1,12 +1,11 @@
 use anyhow::Result;
 use arrow::record_batch::RecordBatch;
-use num_cpus;
 use parquet::basic::BrotliLevel;
 use parquet::file::reader::FileReader;
 use parquet::{
     // <-- here’s the change:
     arrow::{arrow_reader::ParquetRecordBatchReaderBuilder, ArrowWriter},
-    basic::{Compression, ZstdLevel},
+    basic::Compression,
     file::{properties::WriterProperties, serialized_reader::SerializedFileReader},
 };
 use regex::Regex;
@@ -16,7 +15,7 @@ use std::{
     path::{Path, PathBuf},
 };
 use tracing::{debug, error, info};
-use tracing_subscriber::{fmt, EnvFilter};
+use tracing_subscriber::EnvFilter;
 
 // <-- pull in rayon traits -->
 use rayon::prelude::*;

@@ -160,7 +160,6 @@ pub fn split_zip_to_parquet<P: AsRef<Path>, Q: AsRef<Path>, R: AsRef<Path>>(
                 chunk_and_write_segment(
                     &name,
                     &table,
-                    &text[hs..ds],
                     &text[ds..es],
                     cols.clone(),
                     arrow_schema.clone(),

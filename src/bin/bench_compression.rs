@@ -2,8 +2,8 @@ use anyhow::Result;
 use arrow::record_batch::RecordBatch;
 use parquet::{
     arrow::{arrow_reader::ParquetRecordBatchReaderBuilder, ArrowWriter},
-    basic::{BrotliLevel, Compression, GzipLevel, ZstdLevel},
-    file::{properties::WriterProperties, reader::SerializedFileReader},
+    basic::{BrotliLevel, Compression, ZstdLevel},
+    file::properties::WriterProperties,
 };
 use regex::Regex;
 use std::{
@@ -12,8 +12,8 @@ use std::{
     path::{Path, PathBuf},
     time::Instant,
 };
-use tracing::{debug, info};
-use tracing_subscriber::{fmt, EnvFilter};
+use tracing::info;
+use tracing_subscriber::EnvFilter;
 
 struct Report {
     group: String,
@@ -134,7 +134,7 @@ fn main() -> Result<()> {
 
         // infer schema once
         let first = &files[0];
-        let mut first_reader =
+        let first_reader =
             ParquetRecordBatchReaderBuilder::try_new(File::open(first)?)?.with_batch_size(1024);
         let schema = first_reader.schema().clone();
 

@@ -223,12 +223,8 @@ fn infer_type_and_format(raw: &str) -> (String, Option<String>) {
 mod tests {
     use super::*;
     use anyhow::Result;
-    use std::{
-        fs::File,
-        io::{self, Write},
-        path::Path,
-    };
-    use tempfile::tempdir;
+    use std::path::Path;
+    
 
     /// Manual schema existence check:
     /// Reads JSON schema files from a real directory and prompts for a table name.

@@ -22,7 +22,6 @@ use tracing::{debug, info};
 pub fn chunk_and_write_segment(
     table_name: &str,
     schema_id: &str,
-    header: &str,
     data: &str,
     headers: Vec<Column>,
     arrow_schema: Arc<ArrowSchema>,

@@ -13,11 +13,11 @@ use std::{
     time::Duration,
 };
 use tokio::{fs as tokio_fs, io::AsyncWriteExt, time::sleep};
-use tracing::{debug, error, info, instrument, trace, warn};
+use tracing::{debug, error, instrument, trace, warn};
 use url::Url;
 
 use super::ctl::parse_ctl;
-use super::types::{CtlSchema, MonthSchema};
+use super::types::MonthSchema;
 
 async fn get_text_core(client: &Client, url: &Url) -> Result<String> {
     debug!("Fetching text from {}", url);

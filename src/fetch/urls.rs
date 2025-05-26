@@ -1,11 +1,9 @@
 // data/src/fetch/urls.rs
 use anyhow::Result;
-use futures::stream;
 use reqwest::Client;
 use scraper::{Html, Selector};
 use std::collections::BTreeMap;
 use std::time::Duration;
-use tokio::task;
 use tokio::time::sleep;
 use url::Url;
 
@@ -138,14 +136,14 @@ async fn fetch_zip_urls(client: &Client, feeds: &[&str]) -> Result<BTreeMap<Stri
                                 .collect::<Vec<_>>();
                             break urls;
                         }
-                        Err(e) if attempt < MAX_RETRIES => {
+                        Err(_) if attempt < MAX_RETRIES => {
                             sleep(RETRY_DELAY).await;
                             continue;
                         }
                         Err(e) => return Err(e.into()),
                     }
                 }
-                Err(e) if attempt < MAX_RETRIES => {
+                Err(_) if attempt < MAX_RETRIES => {
                     sleep(RETRY_DELAY).await;
                     continue;
                 }
