@@ -16,8 +16,8 @@ pub fn map_to_arrow_type(ty: &str, _format: &Option<String>) -> DataType {
     match up.as_str() {
         s if s.starts_with("CHAR") => DataType::Utf8,
         "DATE" => DataType::Utf8,
+        s if s.starts_with("TIMESTAMP") => DataType::Utf8, // not sure if this is
         "FLOAT" => DataType::Float64,
-        s if s.starts_with("TIMESTAMP") => DataType::Int64,
         _ => DataType::Utf8,
     }
 }
