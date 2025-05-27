@@ -1,0 +1,146 @@
+{
+  "month": "202505",
+  "schemas": [
+    {
+      "table": "BILLING_DIRECTION",
+      "month": "202505",
+      "columns": [
+        {
+          "name": "DIRECTION_ID",
+          "ty": "utf8",
+          "format": null
+        },
+        {
+          "name": "DIRECTION_SERVICE_ID",
+          "ty": "utf8",
+          "format": null
+        },
+        {
+          "name": "DIRECTION_DESC",
+          "ty": "utf8",
+          "format": null
+        },
+        {
+          "name": "DIRECTION_TYPE_ID",
+          "ty": "utf8",
+          "format": null
+        },
+        {
+          "name": "DIRECTION_START_DATE",
+          "ty": "utf8",
+          "format": null
+        },
+        {
+          "name": "DIRECTION_END_DATE",
+          "ty": "utf8",
+          "format": null
+        },
+        {
+          "name": "DIRECTION_START_INTERVAL",
+          "ty": "utf8",
+          "format": null
+        },
+        {
+          "name": "DIRECTION_END_INTERVAL",
+          "ty": "utf8",
+          "format": null
+        },
+        {
+          "name": "COMPENSATION_AMOUNT",
+          "ty": "utf8",
+          "format": null
+        },
+        {
+          "name": "INTEREST_AMOUNT",
+          "ty": "utf8",
+          "format": null
+        },
+        {
+          "name": "INDEPENDENT_EXPERT_FEE",
+          "ty": "utf8",
+          "format": null
+        },
+        {
+          "name": "CRA",
+          "ty": "utf8",
+          "format": null
+        },
+        {
+          "name": "NSW_ACE_ENERGY",
+          "ty": "utf8",
+          "format": null
+        },
+        {
+          "name": "QLD_ACE_ENERGY",
+          "ty": "utf8",
+          "format": null
+        },
+        {
+          "name": "SA_ACE_ENERGY",
+          "ty": "utf8",
+          "format": null
+        },
+        {
+          "name": "TAS_ACE_ENERGY",
+          "ty": "utf8",
+          "format": null
+        },
+        {
+          "name": "VIC_ACE_ENERGY",
+          "ty": "utf8",
+          "format": null
+        },
+        {
+          "name": "NSW_ASOE_ENERGY",
+          "ty": "utf8",
+          "format": null
+        },
+        {
+          "name": "QLD_ASOE_ENERGY",
+          "ty": "utf8",
+          "format": null
+        },
+        {
+          "name": "SA_ASOE_ENERGY",
+          "ty": "utf8",
+          "format": null
+        },
+        {
+          "name": "TAS_ASOE_ENERGY",
+          "ty": "utf8",
+          "format": null
+        },
+        {
+          "name": "VIC_ASOE_ENERGY",
+          "ty": "utf8",
+          "format": null
+        },
+        {
+          "name": "NSW_RBF",
+          "ty": "utf8",
+          "format": null
+        },
+        {
+          "name": "QLD_RBF",
+          "ty": "utf8",
+          "format": null
+        },
+        {
+          "name": "SA_RBF",
+          "ty": "utf8",
+          "format": null
+        },
+        {
+          "name": "VIC_RBF",
+          "ty": "utf8",
+          "format": null
+        },
+        {
+          "name": "TAS_RBF",
+          "ty": "utf8",
+          "format": null
+        }
+      ]
+    }
+  ]
+}
