@@ -1,9 +1,9 @@
 {
-  "month": "202203",
+  "month": "202302",
   "schemas": [
     {
       "table": "DAILY_WDR_NO_SCADA",
-      "month": "202203",
+      "month": "202302",
       "columns": [
         {
           "name": "CALENDAR_DAY",

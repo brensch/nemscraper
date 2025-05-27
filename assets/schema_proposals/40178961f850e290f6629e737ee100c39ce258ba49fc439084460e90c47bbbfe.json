@@ -1,0 +1,171 @@
+{
+  "month": "202503",
+  "schemas": [
+    {
+      "table": "BIDS_BIDDAYOFFER",
+      "month": "202503",
+      "columns": [
+        {
+          "name": "DUID",
+          "ty": "utf8",
+          "format": null
+        },
+        {
+          "name": "BIDTYPE",
+          "ty": "CHAR(9)",
+          "format": null
+        },
+        {
+          "name": "SETTLEMENTDATE",
+          "ty": "DATE",
+          "format": "\"yyyy/mm/dd hh24:mi:ss\""
+        },
+        {
+          "name": "OFFERDATE",
+          "ty": "DATE",
+          "format": "\"yyyy/mm/dd hh24:mi:ss\""
+        },
+        {
+          "name": "VERSIONNO",
+          "ty": "FLOAT",
+          "format": "EXTERNAL"
+        },
+        {
+          "name": "PARTICIPANTID",
+          "ty": "utf8",
+          "format": null
+        },
+        {
+          "name": "DAILYENERGYCONSTRAINT",
+          "ty": "utf8",
+          "format": null
+        },
+        {
+          "name": "REBIDEXPLANATION",
+          "ty": "utf8",
+          "format": null
+        },
+        {
+          "name": "PRICEBAND1",
+          "ty": "FLOAT",
+          "format": "EXTERNAL"
+        },
+        {
+          "name": "PRICEBAND2",
+          "ty": "FLOAT",
+          "format": "EXTERNAL"
+        },
+        {
+          "name": "PRICEBAND3",
+          "ty": "FLOAT",
+          "format": "EXTERNAL"
+        },
+        {
+          "name": "PRICEBAND4",
+          "ty": "FLOAT",
+          "format": "EXTERNAL"
+        },
+        {
+          "name": "PRICEBAND5",
+          "ty": "FLOAT",
+          "format": "EXTERNAL"
+        },
+        {
+          "name": "PRICEBAND6",
+          "ty": "FLOAT",
+          "format": "EXTERNAL"
+        },
+        {
+          "name": "PRICEBAND7",
+          "ty": "FLOAT",
+          "format": "EXTERNAL"
+        },
+        {
+          "name": "PRICEBAND8",
+          "ty": "FLOAT",
+          "format": "EXTERNAL"
+        },
+        {
+          "name": "PRICEBAND9",
+          "ty": "FLOAT",
+          "format": "EXTERNAL"
+        },
+        {
+          "name": "PRICEBAND10",
+          "ty": "FLOAT",
+          "format": "EXTERNAL"
+        },
+        {
+          "name": "MINIMUMLOAD",
+          "ty": "utf8",
+          "format": null
+        },
+        {
+          "name": "T1",
+          "ty": "utf8",
+          "format": null
+        },
+        {
+          "name": "T2",
+          "ty": "utf8",
+          "format": null
+        },
+        {
+          "name": "T3",
+          "ty": "utf8",
+          "format": null
+        },
+        {
+          "name": "T4",
+          "ty": "utf8",
+          "format": null
+        },
+        {
+          "name": "NORMALSTATUS",
+          "ty": "utf8",
+          "format": null
+        },
+        {
+          "name": "LASTCHANGED",
+          "ty": "DATE",
+          "format": "\"yyyy/mm/dd hh24:mi:ss\""
+        },
+        {
+          "name": "ENTRYTYPE",
+          "ty": "CHAR(5)",
+          "format": null
+        },
+        {
+          "name": "REBID_EVENT_TIME",
+          "ty": "CHAR(8)",
+          "format": null
+        },
+        {
+          "name": "REBID_AWARE_TIME",
+          "ty": "CHAR(8)",
+          "format": null
+        },
+        {
+          "name": "REBID_DECISION_TIME",
+          "ty": "CHAR(8)",
+          "format": null
+        },
+        {
+          "name": "REBID_CATEGORY",
+          "ty": "CHAR(1)",
+          "format": null
+        },
+        {
+          "name": "REFERENCE_ID",
+          "ty": "utf8",
+          "format": null
+        },
+        {
+          "name": "DIRECTION",
+          "ty": "utf8",
+          "format": null
+        }
+      ]
+    }
+  ]
+}

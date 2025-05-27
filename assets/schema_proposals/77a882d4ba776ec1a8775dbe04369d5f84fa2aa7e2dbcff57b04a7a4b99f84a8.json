@@ -1,0 +1,146 @@
+{
+  "month": "202503",
+  "schemas": [
+    {
+      "table": "BIDS_BIDOFFERPERIOD_SPARSE",
+      "month": "202503",
+      "columns": [
+        {
+          "name": "DUID",
+          "ty": "CHAR(6)",
+          "format": null
+        },
+        {
+          "name": "BIDTYPE",
+          "ty": "CHAR(9)",
+          "format": null
+        },
+        {
+          "name": "TRADINGDATE",
+          "ty": "DATE",
+          "format": "\"yyyy/mm/dd hh24:mi:ss\""
+        },
+        {
+          "name": "OFFERDATETIME",
+          "ty": "DATE",
+          "format": "\"yyyy/mm/dd hh24:mi:ss\""
+        },
+        {
+          "name": "PERIODID",
+          "ty": "FLOAT",
+          "format": "EXTERNAL"
+        },
+        {
+          "name": "PERIODIDTO",
+          "ty": "FLOAT",
+          "format": "EXTERNAL"
+        },
+        {
+          "name": "MAXAVAIL",
+          "ty": "FLOAT",
+          "format": "EXTERNAL"
+        },
+        {
+          "name": "FIXEDLOAD",
+          "ty": "utf8",
+          "format": null
+        },
+        {
+          "name": "RAMPUPRATE",
+          "ty": "utf8",
+          "format": null
+        },
+        {
+          "name": "RAMPDOWNRATE",
+          "ty": "utf8",
+          "format": null
+        },
+        {
+          "name": "ENABLEMENTMIN",
+          "ty": "FLOAT",
+          "format": "EXTERNAL"
+        },
+        {
+          "name": "ENABLEMENTMAX",
+          "ty": "FLOAT",
+          "format": "EXTERNAL"
+        },
+        {
+          "name": "LOWBREAKPOINT",
+          "ty": "FLOAT",
+          "format": "EXTERNAL"
+        },
+        {
+          "name": "HIGHBREAKPOINT",
+          "ty": "FLOAT",
+          "format": "EXTERNAL"
+        },
+        {
+          "name": "BANDAVAIL1",
+          "ty": "FLOAT",
+          "format": "EXTERNAL"
+        },
+        {
+          "name": "BANDAVAIL2",
+          "ty": "FLOAT",
+          "format": "EXTERNAL"
+        },
+        {
+          "name": "BANDAVAIL3",
+          "ty": "FLOAT",
+          "format": "EXTERNAL"
+        },
+        {
+          "name": "BANDAVAIL4",
+          "ty": "FLOAT",
+          "format": "EXTERNAL"
+        },
+        {
+          "name": "BANDAVAIL5",
+          "ty": "FLOAT",
+          "format": "EXTERNAL"
+        },
+        {
+          "name": "BANDAVAIL6",
+          "ty": "FLOAT",
+          "format": "EXTERNAL"
+        },
+        {
+          "name": "BANDAVAIL7",
+          "ty": "FLOAT",
+          "format": "EXTERNAL"
+        },
+        {
+          "name": "BANDAVAIL8",
+          "ty": "FLOAT",
+          "format": "EXTERNAL"
+        },
+        {
+          "name": "BANDAVAIL9",
+          "ty": "FLOAT",
+          "format": "EXTERNAL"
+        },
+        {
+          "name": "BANDAVAIL10",
+          "ty": "FLOAT",
+          "format": "EXTERNAL"
+        },
+        {
+          "name": "PASAAVAILABILITY",
+          "ty": "utf8",
+          "format": null
+        },
+        {
+          "name": "DIRECTION",
+          "ty": "CHAR(13)",
+          "format": null
+        },
+        {
+          "name": "ENERGYLIMIT",
+          "ty": "utf8",
+          "format": null
+        }
+      ]
+    }
+  ]
+}

@@ -3,12 +3,14 @@ use crate::process::chunk::chunk_and_write_segment;
 use crate::schema::evolution::derive_types;
 use crate::schema::types::{calculate_fields_hash, CtlSchema, MonthSchema};
 use crate::schema::{build_arrow_schema, find_column_types};
+use anyhow::Context;
 use anyhow::Result;
 use arrow::datatypes::Schema as ArrowSchema;
+use csv::ReaderBuilder;
 use num_cpus;
 use rayon::prelude::*;
 use serde_json;
-use std::io::Read;
+use std::io::{Cursor, Read};
 use std::{
     collections::{HashMap, HashSet},
     fs,
@@ -116,12 +118,19 @@ pub fn split_zip_to_parquet<P: AsRef<Path>, Q: AsRef<Path>, R: AsRef<Path>>(
                     Ok(c) => c,
                     Err(e) => {
                         warn!(table=%table,month=%date,error=%e,"lookup failed, deriving types");
-                        let sample_rows: Vec<Vec<String>> = text[ds..es]
-                            .lines()
-                            .skip(1)
-                            .map(|l| l.split(',').skip(4).map(str::to_string).collect())
-                            .take(1000)
-                            .collect();
+                        let mut rdr = ReaderBuilder::new()
+                            .has_headers(false)
+                            .from_reader(Cursor::new(&text[ds..es]));
+
+                        // Collect up to 1_000 sample rows, skipping the control columns:
+                        let mut sample_rows: Vec<Vec<String>> = Vec::with_capacity(1000);
+                        for result in rdr.records().skip(1).take(1000) {
+                            let record = result.context("parsing CSV record for derive_types")?;
+                            // Skip the first 4 columns (C,I metadata) then collect the rest:
+                            let row: Vec<String> =
+                                record.iter().skip(4).map(|s| s.to_string()).collect();
+                            sample_rows.push(row);
+                        }
                         let proposal_cols = derive_types(&table, &headers, &sample_rows)?;
 
                         // wrap in MonthSchema/CtlSchema

@@ -1,9 +1,9 @@
 {
-  "month": "202402",
+  "month": "202403",
   "schemas": [
     {
       "table": "SETTLEMENTS_INTRAREGIONRESIDUES",
-      "month": "202402",
+      "month": "202403",
       "columns": [
         {
           "name": "SETTLEMENTDATE",

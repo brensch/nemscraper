@@ -9,7 +9,7 @@ use std::{
     fs,
     path::Path,
 };
-use tracing::{debug, warn};
+use tracing::{debug, error, warn};
 
 use super::types::{Column, MonthSchema};
 
@@ -123,15 +123,26 @@ pub fn derive_types(
 
     // 2) Walk rows
     for row in rows.iter().take(1_000) {
+        // Guard against rows with too many values
+        if row.len() > header_names.len() {
+            error!(
+                "derive_types: row has {} values but header has {} names, skipping row",
+                row.len(),
+                header_names.len()
+            );
+            error!("Headers: {:?}", header_names);
+            error!("Offending row: {:?}", row);
+            continue;
+        }
+
         for (i, cell) in row.iter().enumerate() {
             let v = cell.trim();
             if v.is_empty() {
                 continue;
             }
 
-            // Skip if we've already marked inconsistent and seen > 1 sample
+            // Skip if we've already marked inconsistent for this column
             if inconsistent[i] {
-                // Still count up to 1 000 rows, but no further checks needed
                 examples_scanned[i] += 1;
                 continue;
             }
@@ -141,12 +152,11 @@ pub fn derive_types(
 
             match &seen[i] {
                 None => {
-                    // first non‐empty sample for this column
+                    // first non-empty sample for this column
                     seen[i] = Some(inferred.clone());
                 }
                 Some(prev) => {
                     if *prev != inferred {
-                        // mismatch! mark inconsistent
                         debug!(
                             "derive_types: column `{}` in table `{}` has conflicting types: {:?} vs {:?}",
                             header_names[i], table_name, prev, inferred
@@ -158,8 +168,6 @@ pub fn derive_types(
 
             examples_scanned[i] += 1;
         }
-        // if every column has at least one sample *and* is either consistent or flagged,
-        // we could stop early; but here we scan the full 1 000 rows to be thorough
     }
 
     // 3) Build result columns
@@ -224,7 +232,6 @@ mod tests {
     use super::*;
     use anyhow::Result;
     use std::path::Path;
-    
 
     /// Manual schema existence check:
     /// Reads JSON schema files from a real directory and prompts for a table name.

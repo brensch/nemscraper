@@ -14,11 +14,13 @@ use parquet::arrow::ArrowWriter;
 use parquet::basic::{BrotliLevel, Compression};
 use parquet::file::properties::WriterProperties;
 use rayon::prelude::*;
+use std::panic;
 use std::{fs::File, path::Path, sync::Arc};
-use tracing::{debug, info};
+use tracing::{debug, error, info};
 
 /// Split a single CSV segment into row-chunks and write each as its own Parquet file,
 /// converting CTL-style DATE columns ("yyyy/mm/dd hh24:mi:ss") (in UTC+10) into true UTC timestamps.
+
 pub fn chunk_and_write_segment(
     table_name: &str,
     schema_id: &str,
@@ -34,109 +36,127 @@ pub fn chunk_and_write_segment(
 
     let compression = Compression::BROTLI(BrotliLevel::try_new(5).unwrap());
 
-    // parallel over chunks
     data_lines
         .par_chunks(chunk_size)
         .enumerate()
-        .for_each(|(chunk_idx, _chunk)| {
-            // wrap the entire chunk in a closure so we can use `?`
-            let chunk_result: Result<(), anyhow::Error> = (|| {
-                // 1) build read_schema & write_schema (omitted for brevity same as before)…
-                // 1) Build read_schema: DATE columns forced to Utf8 so CSV reader doesn't parse them.
-                let read_schema: Arc<ArrowSchema> = {
-                    let mut fields = Vec::with_capacity(arrow_schema.fields().len() + 4);
-                    // metadata fields
-                    fields.push(Field::new("rec_type", DataType::Utf8, false));
-                    fields.push(Field::new("domain", DataType::Utf8, false));
-                    fields.push(Field::new("measure", DataType::Utf8, false));
-                    fields.push(Field::new("seq", DataType::Utf8, false));
-                    // data fields
-                    for (i, f) in arrow_schema.fields().iter().enumerate() {
-                        if headers[i].ty.eq_ignore_ascii_case("DATE")
-                            || headers[i].ty.starts_with("TIMESTAMP")
-                        {
-                            fields.push(Field::new(f.name(), DataType::Utf8, f.is_nullable()));
-                        } else {
-                            fields.push((**f).clone());
+        .for_each(|(chunk_idx, chunk_lines)| {
+            // Wrap the entire chunk-processing in a panic catcher
+            let result = panic::catch_unwind(|| {
+                // All existing logic in a closure that returns Result<()>:
+                (|| -> Result<(), anyhow::Error> {
+                    // 1) Build read_schema
+                    let read_schema: Arc<ArrowSchema> = {
+                        let mut fields = Vec::with_capacity(arrow_schema.fields().len() + 4);
+                        fields.push(Field::new("rec_type", DataType::Utf8, false));
+                        fields.push(Field::new("domain", DataType::Utf8, false));
+                        fields.push(Field::new("measure", DataType::Utf8, false));
+                        fields.push(Field::new("seq", DataType::Utf8, false));
+                        for (i, f) in arrow_schema.fields().iter().enumerate() {
+                            if headers[i].ty.eq_ignore_ascii_case("DATE")
+                                || headers[i].ty.starts_with("TIMESTAMP")
+                            {
+                                fields.push(Field::new(f.name(), DataType::Utf8, f.is_nullable()));
+                            } else {
+                                fields.push((**f).clone());
+                            }
                         }
-                    }
-                    Arc::new(ArrowSchema::new(fields))
-                };
+                        Arc::new(ArrowSchema::new(fields))
+                    };
 
-                // 2) Build write_schema for data columns only: DATE → Timestamp(Microsecond)
-                let write_schema: Arc<ArrowSchema> = {
-                    let mut fields = Vec::with_capacity(arrow_schema.fields().len());
-                    for (i, f) in arrow_schema.fields().iter().enumerate() {
-                        if headers[i].ty.eq_ignore_ascii_case("DATE")
-                            || headers[i].ty.starts_with("TIMESTAMP")
-                        {
-                            fields.push(Field::new(
-                                f.name(),
-                                DataType::Timestamp(TimeUnit::Microsecond, None),
-                                f.is_nullable(),
-                            ));
-                        } else {
-                            fields.push((**f).clone());
+                    // 2) Build write_schema
+                    let write_schema: Arc<ArrowSchema> = {
+                        let mut fields = Vec::with_capacity(arrow_schema.fields().len());
+                        for (i, f) in arrow_schema.fields().iter().enumerate() {
+                            if headers[i].ty.eq_ignore_ascii_case("DATE")
+                                || headers[i].ty.starts_with("TIMESTAMP")
+                            {
+                                fields.push(Field::new(
+                                    f.name(),
+                                    DataType::Timestamp(TimeUnit::Microsecond, None),
+                                    f.is_nullable(),
+                                ));
+                            } else {
+                                fields.push((**f).clone());
+                            }
                         }
+                        Arc::new(ArrowSchema::new(fields))
+                    };
+
+                    // 3) CSV reader
+                    let cursor = std::io::Cursor::new(data.as_bytes());
+                    let projection: Vec<usize> = (4..read_schema.fields().len()).collect();
+                    let mut reader = ReaderBuilder::new(read_schema.clone())
+                        .with_header(false)
+                        .with_projection(projection)
+                        .build(cursor)
+                        .context("creating CSV reader")?;
+
+                    // 4) Parquet writer
+                    let out_path = out_dir.join(format!(
+                        "{}—{}—chunk{}.parquet",
+                        table_name, schema_id, chunk_idx
+                    ));
+                    let file = File::create(&out_path)
+                        .with_context(|| format!("creating {:?}", out_path))?;
+                    let props = WriterProperties::builder()
+                        .set_compression(compression)
+                        .set_dictionary_enabled(true)
+                        .build();
+                    let mut writer = ArrowWriter::try_new(file, write_schema.clone(), Some(props))
+                        .context("opening Parquet writer")?;
+
+                    // 5) Write batches
+                    let mut batch_idx = 0;
+                    while let Some(batch) = reader
+                        .next()
+                        .transpose()
+                        .context("reading next CSV RecordBatch")?
+                    {
+                        batch_idx += 1;
+                        let converted = convert_date_columns(batch, &headers, &write_schema)
+                            .with_context(|| {
+                                format!("converting DATE columns in batch {}", batch_idx)
+                            })?;
+                        writer
+                            .write(&converted)
+                            .with_context(|| format!("writing batch {} to Parquet", batch_idx))?;
                     }
-                    Arc::new(ArrowSchema::new(fields))
-                };
 
-                // 2) open CSV reader projected to skip first 4 columns
-                let cursor = std::io::Cursor::new(data.as_bytes());
-                let projection: Vec<usize> = (4..read_schema.fields().len()).collect();
-                let mut reader = ReaderBuilder::new(read_schema.clone())
-                    .with_header(false)
-                    .with_projection(projection)
-                    .build(cursor)
-                    .context("creating CSV reader")?;
+                    // 6) Close
+                    writer.close().context("closing Parquet writer")?;
+                    debug!(
+                        table=%table_name,
+                        schema=%schema_id,
+                        chunk=chunk_idx,
+                        rows=chunk_lines.len(),
+                        "wrote rows"
+                    );
+                    Ok(())
+                })()
+            });
 
-                // 3) open Parquet writer
-                let out_path = out_dir.join(format!(
-                    "{}—{}—chunk{}.parquet",
-                    table_name, schema_id, chunk_idx
-                ));
-                let file =
-                    File::create(&out_path).with_context(|| format!("creating {:?}", out_path))?;
-                let props = WriterProperties::builder()
-                    .set_compression(compression)
-                    .set_dictionary_enabled(true)
-                    .build();
-                let mut writer = ArrowWriter::try_new(file, write_schema.clone(), Some(props))
-                    .context("opening Parquet writer")?;
-
-                // 4) process batches
-                let mut batch_idx = 0;
-                while let Some(batch) = reader
-                    .next()
-                    .transpose()
-                    .context("reading next CSV RecordBatch")?
-                {
-                    batch_idx += 1;
-                    let converted = convert_date_columns(batch, &headers, &write_schema)
-                        .with_context(|| {
-                            format!("converting DATE columns in batch {}", batch_idx)
-                        })?;
-                    writer
-                        .write(&converted)
-                        .with_context(|| format!("writing batch {} to Parquet", batch_idx))?;
+            match result {
+                Ok(Ok(())) => {
+                    // chunk succeeded
                 }
-
-                // 5) close writer
-                writer.close().context("closing Parquet writer")?;
-                debug!(
-                    table=%table_name,
-                    schema=%schema_id,
-                    chunk=chunk_idx,
-                    rows=_chunk.len(),
-                    "wrote rows"
-                );
-                Ok(())
-            })();
-
-            // if *any* of the above failed, we panic right here with a full error chain:
-            if let Err(e) = chunk_result {
-                panic!("chunk {} failed: {:?}", chunk_idx, e);
+                Ok(Err(e)) => {
+                    // known error path
+                    error!(table=%table_name, schema=%schema_id,
+                        chunk=%chunk_idx, "chunk failed: {:?}", e);
+                }
+                Err(panic_info) => {
+                    // panic occurred inside chunk logic (e.g., index out of bounds)
+                    error!(table=%table_name, schema=%schema_id,
+                        chunk=%chunk_idx, "internal panic: {:?}", panic_info);
+                    // Attempt to log the exact row causing the issue if possible
+                    // Here we assume the panic message includes the index; just log the entire chunk slice around the middle as fallback
+                    let mid = chunk_lines.len() / 2;
+                    let global_mid = chunk_idx * chunk_size + mid;
+                    if let Some(line) = chunk_lines.get(mid) {
+                        error!("Approximate offending row [{}]: {}", global_mid, line);
+                    }
+                    debug!(schema=?arrow_schema, "ArrowSchema at panic");
+                }
             }
         });
 

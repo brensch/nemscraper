@@ -1,9 +1,9 @@
 {
-  "month": "201904",
+  "month": "201903",
   "schemas": [
     {
       "table": "SETTLEMENTS_ANCILLARY_SUMMARY",
-      "month": "201904",
+      "month": "201903",
       "columns": [
         {
           "name": "SETTLEMENTDATE",

@@ -1,9 +1,9 @@
 {
-  "month": "202005",
+  "month": "201703",
   "schemas": [
     {
       "table": "TRADING_UNIT_SOLUTION",
-      "month": "202005",
+      "month": "201703",
       "columns": [
         {
           "name": "SETTLEMENTDATE",

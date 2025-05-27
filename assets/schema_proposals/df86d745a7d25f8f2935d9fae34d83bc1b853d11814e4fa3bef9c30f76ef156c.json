@@ -1,9 +1,9 @@
 {
-  "month": "202408",
+  "month": "202410",
   "schemas": [
     {
       "table": "DISPATCH_OFFERTRK",
-      "month": "202408",
+      "month": "202410",
       "columns": [
         {
           "name": "SETTLEMENTDATE",

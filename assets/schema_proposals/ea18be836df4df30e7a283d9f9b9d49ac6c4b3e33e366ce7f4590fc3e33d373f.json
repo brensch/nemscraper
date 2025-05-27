@@ -1,9 +1,9 @@
 {
-  "month": "202505",
+  "month": "202504",
   "schemas": [
     {
       "table": "SEVENDAYOUTLOOK_PEAK",
-      "month": "202505",
+      "month": "202504",
       "columns": [
         {
           "name": "REGIONID",
