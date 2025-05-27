@@ -1,0 +1,61 @@
+{
+  "month": "202503",
+  "schemas": [
+    {
+      "table": "DEMAND_INTERMITTENT_DS_RUN",
+      "month": "202503",
+      "columns": [
+        {
+          "name": "RUN_DATETIME",
+          "ty": "DATE",
+          "format": "\"yyyy/mm/dd hh24:mi:ss\""
+        },
+        {
+          "name": "DUID",
+          "ty": "utf8",
+          "format": null
+        },
+        {
+          "name": "ORIGIN",
+          "ty": "utf8",
+          "format": null
+        },
+        {
+          "name": "FORECAST_PRIORITY",
+          "ty": "FLOAT",
+          "format": "EXTERNAL"
+        },
+        {
+          "name": "OFFERDATETIME",
+          "ty": "DATE",
+          "format": "\"yyyy/mm/dd hh24:mi:ss\""
+        },
+        {
+          "name": "PARTICIPANT_TIMESTAMP",
+          "ty": "DATE",
+          "format": "\"yyyy/mm/dd hh24:mi:ss\""
+        },
+        {
+          "name": "SUPPRESSED_PARTICIPANT",
+          "ty": "FLOAT",
+          "format": "EXTERNAL"
+        },
+        {
+          "name": "SUPPRESSED_AEMO",
+          "ty": "FLOAT",
+          "format": "EXTERNAL"
+        },
+        {
+          "name": "TRANSACTION_ID",
+          "ty": "CHAR(36)",
+          "format": null
+        },
+        {
+          "name": "LASTCHANGED",
+          "ty": "DATE",
+          "format": "\"yyyy/mm/dd hh24:mi:ss\""
+        }
+      ]
+    }
+  ]
+}

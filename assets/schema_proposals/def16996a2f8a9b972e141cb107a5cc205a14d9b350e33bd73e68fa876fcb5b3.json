@@ -1,0 +1,96 @@
+{
+  "month": "202505",
+  "schemas": [
+    {
+      "table": "PREDISPATCH_FCAS_REQ_CONSTRAINT",
+      "month": "202505",
+      "columns": [
+        {
+          "name": "PREDISPATCHSEQNO",
+          "ty": "FLOAT",
+          "format": "EXTERNAL"
+        },
+        {
+          "name": "RUN_DATETIME",
+          "ty": "DATE",
+          "format": "\"yyyy/mm/dd hh24:mi:ss\""
+        },
+        {
+          "name": "RUNNO",
+          "ty": "FLOAT",
+          "format": "EXTERNAL"
+        },
+        {
+          "name": "INTERVAL_DATETIME",
+          "ty": "DATE",
+          "format": "\"yyyy/mm/dd hh24:mi:ss\""
+        },
+        {
+          "name": "CONSTRAINTID",
+          "ty": "utf8",
+          "format": null
+        },
+        {
+          "name": "REGIONID",
+          "ty": "utf8",
+          "format": null
+        },
+        {
+          "name": "BIDTYPE",
+          "ty": "utf8",
+          "format": null
+        },
+        {
+          "name": "LHS",
+          "ty": "FLOAT",
+          "format": "EXTERNAL"
+        },
+        {
+          "name": "RHS",
+          "ty": "FLOAT",
+          "format": "EXTERNAL"
+        },
+        {
+          "name": "MARGINALVALUE",
+          "ty": "FLOAT",
+          "format": "EXTERNAL"
+        },
+        {
+          "name": "RRP",
+          "ty": "FLOAT",
+          "format": "EXTERNAL"
+        },
+        {
+          "name": "REGIONAL_ENABLEMENT",
+          "ty": "FLOAT",
+          "format": "EXTERNAL"
+        },
+        {
+          "name": "CONSTRAINT_ENABLEMENT",
+          "ty": "FLOAT",
+          "format": "EXTERNAL"
+        },
+        {
+          "name": "REGION_BASE_COST",
+          "ty": "FLOAT",
+          "format": "EXTERNAL"
+        },
+        {
+          "name": "BASE_COST",
+          "ty": "FLOAT",
+          "format": "EXTERNAL"
+        },
+        {
+          "name": "ADJUSTED_COST",
+          "ty": "FLOAT",
+          "format": "EXTERNAL"
+        },
+        {
+          "name": "P_REGULATION",
+          "ty": "FLOAT",
+          "format": "EXTERNAL"
+        }
+      ]
+    }
+  ]
+}

@@ -1,0 +1,51 @@
+{
+  "month": "202505",
+  "schemas": [
+    {
+      "table": "PDCONS_",
+      "month": "202505",
+      "columns": [
+        {
+          "name": "PREDISPATCHSEQNO",
+          "ty": "DATE",
+          "format": "\"yyyy/mm/dd hh24:mi:ss\""
+        },
+        {
+          "name": "RUNNO",
+          "ty": "FLOAT",
+          "format": "EXTERNAL"
+        },
+        {
+          "name": "CONSTRAINTID",
+          "ty": "utf8",
+          "format": null
+        },
+        {
+          "name": "PERIODID",
+          "ty": "DATE",
+          "format": "\"yyyy/mm/dd hh24:mi:ss\""
+        },
+        {
+          "name": "RHS",
+          "ty": "FLOAT",
+          "format": "EXTERNAL"
+        },
+        {
+          "name": "MARGINALVALUE",
+          "ty": "FLOAT",
+          "format": "EXTERNAL"
+        },
+        {
+          "name": "VIOLATIONDEGREE",
+          "ty": "FLOAT",
+          "format": "EXTERNAL"
+        },
+        {
+          "name": "INTERVENTION",
+          "ty": "FLOAT",
+          "format": "EXTERNAL"
+        }
+      ]
+    }
+  ]
+}

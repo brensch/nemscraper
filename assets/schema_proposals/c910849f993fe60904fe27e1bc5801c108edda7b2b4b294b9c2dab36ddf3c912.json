@@ -1,0 +1,31 @@
+{
+  "month": "202504",
+  "schemas": [
+    {
+      "table": "METER_DATA_GEN_DUID",
+      "month": "202504",
+      "columns": [
+        {
+          "name": "INTERVAL_DATETIME",
+          "ty": "DATE",
+          "format": "\"yyyy/mm/dd hh24:mi:ss\""
+        },
+        {
+          "name": "DUID",
+          "ty": "utf8",
+          "format": null
+        },
+        {
+          "name": "MWH_READING",
+          "ty": "FLOAT",
+          "format": "EXTERNAL"
+        },
+        {
+          "name": "LASTCHANGED",
+          "ty": "DATE",
+          "format": "\"yyyy/mm/dd hh24:mi:ss\""
+        }
+      ]
+    }
+  ]
+}

@@ -1,0 +1,46 @@
+{
+  "month": "202505",
+  "schemas": [
+    {
+      "table": "BILLING_DIRECTION_CRA",
+      "month": "202505",
+      "columns": [
+        {
+          "name": "DIRECTION_ID",
+          "ty": "CHAR(14)",
+          "format": null
+        },
+        {
+          "name": "\"PARTICIPANT CATEGORY\"",
+          "ty": "CHAR(24)",
+          "format": null
+        },
+        {
+          "name": "NSW",
+          "ty": "FLOAT",
+          "format": "EXTERNAL"
+        },
+        {
+          "name": "QLD",
+          "ty": "FLOAT",
+          "format": "EXTERNAL"
+        },
+        {
+          "name": "SA",
+          "ty": "FLOAT",
+          "format": "EXTERNAL"
+        },
+        {
+          "name": "TAS",
+          "ty": "FLOAT",
+          "format": "EXTERNAL"
+        },
+        {
+          "name": "VIC",
+          "ty": "FLOAT",
+          "format": "EXTERNAL"
+        }
+      ]
+    }
+  ]
+}

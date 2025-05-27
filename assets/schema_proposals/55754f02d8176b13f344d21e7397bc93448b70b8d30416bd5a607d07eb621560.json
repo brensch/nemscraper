@@ -1,0 +1,41 @@
+{
+  "month": "202505",
+  "schemas": [
+    {
+      "table": "TINT_",
+      "month": "202505",
+      "columns": [
+        {
+          "name": "SETTLEMENTDATE",
+          "ty": "DATE",
+          "format": "\"yyyy/mm/dd hh24:mi:ss\""
+        },
+        {
+          "name": "RUNNO",
+          "ty": "FLOAT",
+          "format": "EXTERNAL"
+        },
+        {
+          "name": "INTERCONNECTORID",
+          "ty": "utf8",
+          "format": null
+        },
+        {
+          "name": "METEREDMWFLOW",
+          "ty": "FLOAT",
+          "format": "EXTERNAL"
+        },
+        {
+          "name": "MWFLOW",
+          "ty": "FLOAT",
+          "format": "EXTERNAL"
+        },
+        {
+          "name": "MWLOSSES",
+          "ty": "FLOAT",
+          "format": "EXTERNAL"
+        }
+      ]
+    }
+  ]
+}

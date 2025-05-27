@@ -1,0 +1,46 @@
+{
+  "month": "202505",
+  "schemas": [
+    {
+      "table": "DEMAND_INTERMITTENT_GEN_LIMIT_DAY",
+      "month": "202505",
+      "columns": [
+        {
+          "name": "DUID",
+          "ty": "utf8",
+          "format": null
+        },
+        {
+          "name": "TRADINGDATE",
+          "ty": "DATE",
+          "format": "\"yyyy/mm/dd hh24:mi:ss\""
+        },
+        {
+          "name": "OFFERDATETIME",
+          "ty": "DATE",
+          "format": "\"yyyy/mm/dd hh24:mi:ss\""
+        },
+        {
+          "name": "PARTICIPANTID",
+          "ty": "utf8",
+          "format": null
+        },
+        {
+          "name": "LASTCHANGED",
+          "ty": "DATE",
+          "format": "\"yyyy/mm/dd hh24:mi:ss\""
+        },
+        {
+          "name": "AUTHORISEDBYUSER",
+          "ty": "utf8",
+          "format": null
+        },
+        {
+          "name": "AUTHORISEDBYPARTICIPANTID",
+          "ty": "utf8",
+          "format": null
+        }
+      ]
+    }
+  ]
+}

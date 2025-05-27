@@ -1,0 +1,31 @@
+{
+  "month": "202504",
+  "schemas": [
+    {
+      "table": "MTPASA_REGIONAVAILTRK",
+      "month": "202504",
+      "columns": [
+        {
+          "name": "PUBLISH_DATETIME",
+          "ty": "utf8",
+          "format": null
+        },
+        {
+          "name": "STARTDATE",
+          "ty": "utf8",
+          "format": null
+        },
+        {
+          "name": "ENDDATE",
+          "ty": "utf8",
+          "format": null
+        },
+        {
+          "name": "LATEST_OFFER_DATETIME",
+          "ty": "utf8",
+          "format": null
+        }
+      ]
+    }
+  ]
+}

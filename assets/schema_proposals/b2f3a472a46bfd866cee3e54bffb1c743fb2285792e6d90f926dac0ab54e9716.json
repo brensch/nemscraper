@@ -1,0 +1,61 @@
+{
+  "month": "202505",
+  "schemas": [
+    {
+      "table": "DISPATCH_REGIONFCASREQUIREMENT",
+      "month": "202505",
+      "columns": [
+        {
+          "name": "SETTLEMENTDATE",
+          "ty": "DATE",
+          "format": "\"yyyy/mm/dd hh24:mi:ss\""
+        },
+        {
+          "name": "RUNNO",
+          "ty": "FLOAT",
+          "format": "EXTERNAL"
+        },
+        {
+          "name": "INTERVENTION",
+          "ty": "FLOAT",
+          "format": "EXTERNAL"
+        },
+        {
+          "name": "GENCONID",
+          "ty": "utf8",
+          "format": null
+        },
+        {
+          "name": "REGIONID",
+          "ty": "utf8",
+          "format": null
+        },
+        {
+          "name": "BIDTYPE",
+          "ty": "utf8",
+          "format": null
+        },
+        {
+          "name": "GENCONEFFECTIVEDATE",
+          "ty": "DATE",
+          "format": "\"yyyy/mm/dd hh24:mi:ss\""
+        },
+        {
+          "name": "GENCONVERSIONNO",
+          "ty": "FLOAT",
+          "format": "EXTERNAL"
+        },
+        {
+          "name": "MARGINALVALUE",
+          "ty": "FLOAT",
+          "format": "EXTERNAL"
+        },
+        {
+          "name": "LASTCHANGED",
+          "ty": "DATE",
+          "format": "\"yyyy/mm/dd hh24:mi:ss\""
+        }
+      ]
+    }
+  ]
+}

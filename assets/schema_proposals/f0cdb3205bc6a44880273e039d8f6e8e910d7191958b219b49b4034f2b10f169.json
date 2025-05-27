@@ -1,0 +1,91 @@
+{
+  "month": "202505",
+  "schemas": [
+    {
+      "table": "DINT_",
+      "month": "202505",
+      "columns": [
+        {
+          "name": "SETTLEMENTDATE",
+          "ty": "DATE",
+          "format": "\"yyyy/mm/dd hh24:mi:ss\""
+        },
+        {
+          "name": "RUNNO",
+          "ty": "FLOAT",
+          "format": "EXTERNAL"
+        },
+        {
+          "name": "INTERCONNECTORID",
+          "ty": "utf8",
+          "format": null
+        },
+        {
+          "name": "INTERVENTION",
+          "ty": "FLOAT",
+          "format": "EXTERNAL"
+        },
+        {
+          "name": "METEREDMWFLOW",
+          "ty": "FLOAT",
+          "format": "EXTERNAL"
+        },
+        {
+          "name": "MWFLOW",
+          "ty": "FLOAT",
+          "format": "EXTERNAL"
+        },
+        {
+          "name": "MWLOSSES",
+          "ty": "FLOAT",
+          "format": "EXTERNAL"
+        },
+        {
+          "name": "MARGINALVALUE",
+          "ty": "FLOAT",
+          "format": "EXTERNAL"
+        },
+        {
+          "name": "VIOLATIONDEGREE",
+          "ty": "FLOAT",
+          "format": "EXTERNAL"
+        },
+        {
+          "name": "IMPORTLIMIT",
+          "ty": "FLOAT",
+          "format": "EXTERNAL"
+        },
+        {
+          "name": "EXPORTLIMIT",
+          "ty": "FLOAT",
+          "format": "EXTERNAL"
+        },
+        {
+          "name": "MARGINALLOSS",
+          "ty": "FLOAT",
+          "format": "EXTERNAL"
+        },
+        {
+          "name": "EXPORTGENCONID",
+          "ty": "utf8",
+          "format": null
+        },
+        {
+          "name": "IMPORTGENCONID",
+          "ty": "utf8",
+          "format": null
+        },
+        {
+          "name": "FCASEXPORTLIMIT",
+          "ty": "FLOAT",
+          "format": "EXTERNAL"
+        },
+        {
+          "name": "FCASIMPORTLIMIT",
+          "ty": "FLOAT",
+          "format": "EXTERNAL"
+        }
+      ]
+    }
+  ]
+}

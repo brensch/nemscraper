@@ -1,0 +1,61 @@
+{
+  "month": "201707",
+  "schemas": [
+    {
+      "table": "BILLING_REGIONEXPORTS",
+      "month": "201707",
+      "columns": [
+        {
+          "name": "CONTRACTYEAR",
+          "ty": "FLOAT",
+          "format": "EXTERNAL"
+        },
+        {
+          "name": "WEEKNO",
+          "ty": "FLOAT",
+          "format": "EXTERNAL"
+        },
+        {
+          "name": "BILLRUNNO",
+          "ty": "FLOAT",
+          "format": "EXTERNAL"
+        },
+        {
+          "name": "REGIONID",
+          "ty": "utf8",
+          "format": null
+        },
+        {
+          "name": "EXPORTTO",
+          "ty": "utf8",
+          "format": null
+        },
+        {
+          "name": "ENERGY",
+          "ty": "FLOAT",
+          "format": "EXTERNAL"
+        },
+        {
+          "name": "VALUE",
+          "ty": "FLOAT",
+          "format": "EXTERNAL"
+        },
+        {
+          "name": "SURPLUSENERGY",
+          "ty": "FLOAT",
+          "format": "EXTERNAL"
+        },
+        {
+          "name": "SURPLUSVALUE",
+          "ty": "FLOAT",
+          "format": "EXTERNAL"
+        },
+        {
+          "name": "LASTCHANGED",
+          "ty": "DATE",
+          "format": "\"yyyy/mm/dd hh24:mi:ss\""
+        }
+      ]
+    }
+  ]
+}

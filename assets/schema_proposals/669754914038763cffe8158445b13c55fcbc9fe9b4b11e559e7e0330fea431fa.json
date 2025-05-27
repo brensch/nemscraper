@@ -1,0 +1,46 @@
+{
+  "month": "202504",
+  "schemas": [
+    {
+      "table": "DEMAND_INTERMITTENT_CLUSTER_AVAIL",
+      "month": "202504",
+      "columns": [
+        {
+          "name": "DUID",
+          "ty": "CHAR(8)",
+          "format": null
+        },
+        {
+          "name": "TRADINGDATE",
+          "ty": "DATE",
+          "format": "\"yyyy/mm/dd hh24:mi:ss\""
+        },
+        {
+          "name": "OFFERDATETIME",
+          "ty": "DATE",
+          "format": "\"yyyy/mm/dd hh24:mi:ss\""
+        },
+        {
+          "name": "CLUSTERID",
+          "ty": "CHAR(10)",
+          "format": null
+        },
+        {
+          "name": "PERIODID",
+          "ty": "FLOAT",
+          "format": "EXTERNAL"
+        },
+        {
+          "name": "ELEMENTS_UNAVAILABLE",
+          "ty": "FLOAT",
+          "format": "EXTERNAL"
+        },
+        {
+          "name": "ELEMENTS_AVAILABLE",
+          "ty": "FLOAT",
+          "format": "EXTERNAL"
+        }
+      ]
+    }
+  ]
+}

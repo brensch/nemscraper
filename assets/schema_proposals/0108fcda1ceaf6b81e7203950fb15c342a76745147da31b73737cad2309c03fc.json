@@ -1,0 +1,111 @@
+{
+  "month": "202505",
+  "schemas": [
+    {
+      "table": "PREDISPATCH_CASE_SOLUTION",
+      "month": "202505",
+      "columns": [
+        {
+          "name": "PREDISPATCHSEQNO",
+          "ty": "utf8",
+          "format": null
+        },
+        {
+          "name": "RUNNO",
+          "ty": "utf8",
+          "format": null
+        },
+        {
+          "name": "SOLUTIONSTATUS",
+          "ty": "utf8",
+          "format": null
+        },
+        {
+          "name": "SPDVERSION",
+          "ty": "utf8",
+          "format": null
+        },
+        {
+          "name": "NONPHYSICALLOSSES",
+          "ty": "utf8",
+          "format": null
+        },
+        {
+          "name": "TOTALOBJECTIVE",
+          "ty": "utf8",
+          "format": null
+        },
+        {
+          "name": "TOTALAREAGENVIOLATION",
+          "ty": "utf8",
+          "format": null
+        },
+        {
+          "name": "TOTALINTERCONNECTORVIOLATION",
+          "ty": "utf8",
+          "format": null
+        },
+        {
+          "name": "TOTALGENERICVIOLATION",
+          "ty": "utf8",
+          "format": null
+        },
+        {
+          "name": "TOTALRAMPRATEVIOLATION",
+          "ty": "utf8",
+          "format": null
+        },
+        {
+          "name": "TOTALUNITMWCAPACITYVIOLATION",
+          "ty": "utf8",
+          "format": null
+        },
+        {
+          "name": "TOTAL5MINVIOLATION",
+          "ty": "utf8",
+          "format": null
+        },
+        {
+          "name": "TOTALREGVIOLATION",
+          "ty": "utf8",
+          "format": null
+        },
+        {
+          "name": "TOTAL6SECVIOLATION",
+          "ty": "utf8",
+          "format": null
+        },
+        {
+          "name": "TOTAL60SECVIOLATION",
+          "ty": "utf8",
+          "format": null
+        },
+        {
+          "name": "TOTALASPROFILEVIOLATION",
+          "ty": "utf8",
+          "format": null
+        },
+        {
+          "name": "TOTALENERGYCONSTRVIOLATION",
+          "ty": "utf8",
+          "format": null
+        },
+        {
+          "name": "TOTALENERGYOFFERVIOLATION",
+          "ty": "utf8",
+          "format": null
+        },
+        {
+          "name": "LASTCHANGED",
+          "ty": "utf8",
+          "format": null
+        },
+        {
+          "name": "INTERVENTION",
+          "ty": "utf8",
+          "format": null
+        }
+      ]
+    }
+  ]
+}
