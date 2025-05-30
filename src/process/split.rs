@@ -1,23 +1,13 @@
-// src/process/split.rs
 use crate::process::chunk::chunk_and_write_segment;
-use crate::schema::build_arrow_schema;
-use crate::schema::derive_types;
 use crate::schema::store::SchemaStore;
-use anyhow::Context;
 use anyhow::Result;
 use arrow::datatypes::Schema as ArrowSchema;
-use csv::ReaderBuilder;
 use num_cpus;
 use rayon::prelude::*;
-use serde_json;
-use std::io::{Cursor, Read};
-use std::{
-    collections::{HashMap, HashSet},
-    fs,
-    fs::File,
-    path::Path,
-    sync::Arc,
-};
+use std::fs::File;
+use std::io::Read;
+use std::path::Path;
+use std::sync::Arc;
 use tracing::{info, instrument, warn};
 use zip::ZipArchive;
 
@@ -25,11 +15,12 @@ use zip::ZipArchive;
 /// using a pre-built lookup of column types per table, with a fallback
 /// to `derive_types` when lookup fails, emitting schema proposals.
 #[instrument(level = "info", skip(zip_path, out_dir, schema_store), fields(zip = %zip_path.as_ref().display()))]
-pub fn split_zip_to_parquet<P: AsRef<Path>, Q: AsRef<Path>, R: AsRef<Path>>(
+pub fn split_zip_to_parquet<P: AsRef<Path>, Q: AsRef<Path>>(
     zip_path: P,
     out_dir: Q,
-    schema_store: SchemaStore,
+    schema_store: Arc<SchemaStore>,
 ) -> Result<()> {
+    // configure Rayon
     rayon::ThreadPoolBuilder::new()
         .num_threads(num_cpus::get())
         .build_global()
@@ -37,6 +28,7 @@ pub fn split_zip_to_parquet<P: AsRef<Path>, Q: AsRef<Path>, R: AsRef<Path>>(
 
     info!("starting split_zip_to_parquet");
 
+    // open ZIP
     let file = File::open(&zip_path)?;
     let mut archive = ZipArchive::new(file)?;
 
@@ -47,75 +39,73 @@ pub fn split_zip_to_parquet<P: AsRef<Path>, Q: AsRef<Path>, R: AsRef<Path>>(
             continue;
         }
 
+        // read entire CSV into Arc<String>
         let mut buf = Vec::new();
         entry.read_to_end(&mut buf)?;
-        let text = Arc::new(String::from_utf8_lossy(&buf).to_string());
+        let text = Arc::new(String::from_utf8_lossy(&buf).into_owned());
+        let text_str: &str = &text;
 
-        let segments = {
-            let mut segs = Vec::new();
-            let mut pos = 0;
-            let mut header_start = 0;
-            let mut data_start = 0;
-            let mut current_table: Option<String> = None;
-            let mut seen_footer = false;
-            let mut date = String::new();
+        // identify segments by searching for "\nI," and "\nC,"
+        let mut pos = 0;
+        let mut current_table: Option<String> = None;
+        let mut header_start = 0;
+        let mut data_start = 0;
+        let mut seen_footer = false;
+        let mut date_str = String::new();
 
-            for chunk in text.split_inclusive('\n') {
-                if chunk.starts_with("C,") {
-                    if seen_footer {
-                        break;
-                    }
-                    let parts: Vec<&str> = chunk.trim_end_matches('\n').split(',').collect();
-                    date = parts[5].replace('/', "").chars().take(6).collect();
-                    seen_footer = true;
-                    pos += chunk.len();
-                    continue;
-                }
-                if chunk.starts_with("I,") {
-                    if let Some(table) = current_table.take() {
-                        segs.push((table, header_start, data_start, pos, date.clone()));
-                    }
-                    header_start = pos;
-                    let parts: Vec<&str> = chunk.trim_end_matches('\n').split(',').collect();
-                    let table_name = if parts[2].starts_with(parts[1]) {
-                        parts[2].to_string()
-                    } else {
-                        format!("{}_{}", parts[1], parts[2])
-                    };
-                    current_table = Some(table_name);
-                    data_start = pos + chunk.len();
-                }
-                pos += chunk.len();
-            }
-            if let Some(table) = current_table {
-                segs.push((table, header_start, data_start, pos, date));
-            }
-            segs
-        };
+        // 1) Find and strip off the first and last C‐lines.
+        //    We look for the first '\n' (end of metadata) and the last "\nC," (start of footer).
+        let first_data = text_str
+            .find('\n')
+            .map(|i| i + 1)
+            .expect("every CSV must have a metadata C‐line at top");
+        let footer_start = text_str
+            .rfind("\nC,")
+            .expect("every CSV must have a footer C‐line at bottom");
 
-        segments
-            .into_par_iter()
-            .try_for_each(|(table, hs, ds, es, date)| -> Result<()> {
-                let headers: Vec<String> = text[hs..ds]
-                    .lines()
-                    .next()
-                    .unwrap()
-                    .split(',')
-                    .skip(4)
-                    .map(String::from)
-                    .collect();
+        // This is the big middle blob containing only I‐ and D‐lines:
+        let core = &text_str[first_data..footer_start];
 
-                let arrow_schema = schema_store.get_schema(&table, &headers, &text, ds, es);
-                chunk_and_write_segment(
-                    &name,
-                    &table,
-                    &text[ds..es],
-                    cols.clone(),
-                    arrow_schema.clone(),
-                    out_dir,
-                );
-                Ok(())
-            })?;
+        // 2) Find the start‐of‐line offsets for every `I,` within that blob.
+        //    We always include 0 (the first I is at the very start of `core`),
+        //    then scan for every `\nI,` and record the index+1.
+        let mut header_starts = Vec::new();
+        header_starts.push(0);
+        for (rel, _) in core.match_indices("\nI,") {
+            header_starts.push(rel + 1);
+        }
+        header_starts.sort_unstable();
+
+        // 3) Build your segments by pairing each header_start with the next one (or end of blob).
+        let mut segments = Vec::with_capacity(header_starts.len());
+        for window in header_starts.windows(2) {
+            let hs = window[0];
+            let es = window[1];
+            segments.push((hs + first_data, es + first_data));
+        }
+        // last segment goes to the footer_start:
+        if let Some(&last_hs) = header_starts.last() {
+            segments.push((last_hs + first_data, footer_start));
+        }
+
+        let out_path = out_dir.as_ref().to_path_buf(); // grab a concrete PathBuf
+        let out_path = std::sync::Arc::new(out_path);
+
+        // process segments in parallel
+        segments.into_par_iter().for_each(|(start, end)| {
+            // build or retrieve ArrowSchema for this table
+            let arrow_schema = schema_store
+                .get_schema(&text_str, start, end)
+                .unwrap_or_else(|e| panic!("schema error: {:?}", e));
+
+            // chunk and write without further slicing of text
+            chunk_and_write_segment(
+                &name,
+                arrow_schema.clone(),
+                &text_str[start..end],
+                &*out_path,
+            );
+        });
     }
 
     Ok(())

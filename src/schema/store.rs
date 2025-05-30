@@ -9,7 +9,7 @@ use std::{
     path::{Path, PathBuf},
     sync::{Arc, RwLock},
 };
-use tracing::error;
+use tracing::{error, warn};
 
 use super::arrow::build_arrow_schema;
 use super::write_columns;
@@ -68,33 +68,54 @@ impl SchemaStore {
         })
     }
 
-    /// Return columns for `table_name`, deriving/persisting if any headers are missing.
-    /// Uses the `text[data_start..data_end]` slice to sample up to 1_000 rows without copying.
+    /// Return columns for the table found at `data_start`, deriving/persisting if needed.
+    /// The first row at `data_start` is parsed for headers and table name.
     pub fn get_columns(
         &self,
-        table_name: &str,
-        header_names: &[String],
         text: &str,
         data_start: usize,
         data_end: usize,
     ) -> Result<Vec<Column>> {
         const SAMPLE_LIMIT: usize = 1_000;
 
-        // 1) Acquire or insert the per-table lock
+        // ----- 1) Extract the very first line to derive `table_name` and header names -----
+        let slice = &text[data_start..data_end];
+        let header_end = slice.find('\n').unwrap_or(slice.len());
+        let header_line = &slice[..header_end];
+
+        // split on commas
+        let parts: Vec<&str> = header_line.split(',').collect();
+        let table_name: String = if parts.len() > 2 && parts[2].starts_with(parts[1]) {
+            // e.g. I,Table1,Table1,...
+            parts[2].to_string()
+        } else if parts.len() > 2 {
+            // e.g. I,Foo,Bar,... → "Foo_Bar"
+            format!("{}_{}", parts[1], parts[2])
+        } else {
+            warn!("malformed header: {}", header_line);
+            "unknown".into()
+        };
+
+        // now drop the header prefix (we’re going to skip it when sampling rows)
+        let data_slice = &slice[header_end.saturating_add(1)..];
+
+        // ----- 2) Acquire or insert the per‐table lock using `table_name` -----
         let table_lock = {
             let map_r = self.map.read().unwrap();
-            if let Some(lock) = map_r.get(table_name) {
+            if let Some(lock) = map_r.get(&table_name) {
                 Arc::clone(lock)
             } else {
                 drop(map_r);
                 let mut map_w = self.map.write().unwrap();
                 let lock = Arc::new(RwLock::new(Vec::new()));
-                map_w.insert(table_name.to_string(), Arc::clone(&lock));
+                map_w.insert(table_name.clone(), Arc::clone(&lock));
                 lock
             }
         };
 
-        // 2) Fast-path: return cached if all headers present
+        // ----- 3) Fast‐path: if we already have all these columns, return immediately -----
+        let header_names: Vec<String> =
+            header_line.split(',').skip(4).map(str::to_string).collect();
         {
             let cols_r = table_lock.read().unwrap();
             let present: HashSet<&String> = cols_r.iter().map(|c| &c.name).collect();
@@ -103,22 +124,21 @@ impl SchemaStore {
             }
         }
 
-        // 3) Write-lock: derive fresh columns only under table lock
+        // ----- 4) Write‐lock & double‐check -----
         let mut cols_w = table_lock.write().unwrap();
-        // Double-check after acquiring write lock
         let present: HashSet<&String> = cols_w.iter().map(|c| &c.name).collect();
         if header_names.iter().all(|n| present.contains(n)) {
             return Ok(cols_w.clone());
         }
 
-        // 4) Sample up to SAMPLE_LIMIT rows and call derive_types
+        // ----- 5) Sample up to SAMPLE_LIMIT rows to derive missing columns -----
         let mut sample_rows = Vec::with_capacity(SAMPLE_LIMIT);
-        let slice = &text[data_start..data_end];
         let mut rdr = ReaderBuilder::new()
             .has_headers(false)
-            .from_reader(Cursor::new(slice.as_bytes()));
+            .from_reader(Cursor::new(data_slice.as_bytes()));
 
-        // collect data rows
+        // skip what was the header row (we sliced it off already),
+        // then take SAMPLE_LIMIT
         for result in rdr.records().take(SAMPLE_LIMIT) {
             let record = result.context("parsing CSV record for derive_types")?;
             let row: Vec<String> = record
@@ -130,12 +150,21 @@ impl SchemaStore {
             sample_rows.push(row);
         }
 
-        let derived = derive::derive_types(table_name, header_names, &sample_rows)
+        // ----- 6) Derive types & persist -----
+        let derived = derive::derive_types(&table_name, &header_names, &sample_rows)
             .with_context(|| format!("deriving types for {}", table_name))?;
 
-        // Persist and update cache
-        write_columns(table_name, &self.dir, &derived)
+        if derived.is_empty() {
+            warn!(
+                "derive_types returned empty for {}, defaulting to utf8-only",
+                table_name
+            );
+        }
+
+        write_columns(&table_name, &self.dir, &derived)
             .with_context(|| format!("writing columns for {}", table_name))?;
+
+        // ----- 7) Cache & return -----
         *cols_w = derived.clone();
         Ok(derived)
     }
@@ -143,13 +172,11 @@ impl SchemaStore {
     /// Return an ArrowSchema for `table_name`, building from columns.
     pub fn get_schema(
         &self,
-        table_name: &str,
-        header_names: &[String],
         text: &str,
         data_start: usize,
         data_end: usize,
     ) -> Result<Arc<ArrowSchema>> {
-        let cols = self.get_columns(table_name, header_names, text, data_start, data_end)?;
+        let cols = self.get_columns(text, data_start, data_end)?;
         Ok(build_arrow_schema(&cols))
     }
 }

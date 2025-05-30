@@ -1,8 +1,5 @@
 use anyhow::Result;
-use nemscraper::{
-    fetch, process,
-    schema::{self, extract_column_types},
-};
+use nemscraper::{fetch, process, schema};
 use reqwest::Client;
 use std::{collections::HashSet, ffi::OsStr, fs, path::PathBuf, sync::Arc, time::Duration};
 use tokio::{
@@ -55,7 +52,8 @@ async fn main() -> Result<()> {
     info!("initial schema fetch → {}", schemas_dir.display());
     // schema::fetch_all(&client, &schemas_dir).await?;
     // let dirs = vec![&schemas_dir, &schema_proposals];
-    let lookup = Arc::new(Mutex::new(extract_column_types(dirs)?));
+    // let lookup = Arc::new(Mutex::new(extract_column_types(dirs)?));
+    let schema_store = Arc::new(schema::SchemaStore::new(&schemas_dir)?);
 
     // ─── 4) channels ──────────────────────────────────────────────────
     let (processor_tx, mut processor_rx) =
@@ -142,12 +140,10 @@ async fn main() -> Result<()> {
 
     // ─── 6) scheduler: periodic fetch → queue → process ─────────────
     {
-        let lookup = lookup.clone();
         let url_tx = url_tx.clone();
         let history = history.clone();
         let client = client.clone();
         let schemas_dir = schemas_dir.clone();
-        let schema_proposals = schema_proposals.clone();
         let zips_dir = zips_dir.clone();
         let failed_dir = failed_dir.clone();
         let processor_tx = processor_tx.clone();
@@ -158,13 +154,6 @@ async fn main() -> Result<()> {
             loop {
                 if let Err(e) = async {
                     info!("scheduler tick");
-
-                    // ─── a) refresh schemas ─────────────────────────
-                    info!("fetch schemas → {}", schemas_dir.display());
-                    schema::fetch_all(&client, &schemas_dir).await?;
-                    let dirs = vec![&schemas_dir, &schema_proposals];
-                    let new_map = extract_column_types(dirs)?;
-                    *lookup.lock().await = new_map;
 
                     // ─── b) re-enqueue failed zips ───────────────────
                     for entry in fs::read_dir(&failed_dir)? {
@@ -241,23 +230,16 @@ async fn main() -> Result<()> {
                 }
                 info!("processing {}", name);
 
-                let lookup_map = lookup.lock().await.clone();
                 let temp_out = tmp_dir.clone();
                 let split_temp_out = tmp_dir.clone();
                 let final_out = parquet_dir.clone();
                 let history = history.clone();
                 let split_path = zip_path.clone();
-                let schema_proposals = schema_proposals.clone();
 
                 // split in blocking thread
+                let schema_store = Arc::clone(&schema_store);
                 let split_res = task::spawn_blocking(move || {
-                    let arc = Arc::new(lookup_map);
-                    process::split::split_zip_to_parquet(
-                        &split_path,
-                        &split_temp_out,
-                        arc,
-                        &schema_proposals,
-                    )
+                    process::split::split_zip_to_parquet(&split_path, &split_temp_out, schema_store)
                 })
                 .await?;
 
