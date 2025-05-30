@@ -45,23 +45,21 @@ pub fn split_zip_to_parquet<P: AsRef<Path>, Q: AsRef<Path>>(
         let text = Arc::new(String::from_utf8_lossy(&buf).into_owned());
         let text_str: &str = &text;
 
-        // identify segments by searching for "\nI," and "\nC,"
-        let mut pos = 0;
-        let mut current_table: Option<String> = None;
-        let mut header_start = 0;
-        let mut data_start = 0;
-        let mut seen_footer = false;
-        let mut date_str = String::new();
-
         // 1) Find and strip off the first and last C‐lines.
         //    We look for the first '\n' (end of metadata) and the last "\nC," (start of footer).
-        let first_data = text_str
-            .find('\n')
-            .map(|i| i + 1)
-            .expect("every CSV must have a metadata C‐line at top");
-        let footer_start = text_str
-            .rfind("\nC,")
-            .expect("every CSV must have a footer C‐line at bottom");
+        let first_data = text_str.find('\n').map(|i| i + 1).unwrap_or_else(|| {
+            panic!(
+                "Error in {}: every CSV must have a metadata C-line at the top",
+                zip_path.as_ref().display()
+            )
+        });
+
+        let footer_start = text_str.rfind("\nC,").unwrap_or_else(|| {
+            panic!(
+                "Error in {}: every CSV must have a footer C-line at the bottom",
+                zip_path.as_ref().display()
+            )
+        });
 
         // This is the big middle blob containing only I‐ and D‐lines:
         let core = &text_str[first_data..footer_start];

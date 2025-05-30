@@ -56,9 +56,10 @@ pub fn chunk_and_write_segment(
     // 3) CSV reader over entire blob, with batch_size for chunking
     let cursor = Cursor::new(data.as_bytes());
     let csv_reader = ReaderBuilder::new(read_schema.clone())
-        .with_header(false)
+        .with_header(true)
         .with_batch_size(chunk_size)
         .with_projection(projection) // skip first 4 fields
+        .with_
         .build(cursor)
         .context("creating CSV reader")
         .unwrap(); // or handle error gracefully

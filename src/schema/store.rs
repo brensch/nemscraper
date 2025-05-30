@@ -113,14 +113,25 @@ impl SchemaStore {
             }
         };
 
-        // ----- 3) Fast‐path: if we already have all these columns, return immediately -----
+        // ----- 3) Fast‐path: if we already have all these columns, return immediately in header order -----
         let header_names: Vec<String> =
             header_line.split(',').skip(4).map(str::to_string).collect();
         {
             let cols_r = table_lock.read().unwrap();
             let present: HashSet<&String> = cols_r.iter().map(|c| &c.name).collect();
             if header_names.iter().all(|n| present.contains(n)) {
-                return Ok(cols_r.clone());
+                // Reorder to match incoming headers
+                let ordered: Vec<Column> = header_names
+                    .iter()
+                    .map(|name| {
+                        cols_r
+                            .iter()
+                            .find(|c| &c.name == name)
+                            .expect("we just checked contains; qed")
+                            .clone()
+                    })
+                    .collect();
+                return Ok(ordered);
             }
         }
 

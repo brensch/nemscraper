@@ -143,7 +143,6 @@ async fn main() -> Result<()> {
         let url_tx = url_tx.clone();
         let history = history.clone();
         let client = client.clone();
-        let schemas_dir = schemas_dir.clone();
         let zips_dir = zips_dir.clone();
         let failed_dir = failed_dir.clone();
         let processor_tx = processor_tx.clone();

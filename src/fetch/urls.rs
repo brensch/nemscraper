@@ -21,7 +21,7 @@ static CURRENT_FEED_URLS: &[&str] = &[
     // "https://nemweb.com.au/Reports/Current/Ancillary_Services_Payments/", // - csv only
     "https://nemweb.com.au/Reports/Current/Bidmove_Complete/",
     "https://nemweb.com.au/Reports/Current/Billing/",
-    "https://nemweb.com.au/Reports/Current/Causer_Pays/",
+    // "https://nemweb.com.au/Reports/Current/Causer_Pays/", // - non cid format. unfortunate.
     // "https://nemweb.com.au/Reports/Current/Causer_Pays_Elements/", // - csv only, needed though for translations
     "https://nemweb.com.au/Reports/Current/Causer_Pays_Scada/",
     // "https://nemweb.com.au/Reports/Current/CDEII/", // element type seemingly
