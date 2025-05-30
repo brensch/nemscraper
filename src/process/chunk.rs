@@ -59,7 +59,6 @@ pub fn chunk_and_write_segment(
         .with_header(true)
         .with_batch_size(chunk_size)
         .with_projection(projection) // skip first 4 fields
-        .with_
         .build(cursor)
         .context("creating CSV reader")
         .unwrap(); // or handle error gracefully
