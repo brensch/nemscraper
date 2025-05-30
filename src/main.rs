@@ -4,14 +4,7 @@ use nemscraper::{
     schema::{self, extract_column_types},
 };
 use reqwest::Client;
-use std::{
-    collections::HashSet,
-    ffi::OsStr,
-    fs,
-    path::PathBuf,
-    sync::Arc,
-    time::Duration,
-};
+use std::{collections::HashSet, ffi::OsStr, fs, path::PathBuf, sync::Arc, time::Duration};
 use tokio::{
     sync::{mpsc, Mutex},
     task,
@@ -38,7 +31,7 @@ async fn main() -> Result<()> {
     let client = Client::new();
     let assets = PathBuf::from("assets");
     let schemas_dir = assets.join("schemas");
-    let schema_proposals = assets.join("schema_proposals");
+    // let schema_proposals = assets.join("schema_proposals");
     let zips_dir = assets.join("zips");
     let parquet_dir = assets.join("parquet");
     let tmp_dir = assets.join("parquet_tmp");
@@ -52,7 +45,7 @@ async fn main() -> Result<()> {
         &tmp_dir,
         &history_dir,
         &failed_dir,
-        &schema_proposals,
+        // &schema_proposals,
     ] {
         fs::create_dir_all(d)?;
     }
@@ -60,8 +53,8 @@ async fn main() -> Result<()> {
     // ─── 3) history & lookup store ───────────────────────────────────
     let history = Arc::new(History::new(&history_dir)?);
     info!("initial schema fetch → {}", schemas_dir.display());
-    schema::fetch_all(&client, &schemas_dir).await?;
-    let dirs = vec![&schemas_dir, &schema_proposals];
+    // schema::fetch_all(&client, &schemas_dir).await?;
+    // let dirs = vec![&schemas_dir, &schema_proposals];
     let lookup = Arc::new(Mutex::new(extract_column_types(dirs)?));
 
     // ─── 4) channels ──────────────────────────────────────────────────
