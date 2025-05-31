@@ -99,7 +99,7 @@ pub fn chunk_and_write_segment(
                     };
 
                     // Build the Parquet filename using the derived table_name
-                    let out_path = out_dir.join(format!("{}--{}--chunk{}.parquet",file_name,    table_name, batch_idx));
+                    let out_path = out_dir.join(format!("{}--{}--chunk{}.parquet", file_name, table_name, batch_idx));
                     let temp_path = out_path.with_extension("tmp");
 
                     // Write the file to a temporary path first
