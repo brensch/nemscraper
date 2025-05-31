@@ -7,13 +7,13 @@ use std::fs::File;
 use std::io::Read;
 use std::path::Path;
 use std::sync::Arc;
-use tracing::{info, instrument, warn};
+use tracing::{instrument, warn};
 use zip::ZipArchive;
 
 /// Splits each CSV file in the ZIP into chunks and writes Parquet files,
 /// using a pre-built lookup of column types per table, with a fallback
 /// to `derive_types` when lookup fails, emitting schema proposals.
-#[instrument(level = "info", skip(zip_path, out_dir, schema_store), fields(zip = %zip_path.as_ref().display()))]
+#[instrument(level = "debug", skip(zip_path, out_dir, schema_store), fields(zip = %zip_path.as_ref().display()))]
 pub fn split_zip_to_parquet<P: AsRef<Path>, Q: AsRef<Path>>(
     zip_path: P,
     out_dir: Q,
@@ -24,8 +24,6 @@ pub fn split_zip_to_parquet<P: AsRef<Path>, Q: AsRef<Path>>(
         .num_threads(num_cpus::get())
         .build_global()
         .ok();
-
-    info!("starting split_zip_to_parquet");
 
     // open ZIP
     let file = File::open(&zip_path)?;
@@ -47,17 +45,19 @@ pub fn split_zip_to_parquet<P: AsRef<Path>, Q: AsRef<Path>>(
         // 1) Find and strip off the first and last C‐lines.
         //    We look for the first '\n' (end of metadata) and the last "\nC," (start of footer).
         let first_data = text_str.find('\n').map(|i| i + 1).unwrap_or_else(|| {
-            panic!(
+            warn!(
                 "Error in {}: every CSV must have a metadata C-line at the top",
                 zip_path.as_ref().display()
-            )
+            );
+            0
         });
 
         let footer_start = text_str.rfind("\nC,").unwrap_or_else(|| {
-            panic!(
+            warn!(
                 "Error in {}: every CSV must have a footer C-line at the bottom",
                 zip_path.as_ref().display()
-            )
+            );
+            text_str.len()
         });
 
         // This is the big middle blob containing only I‐ and D‐lines:

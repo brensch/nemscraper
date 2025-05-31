@@ -39,10 +39,7 @@ async fn main() -> Result<()> {
     // ─── 3) history & lookup store ───────────────────────────────────
     // Now History only holds a single in-memory HashSet<String> of “seen” filenames.
     let history = Arc::new(History::new(&history_dir)?);
-
     info!("initial schema fetch → {}", schemas_dir.display());
-    // schema::fetch_all(&client, &schemas_dir).await?;
-    // let lookup = Arc::new(Mutex::new(extract_column_types(vec![&schemas_dir])?));
     let schema_store = Arc::new(schema::SchemaStore::new(&schemas_dir)?);
 
     // ─── 4) channels ──────────────────────────────────────────────────
@@ -69,7 +66,7 @@ async fn main() -> Result<()> {
 
                 // If this ZIP has already been seen (downloaded or processed), skip.
                 if history.get(&name, &history::State::Downloaded) {
-                    info!(
+                    debug!(
                         name = %name,
                         "already in history (downloaded/processed), skipping download of {}",
                         url
@@ -189,7 +186,7 @@ async fn main() -> Result<()> {
                     debug!(name = %name, "already seen, skipping processing of {}", name);
                     continue;
                 }
-                info!("processing {}", name);
+                debug!(file_name = name, "processing");
 
                 // We spawn the blocking split function on a separate thread:
                 let out_dir = parquet_dir.clone();
@@ -207,10 +204,12 @@ async fn main() -> Result<()> {
                     continue;
                 }
 
-                // Mark as “seen” (processed)
+                // Mark as seen (processed)
                 if let Err(e) = history_clone.add(&name, history::State::Processed) {
                     error!("history.add (processed) failed for {}: {}", name, e);
                 }
+
+                info!(file_name = name, "processing completed");
             }
             Err((url, _)) => {
                 error!("upstream download error for URL {}", url);
