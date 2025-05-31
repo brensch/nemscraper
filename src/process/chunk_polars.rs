@@ -1,8 +1,12 @@
 use polars::prelude::*;
 use std::borrow::Cow;
 use std::error::Error;
+use std::fs;
 use std::io::Cursor;
 use std::path::Path;
+
+// Import PlSmallStr so we can annotate the closure parameter.
+use polars::prelude::PlSmallStr;
 
 /// Reads `df` (the full DataFrame), examines each *string* column’s first‐row value,
 /// and does two things in this order:
@@ -44,7 +48,20 @@ fn check_first_row_trim(df: &DataFrame) -> PolarsResult<bool> {
 
                 let old_dtype = column_ref.dtype();
                 if old_dtype != &new_dtype {
+                    println!(
+                        "Column '{}' first‐row WOULD change type: \
+                         {:?} (orig=\"{}\") → {:?} (trimmed=\"{}\")",
+                        col_name, old_dtype, orig_val, new_dtype, trimmed
+                    );
                     any_type_change = true;
+                }
+
+                // Also print if the trimmed text changed compared to orig_val:
+                if trimmed != orig_val {
+                    println!(
+                        "  (and the trimmed text itself changed: \"{}\" → \"{}\")",
+                        orig_val, trimmed
+                    );
                 }
             }
         }
@@ -54,41 +71,70 @@ fn check_first_row_trim(df: &DataFrame) -> PolarsResult<bool> {
 }
 
 /// Example function:
-/// 1) Reads CSV normally via Polars (using a CsvReadOptions object).
-/// 2) Calls `check_first_row_trim`. If it returns `true`, we:
-///    a) Print a summary line.
-///    b) For *each* string column whose first‐row would change type, we apply
-///       “trim+strip‐quotes” to **every** cell in that column, cast it to the new
-///       dtype (Int64 or Float64), then replace it in the DataFrame in place.
-/// 3) Write the (possibly modified) DataFrame out to Parquet.
+/// 1) Reads CSV normally via Polars (using a CsvReadOptions object) into a DataFrame.
+/// 2) Extracts the 2nd, 3rd, and 4th column names from `df.get_column_names()` (indices 1,2,3),
+///    trims each name, concatenates them with underscores as a prefix for filenames.
+///    If there are fewer than 4 columns, it falls back to using just `file_name`.
+/// 3) Calls `check_first_row_trim`. If it returns `true`, transforms affected columns in place.
+/// 4) Writes the (possibly modified) DataFrame out to `<prefix>_<file_name>.parquet.tmp`,
+///    then renames it to `<prefix>_<file_name>.parquet`.
 pub fn csv_to_parquet(file_name: &str, data: &str, out_dir: &Path) -> Result<(), Box<dyn Error>> {
-    // ─── 1) Wrap CSV text in a Cursor ─────────────────────────────────────────────
+    // ─── 1) Read into a DataFrame so we know Polars‐inferred column names ───────────
     let mut cursor = Cursor::new(data.as_bytes());
+    let options = CsvReadOptions::default()
+        .with_has_header(true)
+        .with_infer_schema_length(Some(100000));
+    let mut df: DataFrame = CsvReader::new(&mut cursor).with_options(options).finish()?; // Polars has inferred dtypes and column names
 
-    // ─── 2) Build CsvReadOptions (header = true) ─────────────────────────────────
-    let options = CsvReadOptions::default().with_has_header(true);
+    // ─── 2) Build `<prefix>` from columns 1,2,3 if available ─────────────────────
+    //
+    // Convert each &PlSmallStr → &str via as_str(), then trim and to_string():
+    let all_trimmed_names: Vec<String> = df
+        .get_column_names()
+        .iter()
+        .map(|s: &&PlSmallStr| s.as_str().trim().to_string())
+        .collect();
+    let prefix = if all_trimmed_names.len() >= 4 {
+        format!(
+            "{}_{}_{}",
+            all_trimmed_names[1], all_trimmed_names[2], all_trimmed_names[3]
+        )
+    } else {
+        String::new()
+    };
 
-    // ─── 3) Read into a DataFrame, letting Polars infer types normally ─────────────
-    let mut df: DataFrame = CsvReader::new(&mut cursor).with_options(options).finish()?; // DataFrame is now typed exactly as Polars infers
+    // Construct the final and temporary filenames:
+    let final_name = if prefix.is_empty() {
+        format!("{}.parquet", file_name)
+    } else {
+        format!("{}_{}.parquet", prefix, file_name)
+    };
+    let tmp_name = if prefix.is_empty() {
+        format!("{}.parquet.tmp", file_name)
+    } else {
+        format!("{}_{}.parquet.tmp", prefix, file_name)
+    };
+    let final_path = out_dir.join(final_name);
+    let tmp_path = out_dir.join(tmp_name);
 
-    // ─── 4) Check if any column’s *first* data‐row would change type after trimming ─
+    // ─── 3) Check if any column’s *first* data‐row would change type after trimming ─
     let type_changed = check_first_row_trim(&df)?;
     if type_changed {
         println!("→ At least one column’s first‐row changed type after trimming.");
 
-        // ─── 5) Collect column‐names into a Vec<String> (convert each PlSmallStr to String)
+        // Collect column names into Vec<String> so we can mutate `df` inside the loop:
         let col_names: Vec<String> = df
             .get_column_names()
             .iter()
             .map(|s| s.to_string())
             .collect();
 
-        // ─── 6) For each string column name in col_names, perform transformation+cast ─
+        // ─── 4) For each string column, transform & cast if needed ─────────────────
         for col_name in col_names {
             let column_ref: &Column = df.column(&col_name)?;
             if let Ok(str_ca) = column_ref.str() {
                 if let Some(orig_val) = str_ca.get(0) {
-                    // The same “trim‐then‐unquote” logic:
+                    // Trim + strip outer quotes on row 0
                     let trimmed_ws = orig_val.trim();
                     let trimmed = if trimmed_ws.starts_with('"')
                         && trimmed_ws.ends_with('"')
@@ -99,7 +145,7 @@ pub fn csv_to_parquet(file_name: &str, data: &str, out_dir: &Path) -> Result<(),
                         trimmed_ws
                     };
 
-                    // Infer the new dtype from the trimmed first‐row:
+                    // Infer new dtype from trimmed first‐row
                     let new_dtype = if trimmed.parse::<i64>().is_ok() {
                         DataType::Int64
                     } else if trimmed.parse::<f64>().is_ok() {
@@ -110,33 +156,28 @@ pub fn csv_to_parquet(file_name: &str, data: &str, out_dir: &Path) -> Result<(),
 
                     let old_dtype = column_ref.dtype().clone();
                     if old_dtype != new_dtype {
-                        // ─── 7) Transform & cast the *entire* column ───────────────────────
-                        //
-                        // a) Obtain an owned `Series` from the Column:
+                        // a) Obtain an owned Series:
                         let s: Series = column_ref.clone().as_series().unwrap().clone();
 
-                        // b) Apply (trim + strip quotes) to every cell in the Utf8Chunked:
-                        //    Return Option<Cow<str>> so we can borrow when possible.
+                        // b) Apply trim+strip‐quotes to every cell (Option<Cow<str>>)
                         let trimmed_utf8: StringChunked = s.str()?.apply(|opt_val| {
                             opt_val.map(|val| {
                                 let ws = val.trim();
                                 if ws.starts_with('"') && ws.ends_with('"') && ws.len() >= 2 {
-                                    // We allocate a new String because we've sliced out of the middle.
                                     Cow::Owned(ws[1..ws.len() - 1].to_string())
                                 } else {
-                                    // We can borrow this slice directly.
                                     Cow::Borrowed(ws)
                                 }
                             })
                         });
 
-                        // Turn that back into a Series of strings:
+                        // c) Convert to Series of strings
                         let trimmed_series: Series = trimmed_utf8.into_series();
 
-                        // c) Cast the trimmed string‐Series into the `new_dtype`:
+                        // d) Cast to new dtype
                         let casted_series: Series = trimmed_series.cast(&new_dtype)?;
 
-                        // d) Replace the column in the DataFrame:
+                        // e) Replace in DataFrame
                         df.replace(&col_name, casted_series)?;
                     }
                 }
@@ -144,14 +185,18 @@ pub fn csv_to_parquet(file_name: &str, data: &str, out_dir: &Path) -> Result<(),
         }
     }
 
-    // ─── 8) Write the (possibly modified) DataFrame to Parquet ───────────────────
-    let out_path = out_dir.join(format!("{}.parquet", file_name));
-    let mut file = std::fs::File::create(out_path)?;
-    ParquetWriter::new(&mut file)
-        .with_compression(ParquetCompression::Brotli(Some(
-            BrotliLevel::try_new(5).unwrap(),
-        )))
-        .finish(&mut df.clone())?;
+    // ─── 5) Write to the temporary `.parquet.tmp` file ───────────────────────────
+    {
+        let mut tmp_file = fs::File::create(&tmp_path)?;
+        ParquetWriter::new(&mut tmp_file)
+            .with_compression(ParquetCompression::Brotli(Some(
+                BrotliLevel::try_new(5).unwrap(),
+            )))
+            .finish(&mut df.clone())?;
+    }
+
+    // ─── 6) Atomically rename `.parquet.tmp` → `.parquet` ────────────────────────
+    fs::rename(&tmp_path, &final_path)?;
 
     Ok(())
 }
