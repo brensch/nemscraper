@@ -10,16 +10,16 @@ COPY Cargo.toml Cargo.lock ./
 # Create a dummy src to allow cargo to fetch dependencies before copying actual code
 # This speeds up rebuilds when dependencies haven't changed.
 RUN mkdir src
-RUN echo "fn main() { println!(\"hello\"); }" > src/main.rs
+RUN echo "fn main() { println!(\"dummy build\"); }" > src/main.rs
 
 # Build a dummy release so that dependencies are cached
 RUN cargo build --release
+RUN rm -f src/main.rs
 
 # Now overwrite with the real source code
 COPY src ./src
 
 # Build the actual release binary
-RUN rm -f src/main.rs
 RUN cargo build --release
 
 # Stage 2: create a minimal runtime image
@@ -32,8 +32,6 @@ COPY --from=builder /usr/src/app/target/release/nemscraper /usr/src/app/nemscrap
 
 # Ensure binary is executable
 RUN chmod +x /usr/src/app/nemscraper
-
-# (Optional) If your Rust app expects any configuration file in /usr/src/app, copy it here.
 
 # By default, just run the nemscraper binary
 ENTRYPOINT ["./nemscraper"]
