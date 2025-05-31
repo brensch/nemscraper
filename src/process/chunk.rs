@@ -18,7 +18,7 @@ use std::fs::File;
 use std::io::Cursor;
 use std::path::Path;
 use std::sync::Arc;
-use tracing::{debug, error, info};
+use tracing::{debug, error};
 
 /// Build a "read" ArrowSchema from the base schema:
 /// - prepend 4 dummy Utf8 fields (rec_type, domain, measure, seq),
