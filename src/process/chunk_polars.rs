@@ -44,20 +44,7 @@ fn check_first_row_trim(df: &DataFrame) -> PolarsResult<bool> {
 
                 let old_dtype = column_ref.dtype();
                 if old_dtype != &new_dtype {
-                    println!(
-                        "Column '{}' first‐row WOULD change type: \
-                         {:?} (orig=\"{}\") → {:?} (trimmed=\"{}\")",
-                        col_name, old_dtype, orig_val, new_dtype, trimmed
-                    );
                     any_type_change = true;
-                }
-
-                // Also print if the trimmed text changed compared to orig_val:
-                if trimmed != orig_val {
-                    println!(
-                        "  (and the trimmed text itself changed: \"{}\" → \"{}\")",
-                        orig_val, trimmed
-                    );
                 }
             }
         }
@@ -89,13 +76,19 @@ pub fn csv_to_parquet(file_name: &str, data: &str, out_dir: &Path) -> Result<(),
     if type_changed {
         println!("→ At least one column’s first‐row changed type after trimming.");
 
-        // ─── 5) For each string column, see if its first‐row requires transformation+cast ─
-        for col_name in df.get_column_names() {
-            // Only transform string columns:
-            let column_ref: &Column = df.column(col_name)?;
+        // ─── 5) Collect column‐names into a Vec<String> (convert each PlSmallStr to String)
+        let col_names: Vec<String> = df
+            .get_column_names()
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+
+        // ─── 6) For each string column name in col_names, perform transformation+cast ─
+        for col_name in col_names {
+            let column_ref: &Column = df.column(&col_name)?;
             if let Ok(str_ca) = column_ref.str() {
                 if let Some(orig_val) = str_ca.get(0) {
-                    // The exact same “trim‐then‐unquote” logic:
+                    // The same “trim‐then‐unquote” logic:
                     let trimmed_ws = orig_val.trim();
                     let trimmed = if trimmed_ws.starts_with('"')
                         && trimmed_ws.ends_with('"')
@@ -117,7 +110,7 @@ pub fn csv_to_parquet(file_name: &str, data: &str, out_dir: &Path) -> Result<(),
 
                     let old_dtype = column_ref.dtype().clone();
                     if old_dtype != new_dtype {
-                        // ─── 6) Transform & cast the *entire* column ─────────────────────────────
+                        // ─── 7) Transform & cast the *entire* column ───────────────────────
                         //
                         // a) Obtain an owned `Series` from the Column:
                         let s: Series = column_ref.clone().as_series().unwrap().clone();
@@ -128,10 +121,10 @@ pub fn csv_to_parquet(file_name: &str, data: &str, out_dir: &Path) -> Result<(),
                             opt_val.map(|val| {
                                 let ws = val.trim();
                                 if ws.starts_with('"') && ws.ends_with('"') && ws.len() >= 2 {
-                                    // Owned, because we're slicing out of the middle
+                                    // We allocate a new String because we've sliced out of the middle.
                                     Cow::Owned(ws[1..ws.len() - 1].to_string())
                                 } else {
-                                    // Borrowed, just a slice of the original
+                                    // We can borrow this slice directly.
                                     Cow::Borrowed(ws)
                                 }
                             })
@@ -144,20 +137,20 @@ pub fn csv_to_parquet(file_name: &str, data: &str, out_dir: &Path) -> Result<(),
                         let casted_series: Series = trimmed_series.cast(&new_dtype)?;
 
                         // d) Replace the column in the DataFrame:
-                        df.replace(col_name, casted_series)?;
+                        df.replace(&col_name, casted_series)?;
                     }
                 }
             }
         }
-    } else {
-        println!("→ No first‐row type changes detected; no in‐place transform needed.");
     }
 
-    // ─── 7) Write the (possibly modified) DataFrame to Parquet ───────────────────
+    // ─── 8) Write the (possibly modified) DataFrame to Parquet ───────────────────
     let out_path = out_dir.join(format!("{}.parquet", file_name));
     let mut file = std::fs::File::create(out_path)?;
     ParquetWriter::new(&mut file)
-        .with_compression(ParquetCompression::Snappy)
+        .with_compression(ParquetCompression::Brotli(Some(
+            BrotliLevel::try_new(5).unwrap(),
+        )))
         .finish(&mut df.clone())?;
 
     Ok(())

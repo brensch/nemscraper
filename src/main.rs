@@ -130,58 +130,57 @@ async fn main() -> Result<()> {
         processor_tx.send(Ok(path.clone()))?;
     }
 
-    // // ─── 6) scheduler: periodic fetch → queue → process ─────────────
-    // {
-    //     let url_tx = url_tx.clone();
-    //     let history = history.clone();
-    //     let client = client.clone();
+    // ─── 6) scheduler: periodic fetch → queue → process ─────────────
+    {
+        let url_tx = url_tx.clone();
+        let history = history.clone();
+        let client = client.clone();
 
-    //     task::spawn(async move {
-    //         let mut ticker = interval(Duration::from_secs(60));
-    //         // loop {
-    //         if let Err(e) = async {
-    //             info!("fetching feeds");
+        task::spawn(async move {
+            let mut ticker = interval(Duration::from_secs(60));
+            loop {
+                if let Err(e) = async {
+                    info!("fetching feeds");
 
-    //             // ─── b) fetch new URLs and enqueue ────────────────
-    //             let feeds = fetch::urls::fetch_current_zip_urls(&client).await?;
-    //             // 1) Flatten all URLs into a single iterator
-    //             let all_urls_iter = feeds.values().flat_map(|urls| urls.iter().cloned());
+                    // ─── b) fetch new URLs and enqueue ────────────────
+                    let feeds = fetch::urls::fetch_current_zip_urls(&client).await?;
+                    // 1) Flatten all URLs into a single iterator
+                    let all_urls_iter = feeds.values().flat_map(|urls| urls.iter().cloned());
 
-    //             // 2) Use `choose_multiple` to sample up to 1,000 items at random
-    //             let mut rng = thread_rng();
-    //             let random_sample: Vec<String> = all_urls_iter.choose_multiple(&mut rng, 100);
+                    // 2) Use `choose_multiple` to sample up to 1,000 items at random
+                    let mut rng = thread_rng();
+                    let random_sample: Vec<String> = all_urls_iter.choose_multiple(&mut rng, 100);
 
-    //             // 3) Collect into a HashSet<String> (deduplicates any repeats)
-    //             let unique_urls: HashSet<String> = random_sample.into_iter().collect();
-    //             info!(
-    //                 "retrieved feeds, downloading {} unique URLs",
-    //                 unique_urls.len()
-    //             );
+                    // 3) Collect into a HashSet<String> (deduplicates any repeats)
+                    let unique_urls: HashSet<String> = random_sample.into_iter().collect();
+                    info!(
+                        "retrieved feeds, downloading {} unique URLs",
+                        unique_urls.len()
+                    );
 
-    //             for url in unique_urls {
-    //                 let url_path = PathBuf::from(&url);
-    //                 let name = url_path.file_name().unwrap().to_string_lossy().to_string();
-    //                 if history.get(&name, &history::State::Downloaded) {
-    //                     debug!(url = %url, "already seen, skipping");
-    //                     continue;
-    //                 }
-    //                 url_tx
-    //                     .send(url.clone())
-    //                     .map_err(|e| anyhow::anyhow!(e.to_string()))?;
-    //             }
+                    for url in unique_urls {
+                        let url_path = PathBuf::from(&url);
+                        let name = url_path.file_name().unwrap().to_string_lossy().to_string();
+                        if history.get(&name, &history::State::Downloaded) {
+                            debug!(url = %url, "already seen, skipping");
+                            continue;
+                        }
+                        url_tx
+                            .send(url.clone())
+                            .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+                    }
 
-    //             Ok::<(), anyhow::Error>(())
-    //         }
-    //         .await
-    //         {
-    //             error!("scheduler loop failed: {}", e);
-    //         }
+                    Ok::<(), anyhow::Error>(())
+                }
+                .await
+                {
+                    error!("scheduler loop failed: {}", e);
+                }
 
-    //         ticker.tick().await;
-    //         drop(processor_tx)
-    //         // }
-    //     });
-    // }
+                ticker.tick().await;
+            }
+        });
+    }
 
     // ─── 7) single‐threaded processor ─────────────────────────────────
     while let Some(msg) = processor_rx.recv().await {
