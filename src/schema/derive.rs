@@ -1,3 +1,4 @@
+use anyhow::anyhow;
 use anyhow::Result;
 use chrono::NaiveDateTime;
 use tracing::{debug, warn};
@@ -12,75 +13,74 @@ use super::Column;
 pub fn derive_types(
     table_name: &str,
     header_names: &[String],
-    rows: &[Vec<String>],
+    sample_rows: &[Vec<String>],
 ) -> Result<Vec<Column>> {
-    // How many rows to sample per column
-    const SAMPLE_LIMIT: usize = 1_000;
-    let num_cols = header_names.len();
-    let mut cols = Vec::with_capacity(num_cols);
+    if header_names.is_empty() {
+        return Err(anyhow!("derive_types: `{}` has no headers", table_name));
+    }
 
-    // OPTIONAL: warn once if any rows are longer than the header
-    if rows.iter().any(|r| r.len() > num_cols) {
+    // Check for rows that are longer than headers and warn once
+    if sample_rows.iter().any(|r| r.len() > header_names.len()) {
         warn!(
-            "derive_types: some rows in table `{}` have more cells than headers ({} headers)",
-            table_name, num_cols
+            "derive_types: some rows in `{}` have more cells than headers ({} headers)",
+            table_name,
+            header_names.len()
         );
     }
 
-    // Process each column independently
-    for (col_idx, col_name) in header_names.iter().enumerate() {
-        // Track the first non-empty sample (type, format)
+    let mut cols = Vec::with_capacity(header_names.len());
+
+    for (idx, raw_name) in header_names.iter().enumerate() {
+        // Strip all leading/trailing whitespace (spaces, tabs, \r, \n, etc.)
+        let col_name = raw_name.trim();
+        if col_name.is_empty() {
+            return Err(anyhow!(
+                "derive_types: header at index {} in `{}` is empty after trimming",
+                idx,
+                table_name
+            ));
+        }
+
         let mut first_sample: Option<(String, Option<String>)> = None;
-        // If we ever see a conflicting sample, we can stop early
         let mut inconsistent = false;
 
-        // Scan up to SAMPLE_LIMIT rows
-        for row in rows.iter().take(SAMPLE_LIMIT) {
-            // Safely get the cell; treat missing cells as empty
-            let cell = row.get(col_idx).map(|s| s.trim()).unwrap_or("");
+        // Scan the sample rows for this column index
+        for row in sample_rows {
+            let cell = row.get(idx).map(|s| s.trim()).unwrap_or("");
             if cell.is_empty() {
                 continue;
             }
 
-            // Infer this cell’s type+format
             let inferred = infer_type_and_format(cell);
 
             match &first_sample {
-                // No sample yet → record this one
-                None => first_sample = Some(inferred.clone()),
-
-                // We already have a sample → check for mismatch
+                None => {
+                    first_sample = Some(inferred.clone());
+                }
                 Some(prev) if prev != &inferred => {
                     debug!(
-                        "derive_types: column `{}` in table `{}` conflict: {:?} vs {:?}",
+                        "derive_types: column `{}` in `{}` conflict: {:?} vs {:?}",
                         col_name, table_name, prev, inferred
                     );
                     inconsistent = true;
                     break;
                 }
-
                 _ => {}
             }
         }
 
-        // Decide final type & format
         let (ty, format) = match (inconsistent, first_sample) {
-            // We detected conflicting samples → default
             (true, _) => {
                 debug!(
-                    "derive_types: inconsistent samples for `{}` in table `{}`, defaulting to utf8",
+                    "derive_types: inconsistent samples for `{}` in `{}`, defaulting to utf8",
                     col_name, table_name
                 );
                 ("utf8".into(), None)
             }
-
-            // No conflict, and we have at least one sample → use it
             (false, Some((t, f))) => (t, f),
-
-            // No conflict but also no samples at all → default
             (false, None) => {
                 debug!(
-                    "derive_types: no samples for `{}` in table `{}`, defaulting to utf8",
+                    "derive_types: no samples for `{}` in `{}`, defaulting to utf8",
                     col_name, table_name
                 );
                 ("utf8".into(), None)
@@ -88,7 +88,7 @@ pub fn derive_types(
         };
 
         cols.push(Column {
-            name: col_name.clone(),
+            name: col_name.to_string(),
             ty,
             format,
         });
