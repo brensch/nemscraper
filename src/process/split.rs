@@ -1,7 +1,6 @@
 use crate::process::chunk::chunk_and_write_segment;
 use crate::schema::store::SchemaStore;
 use anyhow::Result;
-use arrow::datatypes::Schema as ArrowSchema;
 use num_cpus;
 use rayon::prelude::*;
 use std::fs::File;
