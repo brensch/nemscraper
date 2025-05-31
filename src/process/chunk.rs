@@ -54,10 +54,7 @@ pub fn chunk_and_write_segment(
         error!(file_name = %file_name, "Insufficient header fields, skipping chunk");
         return;
     }
-    let table_name = format!(
-        "{}_{}_{}",
-        header_parts[1], header_parts[2], header_parts[3]
-    );
+    let table_name = format!("{}_{}", header_parts[1], header_parts[2]);
 
     // 2) Log only the derived table_name instead of all header fields
     info!(table=%table_name, "splitting into batches");
@@ -102,7 +99,7 @@ pub fn chunk_and_write_segment(
                     };
 
                     // Build the Parquet filename using the derived table_name
-                    let out_path = out_dir.join(format!("{}--chunk{}.parquet", table_name, batch_idx));
+                    let out_path = out_dir.join(format!("{}--{}--chunk{}.parquet",file_name,    table_name, batch_idx));
                     let temp_path = out_path.with_extension("tmp");
 
                     // Write the file to a temporary path first
