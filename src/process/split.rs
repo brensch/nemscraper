@@ -34,8 +34,8 @@ pub fn split_zip_to_parquet<P: AsRef<Path>, Q: AsRef<Path>>(
 
     for idx in 0..archive.len() {
         let mut entry = archive.by_index(idx)?;
-        let name = entry.name().to_string();
-        if !name.to_lowercase().ends_with(".csv") {
+        let file_name = entry.name().to_string();
+        if !file_name.to_lowercase().ends_with(".csv") {
             continue;
         }
 
@@ -98,7 +98,7 @@ pub fn split_zip_to_parquet<P: AsRef<Path>, Q: AsRef<Path>>(
 
             // chunk and write without further slicing of text
             chunk_and_write_segment(
-                &name,
+                &file_name,
                 arrow_schema.clone(),
                 &text_str[start..end],
                 &*out_path,

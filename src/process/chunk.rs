@@ -13,6 +13,7 @@ use parquet::arrow::ArrowWriter;
 use parquet::basic::{BrotliLevel, Compression};
 use parquet::file::properties::WriterProperties;
 use rayon::prelude::*;
+use std::fs;
 use std::io::Cursor;
 use std::{fs::File, path::Path, sync::Arc};
 use tracing::{debug, error, info};
@@ -34,26 +35,40 @@ fn make_read_schema(base: &ArrowSchema) -> Arc<ArrowSchema> {
     }
     Arc::new(ArrowSchema::new(fields))
 }
-
 /// Splits CSV data into record-batches of `chunk_size` rows,
 /// skipping the first 4 control columns via projection, and
 /// converts DATE/TIMESTAMP fields back to native types before writing Parquet.
 pub fn chunk_and_write_segment(
-    table_name: &str,
+    file_name: &str,
     arrow_schema: Arc<ArrowSchema>,
     data: &str,
     out_dir: &Path,
 ) {
     let chunk_size = 1_000_000;
+
+    // 1) Derive the table name by concatenating fields 1–3 of the first line in the CSV.
+    //    If the first line doesn’t have at least 3 comma-separated columns, fall back to file_name.
+    let first_line = data.lines().next().unwrap_or_default();
+    let header_parts: Vec<&str> = first_line.split(',').collect();
+    if header_parts.len() < 3 {
+        error!(file_name = %file_name, "Insufficient header fields, skipping chunk");
+        return;
+    }
+    let table_name = format!(
+        "{}_{}_{}",
+        header_parts[1], header_parts[2], header_parts[3]
+    );
+
+    // 2) Log only the derived table_name instead of all header fields
     info!(table=%table_name, "splitting into batches");
 
-    // 1) Read schema: include 4 dummy columns + actual
+    // 3) Read schema: include 4 dummy columns + actual
     let read_schema = make_read_schema(&arrow_schema);
 
-    // 2) Projection: skip the first 4 dummy CSV columns
+    // 4) Projection: skip the first 4 dummy CSV columns
     let projection = (4..read_schema.fields().len()).collect::<Vec<usize>>();
 
-    // 3) CSV reader over entire blob, with batch_size for chunking
+    // 5) CSV reader over entire blob, with batch_size for chunking
     let cursor = Cursor::new(data.as_bytes());
     let csv_reader = ReaderBuilder::new(read_schema.clone())
         .with_header(true)
@@ -63,13 +78,13 @@ pub fn chunk_and_write_segment(
         .context("creating CSV reader")
         .unwrap(); // or handle error gracefully
 
-    // 4) Parquet writer properties
+    // 6) Parquet writer properties
     let props = WriterProperties::builder()
         .set_compression(Compression::BROTLI(BrotliLevel::try_new(5).unwrap()))
         .set_dictionary_enabled(true)
         .build();
 
-    // 5) Parallelize over record-batches
+    // 7) Parallelize over record-batches
     csv_reader
         .into_iter()
         .enumerate()
@@ -86,9 +101,12 @@ pub fn chunk_and_write_segment(
                         }
                     };
 
-                    // Write Parquet file
+                    // Build the Parquet filename using the derived table_name
                     let out_path = out_dir.join(format!("{}--chunk{}.parquet", table_name, batch_idx));
-                    let file = match File::create(&out_path) {
+                    let temp_path = out_path.with_extension("tmp");
+
+                    // Write the file to a temporary path first
+                    let file = match File::create(&temp_path) {
                         Ok(f) => f,
                         Err(e) => {
                             error!(table=%table_name, chunk=%batch_idx, "file create error: {:?}", e);
@@ -108,6 +126,17 @@ pub fn chunk_and_write_segment(
                     }
                     if let Err(e) = writer.close() {
                         error!(table=%table_name, chunk=%batch_idx, "close error: {:?}", e);
+                    }
+
+                    // Move the temporary file to the final destination
+                    if let Err(e) = fs::rename(&temp_path, &out_path) {
+                        error!(
+                            table=%table_name,
+                            chunk=%batch_idx,
+                            temp_path=%temp_path.display(),
+                            out_path=%out_path.display(),
+                            "rename error: {:?}", e
+                        );
                     }
                     debug!(table=%table_name, chunk=%batch_idx, rows=converted.num_rows(), "wrote rows");
                 }

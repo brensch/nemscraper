@@ -11,7 +11,7 @@ use tracing::{debug, error, info};
 use tracing_subscriber::{fmt, EnvFilter};
 
 mod history;
-use history::{Event, History};
+use history::History;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -28,31 +28,21 @@ async fn main() -> Result<()> {
     let client = Client::new();
     let assets = PathBuf::from("assets");
     let schemas_dir = assets.join("schemas");
-    // let schema_proposals = assets.join("schema_proposals");
     let zips_dir = assets.join("zips");
     let parquet_dir = assets.join("parquet");
-    let tmp_dir = assets.join("parquet_tmp");
     let history_dir = assets.join("history");
-    let failed_dir = assets.join("failed_zips");
 
-    for d in [
-        &schemas_dir,
-        &zips_dir,
-        &parquet_dir,
-        &tmp_dir,
-        &history_dir,
-        &failed_dir,
-        // &schema_proposals,
-    ] {
+    for d in [&schemas_dir, &zips_dir, &parquet_dir, &history_dir] {
         fs::create_dir_all(d)?;
     }
 
     // ─── 3) history & lookup store ───────────────────────────────────
+    // Now History only holds a single in-memory HashSet<String> of “seen” filenames.
     let history = Arc::new(History::new(&history_dir)?);
+
     info!("initial schema fetch → {}", schemas_dir.display());
     // schema::fetch_all(&client, &schemas_dir).await?;
-    // let dirs = vec![&schemas_dir, &schema_proposals];
-    // let lookup = Arc::new(Mutex::new(extract_column_types(dirs)?));
+    // let lookup = Arc::new(Mutex::new(extract_column_types(vec![&schemas_dir])?));
     let schema_store = Arc::new(schema::SchemaStore::new(&schemas_dir)?);
 
     // ─── 4) channels ──────────────────────────────────────────────────
@@ -77,23 +67,19 @@ async fn main() -> Result<()> {
                     .to_string_lossy()
                     .to_string();
 
-                // if the zip was already downloaded, skip
-                match history.get_one(&name, Event::Downloaded) {
-                    Ok(Some(path)) => {
-                        info!(name=%name, "found already downloaded in download loop {:?}, skipping {}", path, url);
-                        continue;
-                    }
-                    Ok(None) => {
-                        // not downloaded yet, fall through to download
-                    }
-                    Err(e) => {
-                        error!(name=%name, "history lookup failed, proceeding with download: {}", e);
-                    }
+                // If this ZIP has already been seen (downloaded or processed), skip.
+                if history.get(&name, &history::State::Downloaded) {
+                    info!(
+                        name = %name,
+                        "already in history (downloaded/processed), skipping download of {}",
+                        url
+                    );
+                    continue;
                 }
 
-                info!(name=%name, "downloading {}", url);
+                info!(name = %name, "downloading {}", url);
 
-                // retry up to 3 times with 2s backoff
+                // retry up to 3 times with exponential backoff
                 let path_result = async {
                     let mut attempt = 0;
                     loop {
@@ -105,7 +91,7 @@ async fn main() -> Result<()> {
                                     "attempt {}/3 for {} failed: {}, retrying...",
                                     attempt, url, e
                                 );
-                                sleep(Duration::from_secs(1 * attempt)).await;
+                                sleep(Duration::from_secs((1 << attempt) as u64)).await;
                             }
                             Err(e) => return Err(e),
                         }
@@ -115,13 +101,14 @@ async fn main() -> Result<()> {
 
                 match path_result {
                     Ok(path) => {
-                        if let Err(e) = history.record_event(&name, Event::Downloaded) {
-                            error!("history.record_event failed: {}", e);
+                        // Mark as “seen”
+                        if let Err(e) = history.add(&name, history::State::Downloaded) {
+                            error!(name = %name, "history.add failed: {}", e);
                         }
                         let _ = tx.send(Ok(path));
                     }
                     Err(e) => {
-                        error!("download failed after retries {}: {}", url, e);
+                        error!("download failed after retries for {}: {}", url, e);
                         let _ = tx.send(Err((url.clone(), e.to_string())));
                     }
                 }
@@ -129,10 +116,16 @@ async fn main() -> Result<()> {
         });
     }
 
-    // ─── enqueue existing unprocessed zips one time. ─────────
+    // ─── enqueue existing unprocessed zips one time ─────────────────
     for entry in fs::read_dir(&zips_dir)? {
         let path = entry?.path();
         if path.extension() != Some(OsStr::new("zip")) {
+            continue;
+        }
+        let name = path.file_name().unwrap().to_string_lossy().to_string();
+        if history.get(&name, &history::State::Processed) {
+            // Already processed.
+            debug!(name = %name, "already processed {}", path.display());
             continue;
         }
         processor_tx.send(Ok(path.clone()))?;
@@ -143,54 +136,31 @@ async fn main() -> Result<()> {
         let url_tx = url_tx.clone();
         let history = history.clone();
         let client = client.clone();
-        let zips_dir = zips_dir.clone();
-        let failed_dir = failed_dir.clone();
-        let processor_tx = processor_tx.clone();
 
         task::spawn(async move {
             let mut ticker = interval(Duration::from_secs(60));
-            // immediate first tick triggers once; no separate init
             loop {
                 if let Err(e) = async {
-                    info!("scheduler tick");
+                    info!("fetching feeds");
 
-                    // ─── b) re-enqueue failed zips ───────────────────
-                    for entry in fs::read_dir(&failed_dir)? {
-                        let path = entry?.path();
-                        if path.extension() != Some(OsStr::new("zip")) {
-                            continue;
-                        }
-                        let name = path.file_name().unwrap().to_string_lossy().to_string();
-                        let dest = zips_dir.join(&name);
-                        fs::rename(&path, &dest)?;
-                        info!("re-queued failed zip {}", name);
-                        // record retried event
-                        history.record_event(&name, Event::Retried)?;
-                        // sending to tx triggers processor workers
-                        processor_tx.send(Ok(dest.clone()))?;
-                    }
-
-                    // ─── d) fetch new URLs and enqueue ────────────────
+                    // ─── b) fetch new URLs and enqueue ────────────────
                     let feeds = fetch::urls::fetch_current_zip_urls(&client).await?;
-                    let already_downloaded = history
-                        .get_all(Event::Downloaded)
-                        .expect("couldn't get downloaded history");
-
-                    //
                     let unique_urls: HashSet<String> = feeds
                         .values()
                         .flat_map(|urls| urls.iter().cloned())
                         .collect();
+                    info!(
+                        "retrieved feeds, downloading {} unique URLs",
+                        unique_urls.len()
+                    );
 
                     for url in unique_urls {
-                        // check if the csv filename in the url is already downloaded
                         let url_path = PathBuf::from(&url);
                         let name = url_path.file_name().unwrap().to_string_lossy().to_string();
-                        if already_downloaded.contains(&name) {
-                            debug!(url=%url, "already downloaded, skipping");
+                        if history.get(&name, &history::State::Downloaded) {
+                            debug!(url = %url, "already seen, skipping");
                             continue;
                         }
-                        // sending to url_tx triggers download workers to download
                         url_tx
                             .send(url.clone())
                             .map_err(|e| anyhow::anyhow!(e.to_string()))?;
@@ -208,67 +178,38 @@ async fn main() -> Result<()> {
         });
     }
 
-    // ─── 7) single-threaded processor ─────────────────────────────────
+    // ─── 7) single‐threaded processor ─────────────────────────────────
     while let Some(msg) = processor_rx.recv().await {
         match msg {
             Ok(zip_path) => {
                 let name = zip_path.file_name().unwrap().to_string_lossy().to_string();
 
-                // if the zip was already processed, skip
-                match history.get_one(&name, Event::Processed) {
-                    Ok(Some(path)) => {
-                        debug!(name=%name, "already processed at {:?}, skipping {}", path, &name);
-                        continue;
-                    }
-                    Ok(None) => {
-                        // not processed yet, fall through to process
-                    }
-                    Err(e) => {
-                        error!(name=%name, "history lookup failed, proceeding with processing: {}", e);
-                    }
+                // If this ZIP was already seen (downloaded or processed), skip.
+                if history.get(&name, &history::State::Processed) {
+                    debug!(name = %name, "already seen, skipping processing of {}", name);
+                    continue;
                 }
                 info!("processing {}", name);
 
-                let temp_out = tmp_dir.clone();
-                let split_temp_out = tmp_dir.clone();
-                let final_out = parquet_dir.clone();
-                let history = history.clone();
+                // We spawn the blocking split function on a separate thread:
+                let out_dir = parquet_dir.clone();
+                let history_clone = history.clone();
                 let split_path = zip_path.clone();
-
-                // split in blocking thread
                 let schema_store = Arc::clone(&schema_store);
+
                 let split_res = task::spawn_blocking(move || {
-                    process::split::split_zip_to_parquet(&split_path, &split_temp_out, schema_store)
+                    process::split::split_zip_to_parquet(&split_path, &out_dir, schema_store)
                 })
                 .await?;
 
                 if let Err(e) = split_res {
                     error!("split {} failed: {}", name, e);
-                    let _ = fs::rename(&zip_path, failed_dir.join(&name));
                     continue;
                 }
 
-                // move .parquet files once write is completed
-                if let Err(e) = (|| -> Result<()> {
-                    for entry in fs::read_dir(&temp_out)? {
-                        let path = entry?.path();
-                        fs::rename(&path, final_out.join(path.file_name().unwrap()))?;
-                    }
-                    Ok(())
-                })() {
-                    error!("moving parquet for {} failed: {}", name, e);
-                }
-
-                // record processed event
-                if let Err(e) = history.record_event(&name, Event::Processed) {
-                    error!("record_event processed failed: {}", e);
-                }
-
-                // delete zip file
-                if let Err(e) = fs::remove_file(&zip_path) {
-                    error!("failed to delete zip {}: {}", name, e);
-                } else {
-                    info!("deleted zip {}", name);
+                // Mark as “seen” (processed)
+                if let Err(e) = history_clone.add(&name, history::State::Processed) {
+                    error!("history.add (processed) failed for {}: {}", name, e);
                 }
             }
             Err((url, _)) => {

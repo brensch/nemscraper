@@ -5,7 +5,7 @@ use serde_json;
 use std::{
     collections::{HashMap, HashSet},
     fs,
-    io::{self, Cursor, Write},
+    io::{self, Cursor},
     path::{Path, PathBuf},
     sync::{Arc, RwLock},
 };
