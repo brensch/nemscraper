@@ -61,7 +61,10 @@ pub fn chunk_and_write_segment(
         error!(file_name = %file_name, "Insufficient header fields, skipping chunk");
         return;
     }
-    let table_name = format!("{}_{}", header_parts[1], header_parts[2]);
+    let table_name = format!(
+        "{}_{}_{}",
+        header_parts[1], header_parts[2], header_parts[3]
+    );
 
     // 2) Log only the derived table_name instead of all header fields
     debug!(table = %table_name, "splitting into batches");
