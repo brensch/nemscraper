@@ -23,7 +23,7 @@ RUN rm -f src/main.rs
 RUN cargo build --release
 
 # Stage 2: create a minimal runtime image
-FROM debian:bullseye-slim
+FROM debian:bookworm-slim
 
 WORKDIR /usr/src/app
 
