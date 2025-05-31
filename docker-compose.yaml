@@ -1,0 +1,26 @@
+services:
+  grafana:
+    container_name: grafana
+    image: grafana/grafana:12.0.1-ubuntu
+    user: "${UID}:${GID}"
+    restart: always
+    ports:
+      - "3000:3000"
+    volumes:
+      - ./grafana/plugins/motherduck-duckdb-datasource:/var/lib/grafana/plugins/motherduck-duckdb-datasource
+      - ./grafana/dashboards:/etc/grafana/provisioned_dashboards
+      - ./grafana/provisioning/dashboards:/etc/grafana/provisioning/dashboards
+      - ./grafana/provisioning/datasources:/etc/grafana/provisioning/datasources
+      - ./assets:/data
+    environment:
+      GF_PLUGINS_ALLOW_LOADING_UNSIGNED_PLUGINS: "motherduck-duckdb-datasource"
+
+  nemscraper:
+    container_name: nemscraper
+    build:
+      context: .
+      dockerfile: Dockerfile.nemscraper
+    working_dir: /usr/src/app
+    volumes:
+      - ./assets:/usr/src/app/assets
+    command: ["./target/release/nemscraper"]
