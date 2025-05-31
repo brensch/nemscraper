@@ -1,4 +1,4 @@
-// data/src/process/chunk.rs
+// src/process/chunk.rs
 
 use anyhow::{anyhow, Context, Result};
 use arrow::array::Array;
@@ -14,18 +14,23 @@ use parquet::basic::{BrotliLevel, Compression};
 use parquet::file::properties::WriterProperties;
 use rayon::prelude::*;
 use std::fs;
+use std::fs::File;
 use std::io::Cursor;
-use std::{fs::File, path::Path, sync::Arc};
+use std::path::Path;
+use std::sync::Arc;
 use tracing::{debug, error, info};
+
 /// Build a "read" ArrowSchema from the base schema:
 /// - prepend 4 dummy Utf8 fields (rec_type, domain, measure, seq),
 /// - convert any Timestamp(µs) fields to Utf8 for CSV parsing.
 fn make_read_schema(base: &ArrowSchema) -> Arc<ArrowSchema> {
     let mut fields = Vec::with_capacity(base.fields().len() + 4);
+
     fields.push(Field::new("rec_type", DataType::Utf8, false));
     fields.push(Field::new("domain", DataType::Utf8, false));
     fields.push(Field::new("measure", DataType::Utf8, false));
     fields.push(Field::new("seq", DataType::Utf8, false));
+
     for f in base.fields() {
         let dt = match f.data_type() {
             DataType::Timestamp(_, _) => DataType::Utf8,
@@ -33,8 +38,10 @@ fn make_read_schema(base: &ArrowSchema) -> Arc<ArrowSchema> {
         };
         fields.push(Field::new(f.name(), dt, f.is_nullable()));
     }
+
     Arc::new(ArrowSchema::new(fields))
 }
+
 /// Splits CSV data into record-batches of `chunk_size` rows,
 /// skipping the first 4 control columns via projection, and
 /// converts DATE/TIMESTAMP fields back to native types before writing Parquet.
@@ -57,7 +64,7 @@ pub fn chunk_and_write_segment(
     let table_name = format!("{}_{}", header_parts[1], header_parts[2]);
 
     // 2) Log only the derived table_name instead of all header fields
-    info!(table=%table_name, "splitting into batches");
+    info!(table = %table_name, "splitting into batches");
 
     // 3) Read schema: include 4 dummy columns + actual
     let read_schema = make_read_schema(&arrow_schema);
@@ -93,7 +100,7 @@ pub fn chunk_and_write_segment(
                     let converted = match convert_date_columns(batch, &arrow_schema) {
                         Ok(b) => b,
                         Err(e) => {
-                            error!(table=%table_name, chunk=%batch_idx, "conversion error: {:?}", e);
+                            error!(table = %table_name, chunk = %batch_idx, "conversion error: {:?}", e);
                             return;
                         }
                     };
@@ -106,49 +113,49 @@ pub fn chunk_and_write_segment(
                     let file = match File::create(&temp_path) {
                         Ok(f) => f,
                         Err(e) => {
-                            error!(table=%table_name, chunk=%batch_idx, "file create error: {:?}", e);
+                            error!(table = %table_name, chunk = %batch_idx, "file create error: {:?}", e);
                             return;
                         }
                     };
                     let mut writer = match ArrowWriter::try_new(file, arrow_schema.clone(), Some(props.clone())) {
                         Ok(w) => w,
                         Err(e) => {
-                            error!(table=%table_name, chunk=%batch_idx, "writer open error: {:?}", e);
+                            error!(table = %table_name, chunk = %batch_idx, "writer open error: {:?}", e);
                             return;
                         }
                     };
 
                     if let Err(e) = writer.write(&converted) {
-                        error!(table=%table_name, chunk=%batch_idx, "write error: {:?}", e);
+                        error!(table = %table_name, chunk = %batch_idx, "write error: {:?}", e);
                     }
                     if let Err(e) = writer.close() {
-                        error!(table=%table_name, chunk=%batch_idx, "close error: {:?}", e);
+                        error!(table = %table_name, chunk = %batch_idx, "close error: {:?}", e);
                     }
 
                     // Move the temporary file to the final destination
                     if let Err(e) = fs::rename(&temp_path, &out_path) {
                         error!(
-                            table=%table_name,
-                            chunk=%batch_idx,
-                            temp_path=%temp_path.display(),
-                            out_path=%out_path.display(),
-                            "rename error: {:?}", e
+                            table = %table_name,
+                            chunk = %batch_idx,
+                            temp_path = %temp_path.display(),
+                            out_path = %out_path.display(),
+                            "rename error: {:?}",
+                            e
                         );
                     }
-                    debug!(table=%table_name, chunk=%batch_idx, rows=converted.num_rows(), "wrote rows");
+                    debug!(table = %table_name, chunk = %batch_idx, rows = converted.num_rows(), "wrote rows");
                 }
                 Err(e) => {
-                    error!(table=%table_name, chunk=%batch_idx, "CSV parse error: {:?}", e);
+                    error!(table = %table_name, chunk = %batch_idx, "CSV parse error: {:?}", e);
                 }
             }
         });
 
-    info!(table=%table_name, "processed file");
+    info!(table = %table_name, "processed file");
 }
 
 /// Convert CTL DATE columns (utf8, in UTC+10) to TimestampMicrosecondArray in the RecordBatch,
 /// parsing digits directly for performance.
-
 fn convert_date_columns(batch: RecordBatch, schema: &Arc<ArrowSchema>) -> Result<RecordBatch> {
     let mut columns: Vec<ArrayRef> = batch.columns().to_vec();
 
@@ -156,7 +163,7 @@ fn convert_date_columns(batch: RecordBatch, schema: &Arc<ArrowSchema>) -> Result
     let offset =
         FixedOffset::east_opt(10 * 3600).ok_or_else(|| anyhow!("invalid fixed offset +10h"))?;
 
-    for (i, col_meta) in schema.fields.iter().enumerate() {
+    for (i, col_meta) in schema.fields().iter().enumerate() {
         if col_meta.data_type() != &DataType::Timestamp(TimeUnit::Microsecond, None) {
             continue; // not a DATE column
         }
