@@ -1,16 +1,19 @@
-// src/process/chunk.rs
+// src/process/chunk_arrow.rs
 
 use anyhow::{anyhow, Context, Result};
 use arrow::array::Array;
 use arrow::array::{ArrayRef, PrimitiveBuilder, StringArray, TimestampMicrosecondArray};
 use arrow::csv::ReaderBuilder;
-use arrow::datatypes::{DataType, Field, Schema as ArrowSchema, TimestampMicrosecondType};
+use arrow::datatypes::{
+    DataType as ArrowDT, Field, Schema as ArrowSchema, TimestampMicrosecondType,
+};
 use arrow::record_batch::RecordBatch;
 use arrow_schema::TimeUnit;
+use arrow_schema::{DataType as ArrowDataType, TimeUnit as ArrowTimeUnit};
 use chrono::TimeZone;
 use chrono::{FixedOffset, NaiveDate, NaiveDateTime, NaiveTime};
 use parquet::arrow::ArrowWriter;
-use parquet::basic::{BrotliLevel, Compression};
+use parquet::basic::{BrotliLevel, Compression as ParquetCompressionArrow};
 use parquet::file::properties::WriterProperties;
 use rayon::prelude::*;
 use std::fs;
@@ -21,19 +24,19 @@ use std::sync::Arc;
 use tracing::{debug, error};
 
 /// Build a "read" ArrowSchema from the base schema:
-/// - prepend 4 dummy Utf8 fields (rec_type, domain, measure, seq),
+/// - prepend 4 dummy Utf8 fields (`rec_type`, `domain`, `measure`, `seq`),
 /// - convert any Timestamp(µs) fields to Utf8 for CSV parsing.
-fn make_read_schema(base: &ArrowSchema) -> Arc<ArrowSchema> {
+pub fn make_read_schema(base: &ArrowSchema) -> Arc<ArrowSchema> {
     let mut fields = Vec::with_capacity(base.fields().len() + 4);
 
-    fields.push(Field::new("rec_type", DataType::Utf8, false));
-    fields.push(Field::new("domain", DataType::Utf8, false));
-    fields.push(Field::new("measure", DataType::Utf8, false));
-    fields.push(Field::new("seq", DataType::Utf8, false));
+    fields.push(Field::new("rec_type", ArrowDT::Utf8, false));
+    fields.push(Field::new("domain", ArrowDT::Utf8, false));
+    fields.push(Field::new("measure", ArrowDT::Utf8, false));
+    fields.push(Field::new("seq", ArrowDT::Utf8, false));
 
     for f in base.fields() {
         let dt = match f.data_type() {
-            DataType::Timestamp(_, _) => DataType::Utf8,
+            ArrowDT::Timestamp(_, _) => ArrowDT::Utf8, // parse timestamp from string
             other => other.clone(),
         };
         fields.push(Field::new(f.name(), dt, f.is_nullable()));
@@ -54,10 +57,9 @@ pub fn chunk_and_write_segment(
     let chunk_size = 1_000_000;
 
     // 1) Derive the table name by concatenating fields 1–3 of the first line in the CSV.
-    //    If the first line doesn’t have at least 3 comma-separated columns, fall back to file_name.
     let first_line = data.lines().next().unwrap_or_default();
     let header_parts: Vec<&str> = first_line.split(',').collect();
-    if header_parts.len() < 3 {
+    if header_parts.len() < 4 {
         error!(file_name = %file_name, "Insufficient header fields, skipping chunk");
         return;
     }
@@ -66,7 +68,7 @@ pub fn chunk_and_write_segment(
         header_parts[1], header_parts[2], header_parts[3]
     );
 
-    // 2) Log only the derived table_name instead of all header fields
+    // 2) Log only the derived table_name
     debug!(table = %table_name, "splitting into batches");
 
     // 3) Read schema: include 4 dummy columns + actual
@@ -80,14 +82,16 @@ pub fn chunk_and_write_segment(
     let csv_reader = ReaderBuilder::new(read_schema.clone())
         .with_header(true)
         .with_batch_size(chunk_size)
-        .with_projection(projection) // skip first 4 fields
+        .with_projection(projection)
         .build(cursor)
         .context("creating CSV reader")
-        .unwrap(); // or handle error gracefully
+        .unwrap();
 
-    // 6) Parquet writer properties
+    // 6) Parquet writer properties (Arrow-based)
     let props = WriterProperties::builder()
-        .set_compression(Compression::BROTLI(BrotliLevel::try_new(5).unwrap()))
+        .set_compression(ParquetCompressionArrow::BROTLI(
+            BrotliLevel::try_new(5).unwrap(),
+        ))
         .set_dictionary_enabled(true)
         .build();
 
@@ -108,11 +112,11 @@ pub fn chunk_and_write_segment(
                         }
                     };
 
-                    // Build the Parquet filename using the derived table_name
+                    // Build the Parquet filename
                     let out_path = out_dir.join(format!("{}--{}--chunk{}.parquet", file_name, table_name, batch_idx));
                     let temp_path = out_path.with_extension("tmp");
 
-                    // Write the file to a temporary path first
+                    // Write via ArrowWriter to a temporary path
                     let file = match File::create(&temp_path) {
                         Ok(f) => f,
                         Err(e) => {
@@ -135,7 +139,7 @@ pub fn chunk_and_write_segment(
                         error!(table = %table_name, chunk = %batch_idx, "close error: {:?}", e);
                     }
 
-                    // Move the temporary file to the final destination
+                    // Rename .tmp → final
                     if let Err(e) = fs::rename(&temp_path, &out_path) {
                         error!(
                             table = %table_name,
@@ -167,8 +171,9 @@ fn convert_date_columns(batch: RecordBatch, schema: &Arc<ArrowSchema>) -> Result
         FixedOffset::east_opt(10 * 3600).ok_or_else(|| anyhow!("invalid fixed offset +10h"))?;
 
     for (i, col_meta) in schema.fields().iter().enumerate() {
-        if col_meta.data_type() != &DataType::Timestamp(TimeUnit::Microsecond, None) {
-            continue; // not a DATE column
+        // Only process columns whose declared arrow type was Timestamp(µs)
+        if col_meta.data_type() != &ArrowDT::Timestamp(TimeUnit::Microsecond, None) {
+            continue;
         }
 
         let idx = i;

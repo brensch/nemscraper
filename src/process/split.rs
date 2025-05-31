@@ -1,4 +1,4 @@
-use crate::process::chunk::chunk_and_write_segment;
+use crate::process::chunk_arrow::chunk_and_write_segment;
 use crate::schema::store::SchemaStore;
 use anyhow::Result;
 use num_cpus;
@@ -9,6 +9,8 @@ use std::path::Path;
 use std::sync::Arc;
 use tracing::{instrument, warn};
 use zip::ZipArchive;
+
+use super::chunk_polars::csv_to_parquet;
 
 /// Splits each CSV file in the ZIP into chunks and writes Parquet files,
 /// using a pre-built lookup of column types per table, with a fallback
@@ -91,17 +93,20 @@ pub fn split_zip_to_parquet<P: AsRef<Path>, Q: AsRef<Path>>(
         // process segments in parallel
         segments.into_par_iter().for_each(|(start, end)| {
             // build or retrieve ArrowSchema for this table
-            let arrow_schema = schema_store
-                .get_schema(&text_str, start, end)
-                .unwrap_or_else(|e| panic!("schema error: {:?}", e));
+            // let arrow_schema = schema_store
+            //     .get_schema(&text_str, start, end)
+            //     .unwrap_or_else(|e| panic!("schema error: {:?}", e));
 
             // chunk and write without further slicing of text
-            chunk_and_write_segment(
-                &file_name,
-                arrow_schema.clone(),
-                &text_str[start..end],
-                &*out_path,
-            );
+            // chunk_and_write_segment(
+            //     &file_name,
+            //     arrow_schema.clone(),
+            //     &text_str[start..end],
+            //     &*out_path,
+            // );
+
+            csv_to_parquet(&file_name, &text_str[start..end], &*out_path)
+                .unwrap_or_else(|e| panic!("csv to parquet error: {:?}", e));
         });
     }
 
