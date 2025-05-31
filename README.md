@@ -1,7 +1,9 @@
 # nemscraper
 scrape all files from the nem archives and compress them to a more usable parquet format.
 
-
+# Usage
+## Dashboard
+```bash
 docker run -d \
   --name=grafana \
   -u "$(id -u):$(id -g)" \
@@ -14,6 +16,34 @@ docker run -d \
   -v $(pwd)/assets:/data/ \
   -e "GF_PLUGINS_ALLOW_LOADING_UNSIGNED_PLUGINS=motherduck-duckdb-datasource" \
   grafana/grafana:latest-ubuntu
+  ```
+
+## monitor files
+
+From within the `assets` directory, you can monitor the number of files in each subdirectory and the disk usage of the assets directory using the following command:
+
+```bash
+watch -n 2 '
+  echo "=== File Counts ==="
+  for dir in */; do
+    echo -n "${dir%/}: "
+    find "$dir" -maxdepth 1 -type f | wc -l
+  done
+
+  echo
+  echo "=== Disk Usage ==="
+  du -sh ./*
+
+  echo
+  echo "=== Processes Matching \"nemscraper\" ==="
+  top -b -n1 | awk "/^ *PID/ || /nemscraper/" || echo "No nemscraper process"
+'
+
+```
+
+## 
+
+# Benchmarking Compression Algorithms
 
 Note using brotli 5 for compression, it performed the best
 
