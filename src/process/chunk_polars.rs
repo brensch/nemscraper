@@ -6,7 +6,8 @@ use std::fs;
 use std::io::Cursor;
 use std::path::Path;
 use std::sync::Arc;
-use tracing::info;
+use std::time::Instant;
+use tracing::{debug, info};
 
 /// 1) Trim whitespace + strip outer quotes if present.
 ///    Always returns an owned String.
@@ -88,23 +89,32 @@ fn check_first_row_trim(df: &DataFrame) -> PolarsResult<bool> {
 ///    - Promote any integerish/Float32 → Float64 in that schema.
 ///    - Re-read full CSV with `.with_dtype_overwrite(...)` so no Int64 remains.
 ///    - For each detected date column, `strptime(...)` into
-///      `Datetime(TimeUnit::Milliseconds, Some("Australia/Sydney"))`.
+///      `Datetime(TimeUnit::Milliseconds, Some("+10:00"))`.
 ///    - Build filename prefix from headers 1,2,3.
 ///    - If any string column’s first row (after `clean_str`) “looks numeric,” do a full‐column
 ///      `clean_str(...)` → cast to Float64 (or leave as String).
 ///    - Write to `<prefix>_<file>.parquet.tmp` → rename to `.parquet`.
 pub fn csv_to_parquet(file_name: &str, data: &str, out_dir: &Path) -> Result<(), Box<dyn Error>> {
     // ─── Step A: SAMPLE‐READ (first 1,000 rows) ───────────────────────────────────
+    let step_a_start = Instant::now();
     let sample_size = 1000;
     let mut sample_cursor = Cursor::new(data.as_bytes());
     let sample_opts = CsvReadOptions::default()
         .with_has_header(true)
-        .with_n_rows(Some(sample_size));
+        .with_n_rows(Some(sample_size))
+        .with_infer_schema_length(Some(sample_size));
     let sample_df: DataFrame = CsvReader::new(&mut sample_cursor)
         .with_options(sample_opts)
         .finish()?;
+    let step_a_elapsed = step_a_start.elapsed();
+    debug!(
+        "Step A (sample-read {} rows) took {:.3}s",
+        sample_size,
+        step_a_elapsed.as_secs_f64()
+    );
 
     // ─── Step B: BUILD A FORCED‐DTYPE VECTOR AND IDENTIFY DATE COLUMNS ─────────────
+    let step_b_start = Instant::now();
     let mut forced_dtypes: Vec<DataType> = Vec::with_capacity(sample_df.width());
     let mut date_cols: Vec<PlSmallStr> = Vec::new();
 
@@ -133,19 +143,17 @@ pub fn csv_to_parquet(file_name: &str, data: &str, out_dir: &Path) -> Result<(),
         }
     }
 
-    // ─── Log the inferred (provisional) schema ────────────────────────────────────
-    info!("Inferred schema from sample:");
-    for (col_name, dtype) in sample_df
-        .get_column_names()
-        .iter()
-        .zip(forced_dtypes.iter())
-    {
-        info!("  {}: {:?}", col_name, dtype);
-    }
+    let step_b_elapsed = step_b_start.elapsed();
+    debug!(
+        "Step B (forced dtypes + identify date columns) took {:.3}s; found {} date columns",
+        step_b_elapsed.as_secs_f64(),
+        date_cols.len()
+    );
 
     let dtypes_ref: Arc<Vec<DataType>> = Arc::new(forced_dtypes);
 
     // ─── Step C: FULL‐READ with FORCED‐DTYPE VECTOR ──────────────────────────────────
+    let step_c_start = Instant::now();
     let mut full_cursor = Cursor::new(data.as_bytes());
     let full_opts = CsvReadOptions::default()
         .with_has_header(true)
@@ -153,40 +161,41 @@ pub fn csv_to_parquet(file_name: &str, data: &str, out_dir: &Path) -> Result<(),
     let mut df: DataFrame = CsvReader::new(&mut full_cursor)
         .with_options(full_opts)
         .finish()?; // now ints → Float64; date columns are still String
+    let step_c_elapsed = step_c_start.elapsed();
+    debug!(
+        "Step C (full-read with forced dtypes) took {:.3}s; DataFrame shape: {}x{}",
+        step_c_elapsed.as_secs_f64(),
+        df.height(),
+        df.width()
+    );
 
     // ─── Step C2: FOR EACH DETECTED DATE COLUMN, PARSE AS DATETIME(GMT+10) ─────────
+    let step_c2_start = Instant::now();
     for col_name in &date_cols {
-        // only proceed if the DataFrame actually has this column name
         if df.get_column_names().contains(&col_name) {
-            // grab the column as a Utf8Chunked (string) array
             let col = df.column(col_name)?;
             let utf8_col: &StringChunked = col.str()?;
 
-            // format, time unit, and flags
             let fmt: Option<&str> = Some("%Y/%m/%d %H:%M:%S");
             let tu = TimeUnit::Milliseconds;
             let use_cache = true;
             let tz_aware = true;
-
-            // static UTC+10 offset, created via Polars’s small‐string TimeZone
-            //
-            // SAFETY: `from_static` does no validation on the string. Here we
-            // know "+10:00" is a valid fixed‐offset identifier, so this is safe.
             let tz: TimeZone = unsafe { TimeZone::from_static("+10:00") };
-
-            // since we’re using a fixed offset, DST can’t occur—any “ambiguous” mask is ignored
-            // but we still need to pass a StringChunked, so fill with empty strings
             let amb = StringChunked::full("ambiguous".into(), "", utf8_col.len());
 
-            // parse the string column into a DatetimeChunked, attaching the +10:00 offset
             let parsed = utf8_col.as_datetime(fmt, tu, use_cache, tz_aware, Some(&tz), &amb)?;
-
-            // replace the original column with the new datetime‐typed series
             df.replace(col_name, parsed.into_series())?;
         }
     }
+    let step_c2_elapsed = step_c2_start.elapsed();
+    debug!(
+        "Step C2 (parse date columns: {:?}) took {:.3}s",
+        date_cols,
+        step_c2_elapsed.as_secs_f64()
+    );
 
     // ─── Step D: BUILD PREFIX FROM COLUMN HEADERS 1,2,3 ─────────────────────────────
+    let step_d_start = Instant::now();
     let all_trimmed_names: Vec<String> = df
         .get_column_names()
         .iter()
@@ -214,13 +223,19 @@ pub fn csv_to_parquet(file_name: &str, data: &str, out_dir: &Path) -> Result<(),
     };
     let final_path = out_dir.join(final_name);
     let tmp_path = out_dir.join(tmp_name);
+    let step_d_elapsed = step_d_start.elapsed();
+    debug!(
+        "Step D (build filename prefix) took {:.3}s; prefix=\"{}\"",
+        step_d_elapsed.as_secs_f64(),
+        prefix
+    );
 
     // ─── Step E: CHECK FIRST‐ROW TRIM FOR STRING COLUMNS ────────────────────────────
+    let step_e_start = Instant::now();
     let type_changed = check_first_row_trim(&df)?;
     if type_changed {
-        println!("→ At least one string column’s first‐row changed type after trimming.");
+        debug!("Step E: first-row trim changed types; applying full-column clean/cast");
         for col_name in df.get_column_names_owned() {
-            // Skip if this column was parsed as datetime
             if date_cols.contains(&col_name) {
                 continue;
             }
@@ -247,22 +262,39 @@ pub fn csv_to_parquet(file_name: &str, data: &str, out_dir: &Path) -> Result<(),
             }
         }
     }
-
-    // ─── Log the updated schema (column names and types) ────────────────────────────
-    info!("Updated schema after parsing and cleanup:");
-    for col_name in df.get_column_names() {
-        info!("  {}: {:?}", col_name, df.column(col_name)?.dtype());
-    }
+    let step_e_elapsed = step_e_start.elapsed();
+    debug!(
+        "Step E (check and apply first-row trim) took {:.3}s; type_changed={}",
+        step_e_elapsed.as_secs_f64(),
+        type_changed
+    );
 
     // ─── Step F: WRITE to temporary Parquet ────────────────────────────────────────
+    let step_f_start = Instant::now();
     {
         let mut tmp_file = fs::File::create(&tmp_path)?;
         ParquetWriter::new(&mut tmp_file)
             .with_compression(ParquetCompression::Brotli(Some(BrotliLevel::try_new(5)?)))
             .finish(&mut df.clone())?;
     }
+    let step_f_elapsed = step_f_start.elapsed();
+    debug!(
+        "Step F (write to temp Parquet: {}) took {:.3}s",
+        tmp_path.display(),
+        step_f_elapsed.as_secs_f64()
+    );
 
     // ─── Step G: ATOMIC RENAME → final .parquet ────────────────────────────────────
+    let step_g_start = Instant::now();
     fs::rename(&tmp_path, &final_path)?;
+    let step_g_elapsed = step_g_start.elapsed();
+    debug!(
+        "Step G (rename {} → {}) took {:.3}s",
+        tmp_path.display(),
+        final_path.display(),
+        step_g_elapsed.as_secs_f64()
+    );
+
+    info!("Wrote final Parquet: {}", final_path.display());
     Ok(())
 }

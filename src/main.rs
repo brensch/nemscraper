@@ -29,20 +29,20 @@ async fn main() -> Result<()> {
     // ─── 2) configure dirs ───────────────────────────────────────────
     let client = Client::new();
     let assets = PathBuf::from("assets");
-    let schemas_dir = assets.join("schemas");
+    // let schemas_dir = assets.join("schemas");
     let zips_dir = assets.join("zips");
     let parquet_dir = assets.join("parquet");
     let history_dir = assets.join("history");
 
-    for d in [&schemas_dir, &zips_dir, &parquet_dir, &history_dir] {
+    for d in [&zips_dir, &parquet_dir, &history_dir] {
         fs::create_dir_all(d)?;
     }
 
     // ─── 3) history & lookup store ───────────────────────────────────
     // Now History only holds a single in-memory HashSet<String> of “seen” filenames.
     let history = Arc::new(History::new(&history_dir)?);
-    info!("initial schema fetch → {}", schemas_dir.display());
-    let schema_store = Arc::new(schema::SchemaStore::new(&schemas_dir)?);
+    // info!("initial schema fetch → {}", schemas_dir.display());
+    // let schema_store = Arc::new(schema::SchemaStore::new(&schemas_dir)?);
 
     // ─── 4) channels ──────────────────────────────────────────────────
     let (processor_tx, mut processor_rx) =
@@ -199,10 +199,10 @@ async fn main() -> Result<()> {
                 let out_dir = parquet_dir.clone();
                 let history_clone = history.clone();
                 let split_path = zip_path.clone();
-                let schema_store = Arc::clone(&schema_store);
+                // let schema_store = Arc::clone(&schema_store);
 
                 let split_res = task::spawn_blocking(move || {
-                    process::split::split_zip_to_parquet(&split_path, &out_dir, schema_store)
+                    process::split::split_zip_to_parquet(&split_path, &out_dir)
                 })
                 .await?;
 
