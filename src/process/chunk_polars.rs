@@ -208,9 +208,8 @@ pub fn csv_to_parquet(file_name: &str, data: &str, out_dir: &Path) -> Result<(),
     let type_changed = check_first_row_trim(&df)?;
     if type_changed {
         println!("→ At least one string column’s first‐row changed type after trimming.");
-
         // let col_names: Vec<PlSmallStr> = df.get_column_names().iter().map(|s| s).collect();
-        for col_name in df.get_column_names() {
+        for col_name in df.get_column_names_owned() {
             // Skip if this column was parsed as datetime
             if date_cols.contains(&col_name) {
                 continue;
