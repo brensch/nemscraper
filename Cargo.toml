@@ -49,4 +49,5 @@ polars = { version = "0.48.1", features = [
     "csv",
     "parquet",
     "timezones",
+    "default",
 ] }

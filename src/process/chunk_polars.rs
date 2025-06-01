@@ -95,14 +95,17 @@ fn check_first_row_trim(df: &DataFrame) -> PolarsResult<bool> {
 ///      `clean_str(...)` → cast to Float64 (or leave as String).
 ///    - Write to `<prefix>_<file>.parquet.tmp` → rename to `.parquet`.
 pub fn csv_to_parquet(file_name: &str, data: &str, out_dir: &Path) -> Result<(), Box<dyn Error>> {
+    debug!("starting");
     // ─── Step A: SAMPLE‐READ (first 1,000 rows) ───────────────────────────────────
     let step_a_start = Instant::now();
     let sample_size = 1000;
     let mut sample_cursor = Cursor::new(data.as_bytes());
+
     let sample_opts = CsvReadOptions::default()
         .with_has_header(true)
         .with_n_rows(Some(sample_size))
-        .with_infer_schema_length(Some(sample_size));
+        .with_infer_schema_length(Some(sample_size))
+        .with_ignore_errors(true);
     let sample_df: DataFrame = CsvReader::new(&mut sample_cursor)
         .with_options(sample_opts)
         .finish()?;
@@ -112,6 +115,8 @@ pub fn csv_to_parquet(file_name: &str, data: &str, out_dir: &Path) -> Result<(),
         sample_size,
         step_a_elapsed.as_secs_f64()
     );
+    // Log the schema of the sampled DataFrame
+    debug!("Step A schema: {:#?}", sample_df.schema());
 
     // ─── Step B: BUILD A FORCED‐DTYPE VECTOR AND IDENTIFY DATE COLUMNS ─────────────
     let step_b_start = Instant::now();
@@ -149,6 +154,12 @@ pub fn csv_to_parquet(file_name: &str, data: &str, out_dir: &Path) -> Result<(),
         step_b_elapsed.as_secs_f64(),
         date_cols.len()
     );
+    // Log forced dtypes paired with column names
+    let column_names = sample_df.get_column_names();
+    for (name, dt) in column_names.iter().zip(forced_dtypes.iter()) {
+        debug!("  Column `{}` → forced dtype {:?}", name, dt);
+    }
+    debug!("Step B date columns: {:?}", date_cols);
 
     let dtypes_ref: Arc<Vec<DataType>> = Arc::new(forced_dtypes);
 
@@ -168,6 +179,8 @@ pub fn csv_to_parquet(file_name: &str, data: &str, out_dir: &Path) -> Result<(),
         df.height(),
         df.width()
     );
+    // Log the schema after full read
+    debug!("Step C schema: {:#?}", df.schema());
 
     // ─── Step C2: FOR EACH DETECTED DATE COLUMN, PARSE AS DATETIME(GMT+10) ─────────
     let step_c2_start = Instant::now();
@@ -185,6 +198,10 @@ pub fn csv_to_parquet(file_name: &str, data: &str, out_dir: &Path) -> Result<(),
 
             let parsed = utf8_col.as_datetime(fmt, tu, use_cache, tz_aware, Some(&tz), &amb)?;
             df.replace(col_name, parsed.into_series())?;
+            debug!(
+                "  Parsed date column `{}` into Datetime(TimeUnit::Milliseconds, \"+10:00\")",
+                col_name
+            );
         }
     }
     let step_c2_elapsed = step_c2_start.elapsed();
@@ -193,6 +210,8 @@ pub fn csv_to_parquet(file_name: &str, data: &str, out_dir: &Path) -> Result<(),
         date_cols,
         step_c2_elapsed.as_secs_f64()
     );
+    // Log the schema after date parsing
+    debug!("Step C2 schema: {:#?}", df.schema());
 
     // ─── Step D: BUILD PREFIX FROM COLUMN HEADERS 1,2,3 ─────────────────────────────
     let step_d_start = Instant::now();
@@ -249,6 +268,10 @@ pub fn csv_to_parquet(file_name: &str, data: &str, out_dir: &Path) -> Result<(),
                 let new_dtype = infer_dtype_from_str(&cleaned_first);
                 let old_dtype = col.dtype();
                 if &new_dtype != old_dtype {
+                    debug!(
+                        "  Column `{}`: first-row cleaned dtype {:?} → casting entire column to {:?}",
+                        col_name, old_dtype, new_dtype
+                    );
                     let s: Series = col.as_series().unwrap().clone();
                     let cleaned_utf8: StringChunked =
                         s.str()?.apply(|opt| opt.map(|v| Cow::Owned(clean_str(v))));
@@ -268,6 +291,8 @@ pub fn csv_to_parquet(file_name: &str, data: &str, out_dir: &Path) -> Result<(),
         step_e_elapsed.as_secs_f64(),
         type_changed
     );
+    // Log the schema after potential full-column casts
+    debug!("Step E schema: {:#?}", df.schema());
 
     // ─── Step F: WRITE to temporary Parquet ────────────────────────────────────────
     let step_f_start = Instant::now();
