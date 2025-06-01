@@ -1,10 +1,7 @@
 use anyhow::Result;
-use num_cpus;
-use rayon::prelude::*;
 use std::fs::File;
 use std::io::Read;
 use std::path::Path;
-use std::sync::Arc;
 use tracing::{debug, instrument, warn};
 use zip::ZipArchive;
 
@@ -19,22 +16,14 @@ pub fn split_zip_to_parquet<P: AsRef<Path>, Q: AsRef<Path>>(
     out_dir: Q,
     // schema_store: Arc<SchemaStore>,
 ) -> Result<()> {
-    // 1) Configure Rayon
-    let num_threads = num_cpus::get();
-    debug!("Configuring Rayon thread pool with {} threads", num_threads);
-    rayon::ThreadPoolBuilder::new()
-        .num_threads(num_threads)
-        .build_global()
-        .ok();
-
-    // 2) Open the ZIP file
+    // 1) Open the ZIP file
     debug!("Opening ZIP file: {}", zip_path.as_ref().display());
     let file = File::open(&zip_path)?;
     let mut archive = ZipArchive::new(file)?;
     let total_entries = archive.len();
     debug!("ZIP archive contains {} entries", total_entries);
 
-    // 3) Iterate over each entry in the ZIP
+    // 2) Iterate over each entry in the ZIP
     for idx in 0..total_entries {
         let mut entry = archive.by_index(idx)?;
         let file_name = entry.name().to_string();
@@ -46,15 +35,15 @@ pub fn split_zip_to_parquet<P: AsRef<Path>, Q: AsRef<Path>>(
         }
         debug!("Processing CSV entry: {}", file_name);
 
-        // 4) Read the entire CSV into memory (Arc<String>)
+        // 3) Read the entire CSV into memory
         let mut buf = Vec::new();
         entry.read_to_end(&mut buf)?;
         debug!("Read {} bytes from {}", buf.len(), file_name);
 
-        let text = Arc::new(String::from_utf8_lossy(&buf).into_owned());
+        let text = String::from_utf8_lossy(&buf).into_owned();
         let text_str: &str = &text;
 
-        // 5) Find and strip off the first and last C-lines
+        // 4) Find and strip off the first and last C-lines
         let first_data = text_str.find('\n').map(|i| i + 1).unwrap_or_else(|| {
             warn!(
                 "Error in {}: every CSV must have a metadata C-line at the top",
@@ -77,7 +66,7 @@ pub fn split_zip_to_parquet<P: AsRef<Path>, Q: AsRef<Path>>(
         let core = &text_str[first_data..footer_start];
         debug!("Core length (bytes): {}", core.len());
 
-        // 6) Find start-of-line offsets for every `I,` within that blob
+        // 5) Find start-of-line offsets for every `I,` within that blob
         let mut header_starts = Vec::new();
         header_starts.push(0);
         for (rel, _) in core.match_indices("\nI,") {
@@ -86,7 +75,7 @@ pub fn split_zip_to_parquet<P: AsRef<Path>, Q: AsRef<Path>>(
         header_starts.sort_unstable();
         debug!("Found {} header starts", header_starts.len());
 
-        // 7) Build segments by pairing each start with the next (or end of blob)
+        // 6) Build segments by pairing each start with the next (or end of blob)
         let mut segments = Vec::with_capacity(header_starts.len());
         for window in header_starts.windows(2) {
             let hs = window[0];
@@ -103,29 +92,25 @@ pub fn split_zip_to_parquet<P: AsRef<Path>, Q: AsRef<Path>>(
             segments.len()
         );
 
-        // 8) Prepare output path
+        // 7) Prepare output path
         let out_path = out_dir.as_ref().to_path_buf();
-        let out_path = Arc::new(out_path);
 
-        // 9) Process each segment in parallel
-        segments
-            .into_par_iter()
-            .enumerate()
-            .for_each(|(seg_idx, (start, end))| {
-                debug!(
-                    "Segment {} for {}: byte range [{}, {})",
-                    seg_idx, file_name, start, end
-                );
+        // 8) Process each segment sequentially
+        for (seg_idx, (start, end)) in segments.into_iter().enumerate() {
+            debug!(
+                "Segment {} for {}: byte range [{}, {})",
+                seg_idx, file_name, start, end
+            );
 
-                // Convert this slice of CSV to Parquet
-                csv_to_parquet(&file_name, &text_str[start..end], &*out_path).unwrap_or_else(|e| {
-                    panic!(
-                        "csv to parquet error on {} segment {}: {:?}",
-                        file_name, seg_idx, e
-                    )
-                });
-                debug!("Finished writing segment {} for {}", seg_idx, file_name);
+            // Convert this slice of CSV to Parquet
+            csv_to_parquet(&file_name, &text_str[start..end], &out_path).unwrap_or_else(|e| {
+                panic!(
+                    "csv to parquet error on {} segment {}: {:?}",
+                    file_name, seg_idx, e
+                )
             });
+            debug!("Finished writing segment {} for {}", seg_idx, file_name);
+        }
 
         debug!("Completed all segments for {}", file_name);
     }
