@@ -1,11 +1,9 @@
 use std::env;
 use std::path::PathBuf;
-use std::sync::Arc;
 use std::time::Instant;
 
 use anyhow::Result;
 use nemscraper::process::split::split_zip_to_parquet;
-use nemscraper::schema::store::SchemaStore;
 use tracing::Level;
 use tracing_subscriber::{self, EnvFilter};
 

@@ -1,5 +1,5 @@
 use anyhow::Result;
-use nemscraper::{fetch, process, schema};
+use nemscraper::{fetch, process};
 use rand::seq::IteratorRandom;
 use rand::thread_rng;
 use reqwest::Client;
@@ -188,7 +188,7 @@ async fn main() -> Result<()> {
             Ok(zip_path) => {
                 let name = zip_path.file_name().unwrap().to_string_lossy().to_string();
 
-                // If this ZIP was already seen (downloaded or processed), skip.
+                // If this ZIP was already seen (processed), skip.
                 if history.get(&name, &history::State::Processed) {
                     debug!(name = %name, "already seen, skipping processing of {}", name);
                     continue;

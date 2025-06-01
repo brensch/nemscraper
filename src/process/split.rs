@@ -1,4 +1,3 @@
-use crate::schema::store::SchemaStore;
 use anyhow::Result;
 use num_cpus;
 use rayon::prelude::*;
