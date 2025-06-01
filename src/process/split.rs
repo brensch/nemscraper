@@ -1,4 +1,3 @@
-use crate::process::chunk_arrow::chunk_and_write_segment;
 use crate::schema::store::SchemaStore;
 use anyhow::Result;
 use num_cpus;

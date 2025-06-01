@@ -9,7 +9,6 @@ use arrow::datatypes::{
 };
 use arrow::record_batch::RecordBatch;
 use arrow_schema::TimeUnit;
-use arrow_schema::{DataType as ArrowDataType, TimeUnit as ArrowTimeUnit};
 use chrono::TimeZone;
 use chrono::{FixedOffset, NaiveDate, NaiveDateTime, NaiveTime};
 use parquet::arrow::ArrowWriter;
