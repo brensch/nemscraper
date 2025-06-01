@@ -1,21 +1,17 @@
 use anyhow::Result;
 use std::fs::File;
-use std::io::Read;
+use std::io::{BufRead, BufReader};
 use std::path::Path;
 use tracing::{debug, instrument, warn};
 use zip::ZipArchive;
 
 use super::chunk_polars::csv_to_parquet;
 
-/// Splits each CSV file in the ZIP into chunks and writes Parquet files,
-/// using a pre-built lookup of column types per table, with a fallback
-/// to `derive_types` when lookup fails, emitting schema proposals.
+/// Splits each CSV file in the ZIP into segments (each starting with an `I,` line
+/// and including all subsequent `D,` lines) and writes Parquet files. At no point
+/// do we read the entire CSV into memory—only one segment is buffered at a time.
 #[instrument(level = "debug", skip(zip_path, out_dir), fields(zip = %zip_path.as_ref().display()))]
-pub fn split_zip_to_parquet<P: AsRef<Path>, Q: AsRef<Path>>(
-    zip_path: P,
-    out_dir: Q,
-    // schema_store: Arc<SchemaStore>,
-) -> Result<()> {
+pub fn split_zip_to_parquet<P: AsRef<Path>, Q: AsRef<Path>>(zip_path: P, out_dir: Q) -> Result<()> {
     // 1) Open the ZIP file
     debug!("Opening ZIP file: {}", zip_path.as_ref().display());
     let file = File::open(&zip_path)?;
@@ -25,7 +21,8 @@ pub fn split_zip_to_parquet<P: AsRef<Path>, Q: AsRef<Path>>(
 
     // 2) Iterate over each entry in the ZIP
     for idx in 0..total_entries {
-        let mut entry = archive.by_index(idx)?;
+        // Extract the entry and capture its name up front
+        let entry = archive.by_index(idx)?;
         let file_name = entry.name().to_string();
 
         // Skip non-CSV entries
@@ -35,81 +32,109 @@ pub fn split_zip_to_parquet<P: AsRef<Path>, Q: AsRef<Path>>(
         }
         debug!("Processing CSV entry: {}", file_name);
 
-        // 3) Read the entire CSV into memory
-        let mut buf = Vec::new();
-        entry.read_to_end(&mut buf)?;
-        debug!("Read {} bytes from {}", buf.len(), file_name);
+        // 3) Wrap the entry in a buffered reader so we can read line-by-line
+        let mut reader = BufReader::new(entry);
 
-        let text = String::from_utf8_lossy(&buf).into_owned();
-        let text_str: &str = &text;
-
-        // 4) Find and strip off the first and last C-lines
-        let first_data = text_str.find('\n').map(|i| i + 1).unwrap_or_else(|| {
+        // 4) Skip the very first “C-” metadata line at the top
+        let mut first_line = String::new();
+        let bytes_read = reader.read_line(&mut first_line)?;
+        if bytes_read == 0 || !first_line.starts_with('C') {
             warn!(
-                "Error in {}: every CSV must have a metadata C-line at the top",
-                zip_path.as_ref().display()
+                "Expected top metadata C-line in {}, but didn't find it; proceeding anyway.",
+                file_name
             );
-            0
-        });
-        debug!("First data offset: {}", first_data);
-
-        let footer_start = text_str.rfind("\nC,").unwrap_or_else(|| {
-            warn!(
-                "Error in {}: every CSV must have a footer C-line at the bottom",
-                zip_path.as_ref().display()
-            );
-            text_str.len()
-        });
-        debug!("Footer start offset: {}", footer_start);
-
-        // Extract the core (only I- and D-lines)
-        let core = &text_str[first_data..footer_start];
-        debug!("Core length (bytes): {}", core.len());
-
-        // 5) Find start-of-line offsets for every `I,` within that blob
-        let mut header_starts = Vec::new();
-        header_starts.push(0);
-        for (rel, _) in core.match_indices("\nI,") {
-            header_starts.push(rel + 1);
+        } else {
+            debug!("Skipped top C-line: {}", first_line.trim_end());
         }
-        header_starts.sort_unstable();
-        debug!("Found {} header starts", header_starts.len());
 
-        // 6) Build segments by pairing each start with the next (or end of blob)
-        let mut segments = Vec::with_capacity(header_starts.len());
-        for window in header_starts.windows(2) {
-            let hs = window[0];
-            let es = window[1];
-            segments.push((hs + first_data, es + first_data));
-        }
-        // Last segment goes to footer_start
-        if let Some(&last_hs) = header_starts.last() {
-            segments.push((last_hs + first_data, footer_start));
-        }
-        debug!(
-            "Total segments to process for {}: {}",
-            file_name,
-            segments.len()
-        );
+        // 5) Now iterate line-by-line until we hit the footer (another C-line).
+        //    Whenever we see an “I,” line, that starts a new segment. We buffer
+        //    until the next “I,” (or footer), then call csv_to_parquet on that chunk.
 
-        // 7) Prepare output path
-        let out_path = out_dir.as_ref().to_path_buf();
+        let mut segment_buf = String::new();
+        let mut first_segment = true;
 
-        // 8) Process each segment sequentially
-        for (seg_idx, (start, end)) in segments.into_iter().enumerate() {
-            debug!(
-                "Segment {} for {}: byte range [{}, {})",
-                seg_idx, file_name, start, end
-            );
+        loop {
+            let mut line = String::new();
+            let bytes = reader.read_line(&mut line)?;
+            if bytes == 0 {
+                // EOF reached; flush last segment if any
+                if !segment_buf.is_empty() {
+                    debug!(
+                        "EOF: flushing final segment ({} bytes) for {}",
+                        segment_buf.len(),
+                        file_name
+                    );
+                    csv_to_parquet(&file_name, &segment_buf, out_dir.as_ref()).unwrap_or_else(
+                        |e| {
+                            panic!(
+                                "csv_to_parquet error on {} final segment: {:?}",
+                                file_name, e
+                            )
+                        },
+                    );
+                    segment_buf.clear();
+                }
+                break;
+            }
 
-            // Convert this slice of CSV to Parquet
-            csv_to_parquet(&file_name, &text_str[start..end], &out_path).unwrap_or_else(|e| {
-                panic!(
-                    "csv to parquet error on {} segment {}: {:?}",
-                    file_name, seg_idx, e
-                )
-            });
-            debug!("Finished writing segment {} for {}", seg_idx, file_name);
+            // If this line begins with “C,” we assume it's the footer and stop.
+            if line.starts_with("C,") {
+                debug!(
+                    "Encountered footer C-line in {}: {}",
+                    file_name,
+                    line.trim_end()
+                );
+                // Flush out the last buffered segment (if any) before breaking
+                if !segment_buf.is_empty() {
+                    debug!(
+                        "Footer: flushing last segment ({} bytes) for {}",
+                        segment_buf.len(),
+                        file_name
+                    );
+                    csv_to_parquet(&file_name, &segment_buf, out_dir.as_ref()).unwrap_or_else(
+                        |e| {
+                            panic!(
+                                "csv_to_parquet error on {} footer segment: {:?}",
+                                file_name, e
+                            )
+                        },
+                    );
+                    segment_buf.clear();
+                }
+                break;
+            }
+
+            // If the line starts with "I,", it’s the start of a new segment
+            if line.starts_with("I,") {
+                if first_segment {
+                    // Start buffering the very first segment
+                    first_segment = false;
+                    segment_buf.push_str(&line);
+                } else {
+                    // We already had buffered a previous segment—flush it now
+                    debug!(
+                        "Found new I-line: flushing segment ({} bytes) for {}",
+                        segment_buf.len(),
+                        file_name
+                    );
+                    csv_to_parquet(&file_name, &segment_buf, out_dir.as_ref()).unwrap_or_else(
+                        |e| panic!("csv_to_parquet error on {} segment: {:?}", file_name, e),
+                    );
+                    // Clear and start a fresh buffer for the next segment
+                    segment_buf.clear();
+                    segment_buf.push_str(&line);
+                }
+            } else {
+                // Not an "I," or "C," line. If we are in a segment, append it.
+                if !first_segment {
+                    segment_buf.push_str(&line);
+                } else {
+                    // We haven't seen any "I," yet, but this is data (D-lines).
+                    // In well-formed CSVs, lines preceding the first I-line are usually metadata—
+                    // but just in case, collect them if we’ve already started a segment. Otherwise ignore.
+                }
+            }
         }
 
         debug!("Completed all segments for {}", file_name);
