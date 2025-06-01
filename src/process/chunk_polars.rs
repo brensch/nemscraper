@@ -4,96 +4,126 @@ use std::error::Error;
 use std::fs;
 use std::io::Cursor;
 use std::path::Path;
+use std::sync::Arc;
 
-// Import PlSmallStr so we can annotate the closure parameter.
-use polars::prelude::PlSmallStr;
+/// 1) Trim whitespace + strip outer quotes if present.
+///    Always returns an owned String.
+fn clean_str(raw: &str) -> String {
+    let trimmed = raw.trim();
+    if trimmed.starts_with('"') && trimmed.ends_with('"') && trimmed.len() >= 2 {
+        trimmed[1..trimmed.len() - 1].to_string()
+    } else {
+        trimmed.to_string()
+    }
+}
 
-/// Reads `df` (the full DataFrame), examines each *string* column’s first‐row value,
-/// and does two things in this order:
-///   1) `trim()` (remove leading/trailing whitespace)
-///   2) if the remaining text starts & ends with `"`, strip those outer quotes
-/// After that, attempt to infer “is it an integer? a float? or just a string?”  
-/// Compare that “would‐be” dtype against `series.dtype()`.  
-/// If *any* column’s first‐row trimmed value would produce a different dtype than
-/// Polars originally inferred, return `Ok(true)`. Otherwise return `Ok(false)`.
+/// 2) Infer “would-be” dtype from a cleaned string, treating ANY parseable
+///    number (integer or float) as Float64. Otherwise String.
+fn infer_dtype_from_str(s: &str) -> DataType {
+    if s.parse::<f64>().is_ok() {
+        DataType::Float64
+    } else {
+        DataType::String
+    }
+}
+
+/// 3) Promote any integer‐type or Float32 to Float64 in a sample‐inferred dtype.
+fn promote_sample_dtype(dt: &DataType) -> DataType {
+    match dt {
+        DataType::Int8
+        | DataType::Int16
+        | DataType::Int32
+        | DataType::Int64
+        | DataType::UInt8
+        | DataType::UInt16
+        | DataType::UInt32
+        | DataType::UInt64
+        | DataType::Float32 => DataType::Float64,
+        DataType::Float64 => DataType::Float64,
+        other => other.clone(),
+    }
+}
+
+/// 4) After forcing schema, check if any string column’s first‐row, once cleaned,
+///    would change dtype (String → Float64). Return true if any do.
 fn check_first_row_trim(df: &DataFrame) -> PolarsResult<bool> {
-    let mut any_type_change = false;
+    let mut any_changed = false;
 
     for col_name in df.get_column_names() {
-        let column_ref: &Column = df.column(col_name)?;
-        // Only look at this column if it is a string column:
-        if let Ok(str_ca) = column_ref.str() {
-            // If there is a non-null first‐row value, get it:
-            if let Some(orig_val) = str_ca.get(0) {
-                // 1) Trim whitespace
-                let trimmed_ws = orig_val.trim();
-                // 2) Strip outer quotes if present
-                let trimmed = if trimmed_ws.starts_with('"')
-                    && trimmed_ws.ends_with('"')
-                    && trimmed_ws.len() >= 2
-                {
-                    &trimmed_ws[1..trimmed_ws.len() - 1]
-                } else {
-                    trimmed_ws
-                };
+        let col = df.column(col_name)?;
+        // Only inspect columns with DataType::String
+        let str_ca = match col.str() {
+            Ok(ca) => ca,
+            Err(_) => continue,
+        };
 
-                // Infer the “would‐be” dtype from this trimmed string:
-                let new_dtype = if trimmed.parse::<i64>().is_ok() {
-                    DataType::Int64
-                } else if trimmed.parse::<f64>().is_ok() {
-                    DataType::Float64
-                } else {
-                    DataType::String
-                };
+        if let Some(orig_val) = str_ca.get(0) {
+            let cleaned = clean_str(orig_val);
+            let new_dtype = infer_dtype_from_str(&cleaned);
+            let old_dtype = col.dtype();
 
-                let old_dtype = column_ref.dtype();
-                if old_dtype != &new_dtype {
-                    println!(
-                        "Column '{}' first‐row WOULD change type: \
-                         {:?} (orig=\"{}\") → {:?} (trimmed=\"{}\")",
-                        col_name, old_dtype, orig_val, new_dtype, trimmed
-                    );
-                    any_type_change = true;
-                }
-
-                // Also print if the trimmed text changed compared to orig_val:
-                if trimmed != orig_val {
-                    println!(
-                        "  (and the trimmed text itself changed: \"{}\" → \"{}\")",
-                        orig_val, trimmed
-                    );
-                }
+            if old_dtype != &new_dtype {
+                println!(
+                    "Column '{}' first‐row WOULD change type: {:?} (orig=\"{}\") → {:?} (cleaned=\"{}\")",
+                    col_name, old_dtype, orig_val, new_dtype, cleaned
+                );
+                any_changed = true;
+            }
+            if cleaned != orig_val {
+                println!(
+                    "  (trimmed text changed: \"{}\" → \"{}\")",
+                    orig_val, cleaned
+                );
             }
         }
     }
 
-    Ok(any_type_change)
+    Ok(any_changed)
 }
 
-/// Example function:
-/// 1) Reads CSV normally via Polars (using a CsvReadOptions object) into a DataFrame.
-/// 2) Extracts the 2nd, 3rd, and 4th column names from `df.get_column_names()` (indices 1,2,3),
-///    trims each name, concatenates them with underscores as a prefix for filenames.
-///    If there are fewer than 4 columns, it falls back to using just `file_name`.
-/// 3) Calls `check_first_row_trim`. If it returns `true`, transforms affected columns in place.
-/// 4) Writes the (possibly modified) DataFrame out to `<prefix>_<file_name>.parquet.tmp`,
-///    then renames it to `<prefix>_<file_name>.parquet`.
+/// 5) Main CSV→Parquet routine:
+///    - Sample first N rows, let Polars infer a schema
+///    - Promote any integerish or Float32 columns to Float64 in that schema
+///    - Re-read the entire CSV with the forced schema so no Int64 remains
+///    - If any String column’s first row, once cleaned, “looks numeric,” do a full-column
+///      clean_str(...) → cast to Float64 (or leave as String) pass
+///    - Write to `<prefix>_<file>.parquet.tmp` → rename to `.parquet`
 pub fn csv_to_parquet(file_name: &str, data: &str, out_dir: &Path) -> Result<(), Box<dyn Error>> {
-    // ─── 1) Read into a DataFrame so we know Polars‐inferred column names ───────────
-    let mut cursor = Cursor::new(data.as_bytes());
-    let options = CsvReadOptions::default()
+    // ─── Step A: SAMPLE READ (first 1,000 rows) ───────────────────────────────────
+    let sample_size = 1000;
+    let mut sample_cursor = Cursor::new(data.as_bytes());
+    let sample_opts = CsvReadOptions::default()
         .with_has_header(true)
-        .with_infer_schema_length(Some(100000));
-    let mut df: DataFrame = CsvReader::new(&mut cursor).with_options(options).finish()?; // Polars has inferred dtypes and column names
+        .with_n_rows(Some(sample_size));
+    let sample_df: DataFrame = CsvReader::new(&mut sample_cursor)
+        .with_options(sample_opts)
+        .finish()?;
 
-    // ─── 2) Build `<prefix>` from columns 1,2,3 if available ─────────────────────
-    //
-    // Convert each &PlSmallStr → &str via as_str(), then trim and to_string():
+    // ─── Step B: BUILD A FORCED-DTYPE VECTOR, PROMOTING ANY INTEGERISH → Float64 ─────
+    let mut forced_dtypes: Vec<DataType> = Vec::with_capacity(sample_df.width());
+    for s in sample_df.get_columns() {
+        let orig_dtype = s.dtype();
+        let forced_dtype = promote_sample_dtype(orig_dtype);
+        forced_dtypes.push(forced_dtype);
+    }
+    let dtypes_ref: Arc<Vec<DataType>> = Arc::new(forced_dtypes);
+
+    // ─── Step C: FULL READ with FORCED DTYPE VECTOR ─────────────────────────────────
+    let mut full_cursor = Cursor::new(data.as_bytes());
+    let full_opts = CsvReadOptions::default()
+        .with_has_header(true)
+        .with_dtype_overwrite(Some(dtypes_ref.clone()));
+    let mut df: DataFrame = CsvReader::new(&mut full_cursor)
+        .with_options(full_opts)
+        .finish()?; // now any integer columns are Float64
+
+    // ─── Step D: BUILD PREFIX FROM COLUMN HEADERS 1,2,3 ─────────────────────────────
     let all_trimmed_names: Vec<String> = df
         .get_column_names()
         .iter()
-        .map(|s: &&PlSmallStr| s.as_str().trim().to_string())
+        .map(|hdr| clean_str(hdr.as_str()))
         .collect();
+
     let prefix = if all_trimmed_names.len() >= 4 {
         format!(
             "{}_{}_{}",
@@ -103,7 +133,6 @@ pub fn csv_to_parquet(file_name: &str, data: &str, out_dir: &Path) -> Result<(),
         String::new()
     };
 
-    // Construct the final and temporary filenames:
     let final_name = if prefix.is_empty() {
         format!("{}.parquet", file_name)
     } else {
@@ -117,86 +146,61 @@ pub fn csv_to_parquet(file_name: &str, data: &str, out_dir: &Path) -> Result<(),
     let final_path = out_dir.join(final_name);
     let tmp_path = out_dir.join(tmp_name);
 
-    // ─── 3) Check if any column’s *first* data‐row would change type after trimming ─
+    // ─── Step E: CHECK FIRST‐ROW TRIM FOR STRING COLUMNS ────────────────────────────
     let type_changed = check_first_row_trim(&df)?;
     if type_changed {
-        println!("→ At least one column’s first‐row changed type after trimming.");
+        println!("→ At least one string column’s first‐row changed type after trimming.");
 
-        // Collect column names into Vec<String> so we can mutate `df` inside the loop:
+        // Collect column names so we can replace in place
         let col_names: Vec<String> = df
             .get_column_names()
             .iter()
             .map(|s| s.to_string())
             .collect();
-
-        // ─── 4) For each string column, transform & cast if needed ─────────────────
         for col_name in col_names {
-            let column_ref: &Column = df.column(&col_name)?;
-            if let Ok(str_ca) = column_ref.str() {
-                if let Some(orig_val) = str_ca.get(0) {
-                    // Trim + strip outer quotes on row 0
-                    let trimmed_ws = orig_val.trim();
-                    let trimmed = if trimmed_ws.starts_with('"')
-                        && trimmed_ws.ends_with('"')
-                        && trimmed_ws.len() >= 2
-                    {
-                        &trimmed_ws[1..trimmed_ws.len() - 1]
+            let col = df.column(&col_name)?;
+            // Only transform columns whose dtype is String
+            let str_ca = match col.str() {
+                Ok(ca) => ca,
+                Err(_) => continue,
+            };
+
+            if let Some(orig_val) = str_ca.get(0) {
+                let cleaned_first = clean_str(orig_val);
+                let new_dtype = infer_dtype_from_str(&cleaned_first);
+                let old_dtype = col.dtype();
+
+                if &new_dtype != old_dtype {
+                    // a) Clone the Series for full‐column work
+                    let s: Series = col.as_series().unwrap().clone();
+
+                    // b) Apply clean_str(...) to every cell, producing a StringChunked
+                    let cleaned_utf8: StringChunked =
+                        s.str()?.apply(|opt| opt.map(|v| Cow::Owned(clean_str(v))));
+
+                    // c) Convert to Series, then cast if needed
+                    let casted_series: Series = if new_dtype == DataType::Float64 {
+                        cleaned_utf8.into_series().cast(&DataType::Float64)?
                     } else {
-                        trimmed_ws
+                        cleaned_utf8.into_series()
                     };
 
-                    // Infer new dtype from trimmed first‐row
-                    let new_dtype = if trimmed.parse::<i64>().is_ok() {
-                        DataType::Int64
-                    } else if trimmed.parse::<f64>().is_ok() {
-                        DataType::Float64
-                    } else {
-                        DataType::String
-                    };
-
-                    let old_dtype = column_ref.dtype().clone();
-                    if old_dtype != new_dtype {
-                        // a) Obtain an owned Series:
-                        let s: Series = column_ref.clone().as_series().unwrap().clone();
-
-                        // b) Apply trim+strip‐quotes to every cell (Option<Cow<str>>)
-                        let trimmed_utf8: StringChunked = s.str()?.apply(|opt_val| {
-                            opt_val.map(|val| {
-                                let ws = val.trim();
-                                if ws.starts_with('"') && ws.ends_with('"') && ws.len() >= 2 {
-                                    Cow::Owned(ws[1..ws.len() - 1].to_string())
-                                } else {
-                                    Cow::Borrowed(ws)
-                                }
-                            })
-                        });
-
-                        // c) Convert to Series of strings
-                        let trimmed_series: Series = trimmed_utf8.into_series();
-
-                        // d) Cast to new dtype
-                        let casted_series: Series = trimmed_series.cast(&new_dtype)?;
-
-                        // e) Replace in DataFrame
-                        df.replace(&col_name, casted_series)?;
-                    }
+                    // d) Replace that column in df
+                    df.replace(&col_name, casted_series)?;
                 }
             }
         }
     }
 
-    // ─── 5) Write to the temporary `.parquet.tmp` file ───────────────────────────
+    // ─── Step F: WRITE to temporary Parquet ────────────────────────────────────────
     {
         let mut tmp_file = fs::File::create(&tmp_path)?;
         ParquetWriter::new(&mut tmp_file)
-            .with_compression(ParquetCompression::Brotli(Some(
-                BrotliLevel::try_new(5).unwrap(),
-            )))
+            .with_compression(ParquetCompression::Brotli(Some(BrotliLevel::try_new(5)?)))
             .finish(&mut df.clone())?;
     }
 
-    // ─── 6) Atomically rename `.parquet.tmp` → `.parquet` ────────────────────────
+    // ─── Step G: ATOMIC RENAME → final .parquet ────────────────────────────────────
     fs::rename(&tmp_path, &final_path)?;
-
     Ok(())
 }
