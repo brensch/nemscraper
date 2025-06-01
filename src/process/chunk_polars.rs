@@ -6,6 +6,7 @@ use std::fs;
 use std::io::Cursor;
 use std::path::Path;
 use std::sync::Arc;
+use tracing::info;
 
 /// 1) Trim whitespace + strip outer quotes if present.
 ///    Always returns an owned String.
@@ -132,6 +133,16 @@ pub fn csv_to_parquet(file_name: &str, data: &str, out_dir: &Path) -> Result<(),
         }
     }
 
+    // ─── Log the inferred (provisional) schema ────────────────────────────────────
+    info!("Inferred schema from sample:");
+    for (col_name, dtype) in sample_df
+        .get_column_names()
+        .iter()
+        .zip(forced_dtypes.iter())
+    {
+        info!("  {}: {:?}", col_name, dtype);
+    }
+
     let dtypes_ref: Arc<Vec<DataType>> = Arc::new(forced_dtypes);
 
     // ─── Step C: FULL‐READ with FORCED‐DTYPE VECTOR ──────────────────────────────────
@@ -174,6 +185,7 @@ pub fn csv_to_parquet(file_name: &str, data: &str, out_dir: &Path) -> Result<(),
             df.replace(col_name, parsed.into_series())?;
         }
     }
+
     // ─── Step D: BUILD PREFIX FROM COLUMN HEADERS 1,2,3 ─────────────────────────────
     let all_trimmed_names: Vec<String> = df
         .get_column_names()
@@ -207,7 +219,6 @@ pub fn csv_to_parquet(file_name: &str, data: &str, out_dir: &Path) -> Result<(),
     let type_changed = check_first_row_trim(&df)?;
     if type_changed {
         println!("→ At least one string column’s first‐row changed type after trimming.");
-        // let col_names: Vec<PlSmallStr> = df.get_column_names().iter().map(|s| s).collect();
         for col_name in df.get_column_names_owned() {
             // Skip if this column was parsed as datetime
             if date_cols.contains(&col_name) {
@@ -235,6 +246,12 @@ pub fn csv_to_parquet(file_name: &str, data: &str, out_dir: &Path) -> Result<(),
                 }
             }
         }
+    }
+
+    // ─── Log the updated schema (column names and types) ────────────────────────────
+    info!("Updated schema after parsing and cleanup:");
+    for col_name in df.get_column_names() {
+        info!("  {}: {:?}", col_name, df.column(col_name)?.dtype());
     }
 
     // ─── Step F: WRITE to temporary Parquet ────────────────────────────────────────

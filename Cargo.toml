@@ -44,4 +44,9 @@ arrow = "55.1.0"
 parquet = "55.1.0"
 rayon = "1.10.0"
 glob = "0.3.2"
-polars = { version = "0.48.1", features = ["lazy", "csv", "parquet"] }
+polars = { version = "0.48.1", features = [
+    "lazy",
+    "csv",
+    "parquet",
+    "timezones",
+] }
