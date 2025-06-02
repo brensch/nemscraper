@@ -29,7 +29,6 @@ async fn main() -> Result<()> {
     // ─── 2) configure dirs ───────────────────────────────────────────
     let client = Client::new();
     let assets = PathBuf::from("assets");
-    // let schemas_dir = assets.join("schemas");
     let zips_dir = assets.join("zips");
     let parquet_dir = assets.join("parquet");
     let history_dir = assets.join("history");
@@ -39,13 +38,10 @@ async fn main() -> Result<()> {
     }
 
     // ─── 3) history & lookup store ───────────────────────────────────
-    // Now History only holds a single in-memory HashSet<String> of “seen” filenames.
     let history = Arc::new(History::new(&history_dir)?);
-    // info!("initial schema fetch → {}", schemas_dir.display());
-    // let schema_store = Arc::new(schema::SchemaStore::new(&schemas_dir)?);
 
     // ─── 4) channels ──────────────────────────────────────────────────
-    let (processor_tx, mut processor_rx) =
+    let (processor_tx, processor_rx) =
         mpsc::unbounded_channel::<Result<PathBuf, (String, String)>>();
     let (url_tx, url_rx) = mpsc::unbounded_channel::<String>();
     let url_rx = Arc::new(Mutex::new(url_rx));
@@ -59,18 +55,28 @@ async fn main() -> Result<()> {
         let history = history.clone();
 
         task::spawn(async move {
-            while let Some(url) = url_rx.lock().await.recv().await {
+            loop {
+                // Lock & recv one URL
+                let maybe_url = {
+                    let mut guard = url_rx.lock().await;
+                    guard.recv().await
+                };
+                let url = match maybe_url {
+                    Some(u) => u,
+                    None => break, // channel closed
+                };
+
                 let name = PathBuf::from(&url)
                     .file_name()
                     .unwrap()
                     .to_string_lossy()
                     .to_string();
 
-                // If this ZIP has already been seen (downloaded or processed), skip.
+                // Skip if already downloaded/processed
                 if history.get(&name, &history::State::Downloaded) {
                     debug!(
                         name = %name,
-                        "already in history (downloaded/processed), skipping download of {}",
+                        "already in history (downloaded/processed), skipping {}",
                         url
                     );
                     continue;
@@ -78,7 +84,7 @@ async fn main() -> Result<()> {
 
                 info!(name = %name, "downloading {}", url);
 
-                // retry up to 3 times with exponential backoff
+                // retry up to 3 times
                 let path_result = async {
                     let mut attempt = 0;
                     loop {
@@ -87,7 +93,7 @@ async fn main() -> Result<()> {
                             Ok(path) => return Ok(path),
                             Err(e) if attempt < 3 => {
                                 error!(
-                                    "attempt {}/3 for {} failed: {}, retrying...",
+                                    "attempt {}/3 for {} failed: {}, retrying…",
                                     attempt, url, e
                                 );
                                 sleep(Duration::from_secs((1 << attempt) as u64)).await;
@@ -100,7 +106,6 @@ async fn main() -> Result<()> {
 
                 match path_result {
                     Ok(path) => {
-                        // Mark as “seen”
                         if let Err(e) = history.add(&name, history::State::Downloaded) {
                             error!(name = %name, "history.add failed: {}", e);
                         }
@@ -115,7 +120,7 @@ async fn main() -> Result<()> {
         });
     }
 
-    // ─── enqueue existing unprocessed zips one time ─────────────────
+    // ─── enqueue existing unprocessed ZIPs one time ───────────────────
     for entry in fs::read_dir(&zips_dir)? {
         let path = entry?.path();
         if path.extension() != Some(OsStr::new("zip")) {
@@ -123,7 +128,6 @@ async fn main() -> Result<()> {
         }
         let name = path.file_name().unwrap().to_string_lossy().to_string();
         if history.get(&name, &history::State::Processed) {
-            // Already processed.
             debug!(name = %name, "already processed {}", path.display());
             continue;
         }
@@ -142,25 +146,16 @@ async fn main() -> Result<()> {
                 if let Err(e) = async {
                     info!("fetching feeds");
 
-                    // ─── b) fetch new URLs and enqueue ────────────────
+                    // a) Fetch new URLs
                     let feeds = fetch::urls::fetch_current_zip_urls(&client).await?;
-                    // 1) Flatten all URLs into a single iterator
                     let all_urls_iter = feeds.values().flat_map(|urls| urls.iter().cloned());
 
-                    // 2) Use `choose_multiple` to sample up to 1,000 items at random
-                    let mut rng = thread_rng();
-                    let random_sample: Vec<String> = all_urls_iter.choose_multiple(&mut rng, 100);
-
-                    // 3) Collect into a HashSet<String> (deduplicates any repeats)
-                    let unique_urls: HashSet<String> = random_sample.into_iter().collect();
-                    info!(
-                        "retrieved feeds, downloading {} unique URLs",
-                        unique_urls.len()
-                    );
-
-                    for url in unique_urls {
-                        let url_path = PathBuf::from(&url);
-                        let name = url_path.file_name().unwrap().to_string_lossy().to_string();
+                    for url in all_urls_iter {
+                        let name = PathBuf::from(&url)
+                            .file_name()
+                            .unwrap()
+                            .to_string_lossy()
+                            .to_string();
                         if history.get(&name, &history::State::Downloaded) {
                             debug!(url = %url, "already seen, skipping");
                             continue;
@@ -169,60 +164,89 @@ async fn main() -> Result<()> {
                             .send(url.clone())
                             .map_err(|e| anyhow::anyhow!(e.to_string()))?;
                     }
-
                     Ok::<(), anyhow::Error>(())
                 }
                 .await
                 {
                     error!("scheduler loop failed: {}", e);
                 }
-
                 ticker.tick().await;
             }
         });
     }
 
-    // ─── 7) single‐threaded processor ─────────────────────────────────
-    while let Some(msg) = processor_rx.recv().await {
-        match msg {
-            Ok(zip_path) => {
-                let name = zip_path.file_name().unwrap().to_string_lossy().to_string();
+    // ─── 7) spawn “processor” workers (one per CPU core) ──────────────
+    let processor_rx = Arc::new(Mutex::new(processor_rx));
+    let num_cores = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1);
 
-                // If this ZIP was already seen (processed), skip.
-                if history.get(&name, &history::State::Processed) {
-                    debug!(name = %name, "already seen, skipping processing of {}", name);
-                    continue;
+    info!("spawning {} processor workers", num_cores);
+    for _ in 0..num_cores {
+        let rx = processor_rx.clone();
+        let history = history.clone();
+        let parquet_dir = parquet_dir.clone();
+
+        task::spawn(async move {
+            loop {
+                // 1) Lock & receive exactly one message
+                let msg_opt = {
+                    let mut guard = rx.lock().await;
+                    guard.recv().await
+                };
+
+                let msg = match msg_opt {
+                    Some(m) => m,
+                    None => break, // channel closed → exit worker
+                };
+
+                match msg {
+                    Ok(zip_path) => {
+                        let name = zip_path.file_name().unwrap().to_string_lossy().to_string();
+
+                        // If already processed, skip
+                        if history.get(&name, &history::State::Processed) {
+                            debug!(name = %name, "already processed {}, skipping", name);
+                            continue;
+                        }
+                        debug!(file_name = %name, "processing");
+
+                        // Run the blocking split on a dedicated blocking thread
+                        let split_path = zip_path.clone();
+                        let out_dir = parquet_dir.clone();
+                        let history_clone = history.clone();
+
+                        let split_res = task::spawn_blocking(move || {
+                            process::split::split_zip_to_parquet(&split_path, &out_dir)
+                        })
+                        .await
+                        .unwrap();
+
+                        if let Err(e) = split_res {
+                            error!("split {} failed: {}", name, e);
+                            continue;
+                        }
+
+                        // Mark as processed
+                        if let Err(e) = history_clone.add(&name, history::State::Processed) {
+                            error!("history.add (Processed) failed for {}: {}", name, e);
+                        }
+                        info!(file_name = %name, "processing completed");
+                    }
+                    Err((url, _)) => {
+                        error!("upstream download error for URL {}", url);
+                    }
                 }
-                debug!(file_name = name, "processing");
-
-                // We spawn the blocking split function on a separate thread:
-                let out_dir = parquet_dir.clone();
-                let history_clone = history.clone();
-                let split_path = zip_path.clone();
-                // let schema_store = Arc::clone(&schema_store);
-
-                let split_res = task::spawn_blocking(move || {
-                    process::split::split_zip_to_parquet(&split_path, &out_dir)
-                })
-                .await?;
-
-                if let Err(e) = split_res {
-                    error!("split {} failed: {}", name, e);
-                    continue;
-                }
-
-                // Mark as seen (processed)
-                if let Err(e) = history_clone.add(&name, history::State::Processed) {
-                    error!("history.add (processed) failed for {}: {}", name, e);
-                }
-
-                info!(file_name = name, "processing completed");
             }
-            Err((url, _)) => {
-                error!("upstream download error for URL {}", url);
-            }
-        }
+            // Worker exits once the channel is closed
+        });
     }
 
+    // ─── 8) drop the senders so that when queues drain, workers exit ──
+    drop(processor_tx);
+    drop(url_tx);
+
+    // ─── 9) keep main alive until shutdown (e.g. Ctrl+C). ─────────────
+    futures::future::pending::<()>().await;
     Ok(())
 }
