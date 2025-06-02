@@ -1,6 +1,5 @@
 services:
   grafana:
-    container_name: grafana
     image: grafana/grafana:12.0.1-ubuntu
     user: "${UID}:${GID}"
     restart: always
@@ -16,7 +15,7 @@ services:
       GF_PLUGINS_ALLOW_LOADING_UNSIGNED_PLUGINS: "motherduck-duckdb-datasource"
 
   nemscraper:
-    container_name: nemscraper
+    user: "${UID}:${GID}"
     build:
       context: .
       dockerfile: Dockerfile.nemscraper

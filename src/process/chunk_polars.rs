@@ -6,7 +6,6 @@ use std::fs;
 use std::io::Cursor;
 use std::path::Path;
 use std::sync::Arc;
-use std::time::Instant;
 use tracing::{debug, info};
 
 /// 1) Trim whitespace + strip outer quotes if present.
@@ -97,7 +96,6 @@ fn check_first_row_trim(df: &DataFrame) -> PolarsResult<bool> {
 pub fn csv_to_parquet(file_name: &str, data: &str, out_dir: &Path) -> Result<(), Box<dyn Error>> {
     debug!("starting");
     // ─── Step A: SAMPLE‐READ (first 1,000 rows) ───────────────────────────────────
-    let step_a_start = Instant::now();
     let sample_size = 1000;
     let mut sample_cursor = Cursor::new(data.as_bytes());
 
@@ -109,17 +107,8 @@ pub fn csv_to_parquet(file_name: &str, data: &str, out_dir: &Path) -> Result<(),
     let sample_df: DataFrame = CsvReader::new(&mut sample_cursor)
         .with_options(sample_opts)
         .finish()?;
-    let step_a_elapsed = step_a_start.elapsed();
-    debug!(
-        "Step A (sample-read {} rows) took {:.3}s",
-        sample_size,
-        step_a_elapsed.as_secs_f64()
-    );
-    // Log the schema of the sampled DataFrame
-    debug!("Step A schema: {:#?}", sample_df.schema());
 
     // ─── Step B: BUILD A FORCED‐DTYPE VECTOR AND IDENTIFY DATE COLUMNS ─────────────
-    let step_b_start = Instant::now();
     let mut forced_dtypes: Vec<DataType> = Vec::with_capacity(sample_df.width());
     let mut date_cols: Vec<PlSmallStr> = Vec::new();
 
@@ -148,23 +137,10 @@ pub fn csv_to_parquet(file_name: &str, data: &str, out_dir: &Path) -> Result<(),
         }
     }
 
-    let step_b_elapsed = step_b_start.elapsed();
-    debug!(
-        "Step B (forced dtypes + identify date columns) took {:.3}s; found {} date columns",
-        step_b_elapsed.as_secs_f64(),
-        date_cols.len()
-    );
     // Log forced dtypes paired with column names
-    let column_names = sample_df.get_column_names();
-    for (name, dt) in column_names.iter().zip(forced_dtypes.iter()) {
-        debug!("  Column `{}` → forced dtype {:?}", name, dt);
-    }
-    debug!("Step B date columns: {:?}", date_cols);
-
     let dtypes_ref: Arc<Vec<DataType>> = Arc::new(forced_dtypes);
 
     // ─── Step C: FULL‐READ with FORCED‐DTYPE VECTOR ──────────────────────────────────
-    let step_c_start = Instant::now();
     let mut full_cursor = Cursor::new(data.as_bytes());
     let full_opts = CsvReadOptions::default()
         .with_has_header(true)
@@ -172,49 +148,37 @@ pub fn csv_to_parquet(file_name: &str, data: &str, out_dir: &Path) -> Result<(),
     let mut df: DataFrame = CsvReader::new(&mut full_cursor)
         .with_options(full_opts)
         .finish()?; // now ints → Float64; date columns are still String
-    let step_c_elapsed = step_c_start.elapsed();
-    debug!(
-        "Step C (full-read with forced dtypes) took {:.3}s; DataFrame shape: {}x{}",
-        step_c_elapsed.as_secs_f64(),
-        df.height(),
-        df.width()
-    );
+
     // Log the schema after full read
     debug!("Step C schema: {:#?}", df.schema());
 
     // ─── Step C2: FOR EACH DETECTED DATE COLUMN, PARSE AS DATETIME(GMT+10) ─────────
-    let step_c2_start = Instant::now();
     for col_name in &date_cols {
-        if df.get_column_names().contains(&col_name) {
-            let col = df.column(col_name)?;
-            let utf8_col: &StringChunked = col.str()?;
-
-            let fmt: Option<&str> = Some("%Y/%m/%d %H:%M:%S");
-            let tu = TimeUnit::Milliseconds;
-            let use_cache = true;
-            let tz_aware = true;
-            let tz: TimeZone = unsafe { TimeZone::from_static("+10:00") };
-            let amb = StringChunked::full("ambiguous".into(), "", utf8_col.len());
-
-            let parsed = utf8_col.as_datetime(fmt, tu, use_cache, tz_aware, Some(&tz), &amb)?;
-            df.replace(col_name, parsed.into_series())?;
-            debug!(
-                "  Parsed date column `{}` into Datetime(TimeUnit::Milliseconds, \"+10:00\")",
-                col_name
-            );
+        if !df.get_column_names().contains(&col_name) {
+            continue; // Skip if the column was not found in the DataFrame
         }
+        let col = df.column(col_name)?;
+        let utf8_col: &StringChunked = col.str()?;
+
+        let fmt: Option<&str> = Some("%Y/%m/%d %H:%M:%S");
+        let tu = TimeUnit::Milliseconds;
+        let use_cache = true;
+        let tz_aware = false;
+        let tz: TimeZone = unsafe { TimeZone::from_static("+10:00") };
+        let amb = StringChunked::full("ambiguous".into(), "", utf8_col.len());
+
+        let parsed_naive = utf8_col.as_datetime(fmt, tu, use_cache, tz_aware, None, &amb)?;
+        let mut parsed_with_tz: DatetimeChunked = parsed_naive;
+        parsed_with_tz.set_time_zone(tz)?;
+
+        df.replace(col_name, parsed_with_tz.into_series())?;
+        debug!(
+            "  Parsed date column `{}` into Datetime(TimeUnit::Milliseconds, \"+10:00\")",
+            col_name
+        );
     }
-    let step_c2_elapsed = step_c2_start.elapsed();
-    debug!(
-        "Step C2 (parse date columns: {:?}) took {:.3}s",
-        date_cols,
-        step_c2_elapsed.as_secs_f64()
-    );
-    // Log the schema after date parsing
-    debug!("Step C2 schema: {:#?}", df.schema());
 
     // ─── Step D: BUILD PREFIX FROM COLUMN HEADERS 1,2,3 ─────────────────────────────
-    let step_d_start = Instant::now();
     let all_trimmed_names: Vec<String> = df
         .get_column_names()
         .iter()
@@ -242,83 +206,63 @@ pub fn csv_to_parquet(file_name: &str, data: &str, out_dir: &Path) -> Result<(),
     };
     let final_path = out_dir.join(final_name);
     let tmp_path = out_dir.join(tmp_name);
-    let step_d_elapsed = step_d_start.elapsed();
-    debug!(
-        "Step D (build filename prefix) took {:.3}s; prefix=\"{}\"",
-        step_d_elapsed.as_secs_f64(),
-        prefix
-    );
 
     // ─── Step E: CHECK FIRST‐ROW TRIM FOR STRING COLUMNS ────────────────────────────
-    let step_e_start = Instant::now();
     let type_changed = check_first_row_trim(&df)?;
     if type_changed {
-        debug!("Step E: first-row trim changed types; applying full-column clean/cast");
         for col_name in df.get_column_names_owned() {
             if date_cols.contains(&col_name) {
                 continue;
             }
+
             let col = df.column(&col_name)?;
             let str_ca = match col.str() {
                 Ok(ca) => ca,
                 Err(_) => continue,
             };
-            if let Some(orig_val) = str_ca.get(0) {
-                let cleaned_first = clean_str(orig_val);
-                let new_dtype = infer_dtype_from_str(&cleaned_first);
-                let old_dtype = col.dtype();
-                if &new_dtype != old_dtype {
-                    debug!(
-                        "  Column `{}`: first-row cleaned dtype {:?} → casting entire column to {:?}",
-                        col_name, old_dtype, new_dtype
-                    );
-                    let s: Series = col.as_series().unwrap().clone();
-                    let cleaned_utf8: StringChunked =
-                        s.str()?.apply(|opt| opt.map(|v| Cow::Owned(clean_str(v))));
-                    let casted_series: Series = if new_dtype == DataType::Float64 {
-                        cleaned_utf8.into_series().cast(&DataType::Float64)?
-                    } else {
-                        cleaned_utf8.into_series()
-                    };
-                    df.replace(&col_name, casted_series)?;
-                }
+
+            let orig_val = match str_ca.get(0) {
+                Some(val) => val,
+                None => continue,
+            };
+
+            let cleaned_first = clean_str(orig_val);
+            let new_dtype = infer_dtype_from_str(&cleaned_first);
+            if new_dtype == *col.dtype() {
+                continue;
             }
+
+            debug!(
+                "Column `{}`: first-row cleaned dtype {:?} → casting entire column to {:?}",
+                col_name,
+                col.dtype(),
+                new_dtype
+            );
+
+            let s: Series = col.as_series().unwrap().clone();
+            let cleaned_utf8: StringChunked =
+                s.str()?.apply(|opt| opt.map(|v| Cow::Owned(clean_str(v))));
+
+            let casted_series = if new_dtype == DataType::Float64 {
+                cleaned_utf8.into_series().cast(&DataType::Float64)?
+            } else {
+                cleaned_utf8.into_series()
+            };
+
+            df.replace(&col_name, casted_series)?;
         }
     }
-    let step_e_elapsed = step_e_start.elapsed();
-    debug!(
-        "Step E (check and apply first-row trim) took {:.3}s; type_changed={}",
-        step_e_elapsed.as_secs_f64(),
-        type_changed
-    );
-    // Log the schema after potential full-column casts
-    debug!("Step E schema: {:#?}", df.schema());
 
     // ─── Step F: WRITE to temporary Parquet ────────────────────────────────────────
-    let step_f_start = Instant::now();
     {
         let mut tmp_file = fs::File::create(&tmp_path)?;
         ParquetWriter::new(&mut tmp_file)
             .with_compression(ParquetCompression::Brotli(Some(BrotliLevel::try_new(5)?)))
             .finish(&mut df.clone())?;
     }
-    let step_f_elapsed = step_f_start.elapsed();
-    debug!(
-        "Step F (write to temp Parquet: {}) took {:.3}s",
-        tmp_path.display(),
-        step_f_elapsed.as_secs_f64()
-    );
 
     // ─── Step G: ATOMIC RENAME → final .parquet ────────────────────────────────────
-    let step_g_start = Instant::now();
     fs::rename(&tmp_path, &final_path)?;
-    let step_g_elapsed = step_g_start.elapsed();
-    debug!(
-        "Step G (rename {} → {}) took {:.3}s",
-        tmp_path.display(),
-        final_path.display(),
-        step_g_elapsed.as_secs_f64()
-    );
 
     info!("Wrote final Parquet: {}", final_path.display());
     Ok(())
