@@ -163,6 +163,7 @@ pub fn csv_to_parquet(file_name: &str, data: &str, out_dir: &Path) -> Result<(),
         let fmt: Option<&str> = Some("%Y/%m/%d %H:%M:%S");
         let tu = TimeUnit::Milliseconds;
         let use_cache = true;
+        // we are assuming the date is in GMT+10
         let tz_aware = false;
         let tz: TimeZone = unsafe { TimeZone::from_static("+10:00") };
         let amb = StringChunked::full("ambiguous".into(), "", utf8_col.len());
