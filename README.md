@@ -25,6 +25,11 @@ watch -n 2 '
 
 ```
 
+## Remove all processed files to reprocess
+```bash
+find assets/history -type f -name '*Proc*' -delete
+```
+
 ## 
 
 # Benchmarking Compression Algorithms

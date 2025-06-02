@@ -1,25 +1,36 @@
+version: "3.8"
+
 services:
   grafana:
     image: grafana/grafana:12.0.1-ubuntu
-    user: "${UID}:${GID}"
     restart: always
     ports:
       - "3000:3000"
+    user: "1000:1000"               
     volumes:
+      - assets:/data                    # mount the shared assets here
       - ./grafana/plugins/motherduck-duckdb-datasource:/var/lib/grafana/plugins/motherduck-duckdb-datasource
       - ./grafana/dashboards:/etc/grafana/provisioned_dashboards
       - ./grafana/provisioning/dashboards:/etc/grafana/provisioning/dashboards
       - ./grafana/provisioning/datasources:/etc/grafana/provisioning/datasources
-      - ./assets:/data
     environment:
       GF_PLUGINS_ALLOW_LOADING_UNSIGNED_PLUGINS: "motherduck-duckdb-datasource"
 
   nemscraper:
-    user: "${UID}:${GID}"
     build:
       context: .
       dockerfile: Dockerfile.nemscraper
     working_dir: /usr/src/app
+    user: "1000:1000"               
     volumes:
-      - ./assets:/usr/src/app/assets
+      - assets:/usr/src/app/assets      # same “assets” volume, mounted at a different path
     command: ["./target/release/nemscraper"]
+
+volumes:
+  assets:
+    driver: local
+    driver_opts:
+      # bind the host’s ./assets folder into a named volume called “assets”
+      type: "none"
+      o: "bind"
+      device: "${PWD}/assets"
