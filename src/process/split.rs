@@ -12,12 +12,15 @@ use super::chunk_polars::csv_to_parquet;
 /// old chunk (if any), then begin a new chunk whose first line is that `I,` header. We also
 /// never let any single chunk exceed MAX_BATCH_BYTES—if it would, we flush and start a fresh
 /// chunk, always re‐adding the same `I,` header at the top.
+///
+/// Returns the total number of data‐rows processed (i.e. each `I,`‐header plus each subsequent
+/// data line belonging to a schema).
 #[instrument(level = "debug", skip(zip_path, out_dir), fields(zip = %zip_path.as_ref().display()))]
 pub fn split_zip_to_parquet<P: AsRef<Path>, Q: AsRef<Path>>(
     zip_path: P,
     out_dir: Q,
     // schema_store: Arc<SchemaStore>,
-) -> Result<()> {
+) -> Result<i64> {
     const MAX_BATCH_BYTES: usize = 100 * 1024 * 1024; // 100 MiB
 
     debug!("Opening ZIP file: {}", zip_path.as_ref().display());
@@ -25,6 +28,9 @@ pub fn split_zip_to_parquet<P: AsRef<Path>, Q: AsRef<Path>>(
     let mut archive = ZipArchive::new(file)?;
     let total_entries = archive.len();
     debug!("ZIP archive contains {} entries", total_entries);
+
+    // Count of data rows (each `I,` header counts as one, plus each non-header line that goes in a batch)
+    let mut total_rows: i64 = 0;
 
     for idx in 0..total_entries {
         let entry = archive.by_index(idx)?;
@@ -52,13 +58,12 @@ pub fn split_zip_to_parquet<P: AsRef<Path>, Q: AsRef<Path>>(
             }
         }
 
-        // 2) We maintain:
+        // 2) Maintain:
         //    - `current_i_line`: the last-seen "I," header that defines the current schema.
         //    - `batch`: the accumulating chunk (always starts with current_i_line, once set).
         // Whenever we see a new `I,` line, we flush the old batch (if nonempty),
         // then begin batch = that `I,` line. We also flush if batch.len() ≥ MAX_BATCH_BYTES,
         // but always re-add current_i_line at the top of the new chunk.
-
         let mut buf = String::new();
         let mut current_i_line: Option<String> = None;
         let mut batch = String::new();
@@ -80,6 +85,9 @@ pub fn split_zip_to_parquet<P: AsRef<Path>, Q: AsRef<Path>>(
 
             // Check if this line starts with "I," → new schema
             if buf.trim_start().starts_with("I,") {
+                // Count this I-line as a data row
+                total_rows += 1;
+
                 // 2a) If we already have a batch (i.e. current_i_line.is_some()), flush it now.
                 if !batch.is_empty() {
                     debug!(
@@ -112,6 +120,8 @@ pub fn split_zip_to_parquet<P: AsRef<Path>, Q: AsRef<Path>>(
                 Some(i_line) => {
                     // We are inside a schema group. Append this line to batch.
                     batch.push_str(&buf);
+                    // Count this data line as a row
+                    total_rows += 1;
 
                     // 2d) If batch has grown too large, flush it but keep the same I-line.
                     if batch.len() >= MAX_BATCH_BYTES {
@@ -166,6 +176,9 @@ pub fn split_zip_to_parquet<P: AsRef<Path>, Q: AsRef<Path>>(
         debug!("Completed all batches for {}", file_name);
     }
 
-    debug!("Completed processing all entries in ZIP");
-    Ok(())
+    debug!(
+        "Completed processing all entries in ZIP; total rows = {}",
+        total_rows
+    );
+    Ok(total_rows)
 }

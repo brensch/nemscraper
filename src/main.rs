@@ -36,7 +36,7 @@ async fn main() -> Result<()> {
     }
 
     // ─── 3) history & lookup store ───────────────────────────────────
-    let history = Arc::new(History::new(&history_dir)?);
+    let history = Arc::new(History::new(history_dir)?);
 
     // ─── 4) channels ──────────────────────────────────────────────────
     let (processor_tx, processor_rx) =
@@ -104,7 +104,7 @@ async fn main() -> Result<()> {
 
                 match path_result {
                     Ok(path) => {
-                        if let Err(e) = history.add(&name, history::State::Downloaded) {
+                        if let Err(e) = history.add(&name, history::State::Downloaded, 1) {
                             error!(name = %name, "history.add failed: {}", e);
                         }
                         let _ = tx.send(Ok(path));
@@ -216,22 +216,31 @@ async fn main() -> Result<()> {
                         let out_dir = parquet_dir.clone();
                         let history_clone = history.clone();
 
-                        let split_res = task::spawn_blocking(move || {
+                        // spawn_blocking returns a JoinHandle<Result<usize, E>>
+                        let split_res: Result<i64> = task::spawn_blocking(move || {
                             process::split::split_zip_to_parquet(&split_path, &out_dir)
                         })
                         .await
-                        .unwrap();
+                        .unwrap(); // unwrap the JoinHandle, giving you the inner Result<usize, _>
 
-                        if let Err(e) = split_res {
-                            error!("split {} failed: {}", name, e);
-                            continue;
+                        match split_res {
+                            Ok(row_count) => {
+                                // Only add to history if the split succeeded
+                                if let Err(e) = history_clone.add(
+                                    &name,
+                                    history::State::Processed,
+                                    row_count as i64,
+                                ) {
+                                    error!("history.add (Processed) failed for {}: {}", name, e);
+                                } else {
+                                    info!(file_name = %name, "processing completed ({} rows)", row_count);
+                                }
+                            }
+                            Err(e) => {
+                                error!("split {} failed: {}", name, e);
+                                continue;
+                            }
                         }
-
-                        // Mark as processed
-                        if let Err(e) = history_clone.add(&name, history::State::Processed) {
-                            error!("history.add (Processed) failed for {}: {}", name, e);
-                        }
-                        info!(file_name = %name, "processing completed");
                     }
                     Err((url, _)) => {
                         error!("upstream download error for URL {}", url);
