@@ -340,13 +340,6 @@ impl History {
 
             // (b) Read each file in `paths`, except the old consolidated (skip that), and dump its batches into the new writer.
             for p in paths.iter() {
-                if let Some(fname) = p.file_name().and_then(|f| f.to_str()) {
-                    if fname == consolidated_name {
-                        // Skip any existing consolidated file
-                        continue;
-                    }
-                }
-
                 let file =
                     File::open(p).with_context(|| format!("failed to open `{}`", p.display()))?;
                 let builder =
