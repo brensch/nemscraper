@@ -1,10 +1,9 @@
 //! stats.rs: show nemscraper’s CPU/memory usage plus the other stats.
 //!
-//! - Queries `ps -C nemscraper -o %cpu= -o %mem=` to get per‐process CPU and memory usage for any "nemscraper" instances, summing them.
+//! - Uses `sysinfo` to sample instantaneous CPU and memory usage for any "nemscraper" instances, summing them.
 //! - Counts files in `assets/history` matching `*Proc*` and `*Down*`, excluding `.tmp`.
 //! - Computes and prints the processed‐vs‐downloaded percentage.
 //! - Summarizes on‐disk usage (blocks×512 bytes) for each top‐level subdirectory of `assets/`, excluding `.tmp`.
-//! - Finally, lists any “nemscraper” PIDs and their full command lines via `pgrep -fl nemscraper`.
 
 use std::collections::HashMap;
 use std::ffi::OsStr;
@@ -12,7 +11,10 @@ use std::fs;
 use std::io;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::thread;
+use std::time::Duration;
+
+use sysinfo::{ProcessesToUpdate, System};
 
 /// Convert a byte count into a human-readable string (B, K, M, G, T, P).
 fn human_readable(bytes: u64) -> String {
@@ -35,40 +37,47 @@ fn human_readable(bytes: u64) -> String {
     }
 }
 
-/// Use `ps -C nemscraper -o %cpu= -o %mem=` to gather CPU and memory usage
-/// across all "nemscraper" processes. Sums each column over all lines.
-///
-/// Returns:
-/// - `Ok(Some((cpu_sum, mem_sum)))` if at least one line of output (i.e., at least one process),
-/// - `Ok(None)` if no matching lines (no nemscraper running),
-/// - `Err(_)` on any failure invoking or parsing `ps`.
+/// Sample instantaneous CPU% and memory% usage for all processes named "nemscraper",
+/// using the `sysinfo` crate. Returns:
+/// - `Ok(Some((cpu_sum, mem_sum)))` if at least one `nemscraper` is found,
+/// - `Ok(None)` if no matching processes,
+/// - `Err(_)` on any failure (e.g., unable to read `/proc`).
 fn get_nemscraper_usage() -> io::Result<Option<(f64, f64)>> {
-    // The `=` after %cpu and %mem suppresses headers.
-    let output = Command::new("ps")
-        .args(&["-C", "nemscraper", "-o", "%cpu=", "-o", "%mem="])
-        .output()?;
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let mut cpu_sum = 0.0;
-    let mut mem_sum = 0.0;
-    let mut found = false;
+    // 1) Create a System and do an initial refresh of ALL processes (no CPU delta yet).
+    let mut sys = System::new_all();
 
-    for line in stdout.lines().map(str::trim).filter(|l| !l.is_empty()) {
-        // Each line should contain two numbers, e.g. " 0.3  1.2"
-        let parts: Vec<&str> = line.split_whitespace().collect();
-        if parts.len() >= 2 {
-            if let (Ok(cpu), Ok(mem)) = (parts[0].parse::<f64>(), parts[1].parse::<f64>()) {
-                cpu_sum += cpu;
-                mem_sum += mem;
-                found = true;
-            }
+    // The first call populates process information, but does not compute CPU deltas:
+    sys.refresh_processes(ProcessesToUpdate::All, /* update_cpu = */ false);
+
+    // 2) Wait a short interval so that `sysinfo` can measure a CPU‐usage delta.
+    thread::sleep(Duration::from_millis(200));
+
+    // 3) Refresh again, this time with `update_cpu = true`, so CPU usage is computed
+    //    over the 200 ms window.
+    sys.refresh_processes(ProcessesToUpdate::All, /* update_cpu = */ true);
+
+    let total_memory_kb = sys.total_memory(); // total RAM in KB
+    let mut cpu_sum = 0.0_f64;
+    let mut mem_sum_kb = 0_u64;
+
+    // 4) Iterate over every process; pick out those named "nemscraper".
+    for process in sys.processes().values() {
+        if process.name() == "nemscraper" {
+            // `cpu_usage()` is a percentage of one core (0.0–100.0) over that sampling interval.
+            cpu_sum += process.cpu_usage() as f64;
+            // `memory()` returns RSS in KB.
+            mem_sum_kb += process.memory();
         }
     }
 
-    if found {
-        Ok(Some((cpu_sum, mem_sum)))
-    } else {
-        Ok(None)
+    // 5) If none were found, return None.
+    if cpu_sum == 0.0 && mem_sum_kb == 0 {
+        return Ok(None);
     }
+
+    // 6) Convert total memory (KB) into a percentage of total RAM.
+    let mem_pct = (mem_sum_kb as f64 / total_memory_kb as f64) * 100.0;
+    Ok(Some((cpu_sum, mem_pct)))
 }
 
 /// Recursively traverse `path`, accumulating on‐disk usage (blocks×512 bytes) for each
@@ -96,14 +105,14 @@ fn traverse(path: &Path, top_name: Option<&OsStr>, map: &mut HashMap<String, u64
             };
             traverse(&p, new_top, map);
         } else if p.is_file() {
-            // Skip any ".tmp" file
+            // Skip any ".tmp" file.
             if file_name.ends_with(".tmp") {
                 continue;
             }
-            // Only count once we've descended into a top-level dir
+            // Only count once we've descended into a top-level dir.
             if let Some(top_os) = top_name {
                 if let Ok(meta) = fs::metadata(&p) {
-                    // meta.blocks() is number of 512-byte blocks allocated
+                    // `meta.blocks()` is number of 512-byte blocks allocated.
                     let bytes = meta.blocks().saturating_mul(512);
                     let key = top_os.to_string_lossy().into_owned();
                     *map.entry(key).or_default() += bytes;
@@ -124,12 +133,12 @@ fn main() {
         Ok(None) => {
             println!("nemscraper is not running");
         }
-        Err(_) => {
-            println!("nemscraper usage: N/A");
+        Err(err) => {
+            println!("nemscraper usage: N/A ({})", err);
         }
     }
 
-    // ─── 2) Count "*Proc*" and "*Down*" in "assets/history", excluding ".tmp"
+    // ─── 2) Count "*Proc*" and "*Down*" in "assets/history", excluding ".tmp".
     let history_dir = PathBuf::from("assets/history");
     let mut proc_count = 0u64;
     let mut down_count = 0u64;

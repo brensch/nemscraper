@@ -51,3 +51,4 @@ polars = { version = "0.48.1", features = [
     "timezones",
     "default",
 ] }
+sysinfo = "0.35.1"
