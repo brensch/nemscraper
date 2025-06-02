@@ -15,7 +15,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 /// Convert a byte count into a human-readable string (B, K, M, G, T, P).
-fn human_readable(mut bytes: u64) -> String {
+fn human_readable(bytes: u64) -> String {
     let units = ["B", "K", "M", "G", "T", "P"];
     let mut i = 0;
     let mut value = bytes as f64;
