@@ -12,6 +12,7 @@ use arrow::{
     datatypes::{DataType as ArrowDataType, Field, Schema as ArrowSchema, TimeUnit},
     record_batch::RecordBatch,
 };
+use chrono::TimeZone;
 use chrono::{DateTime, NaiveDate, NaiveDateTime, Utc};
 use glob::glob;
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
@@ -142,7 +143,7 @@ impl History {
         let now_utc = Utc::now();
         let ts_micros = now_utc.timestamp_micros();
 
-        // 2) Check for duplicates under the mutex.  If already seen, skip writing.
+        // 2) Check for duplicates under the mutex. If already seen, skip writing.
         {
             let mut seen_guard = self.seen.lock().unwrap();
             if seen_guard.contains(&(safe_fname.to_string(), state, ts_micros)) {
@@ -152,42 +153,51 @@ impl History {
             seen_guard.insert((safe_fname.to_string(), state, ts_micros));
         }
 
-        // 3) Build the on‐disk filename "<safe_fname>---<State>---<ts>.parquet"
+        // 3) Build the on-disk filename "<safe_fname>---<State>---<ts>.parquet"
         let file_name = format!(
             "{}---{}---{}.parquet",
             safe_fname,
             state.as_str(),
             ts_micros
         );
-        let path = self.history_dir.join(&file_name);
+        let final_path = self.history_dir.join(&file_name);
 
-        // 4) Define an Arrow schema that includes:
-        //    ["file_name":Utf8, "state":Utf8, "event_time":Timestamp(µs, UTC), "count":Int64]
+        // 4) Build the temporary filename "<safe_fname>---<State>---<ts>.parquet.tmp"
+        let tmp_file_name = format!(
+            "{}---{}---{}.parquet.tmp",
+            safe_fname,
+            state.as_str(),
+            ts_micros
+        );
+        let tmp_path = self.history_dir.join(&tmp_file_name);
+
+        // 5) Define an Arrow schema that includes:
+        //    ["file_name":Utf8, "state":Utf8, "event_time":Timestamp(µs), "count":Int64]
         let schema = Arc::new(ArrowSchema::new(vec![
             Field::new("file_name", ArrowDataType::Utf8, false),
             Field::new("state", ArrowDataType::Utf8, false),
             Field::new(
                 "event_time",
-                ArrowDataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
+                ArrowDataType::Timestamp(TimeUnit::Microsecond, None),
                 false,
             ),
             Field::new("count", ArrowDataType::Int64, false),
         ]));
 
-        // 5) Create the Parquet file & ArrowWriter
-        let file = File::create(&path)
-            .with_context(|| format!("could not create `{}`", path.display()))?;
-        let buf_writer = BufWriter::new(file);
+        // 6) Create the Parquet file & ArrowWriter on the .tmp path
+        let tmp_file = File::create(&tmp_path)
+            .with_context(|| format!("could not create temporary file `{}`", tmp_path.display()))?;
+        let buf_writer = BufWriter::new(tmp_file);
         let mut writer = ArrowWriter::try_new(buf_writer, schema.clone(), None)
             .context("creating ArrowWriter for tiny Parquet")?;
 
-        // 6) Build each column array (single‐row):
+        // 7) Build each column array (single-row):
         let file_name_array = StringArray::from(vec![file_name.clone()]);
         let state_array = StringArray::from(vec![state.as_str().to_string()]);
         let event_time_array = TimestampMicrosecondArray::from(vec![ts_micros]);
         let count_array = arrow::array::Int64Array::from(vec![count]);
 
-        // 7) Package into a RecordBatch
+        // 8) Package into a RecordBatch
         let batch = RecordBatch::try_new(
             schema.clone(),
             vec![
@@ -199,13 +209,22 @@ impl History {
         )
         .context("building RecordBatch for tiny Parquet")?;
 
-        // 8) Write out and close
+        // 9) Write out and close
         writer
             .write(&batch)
             .context("writing batch to tiny Parquet")?;
         writer
             .close()
             .context("closing ArrowWriter for tiny Parquet")?;
+
+        // 10) Rename the .tmp file to its final .parquet filename
+        fs::rename(&tmp_path, &final_path).with_context(|| {
+            format!(
+                "failed to rename `{}` to `{}`",
+                tmp_path.display(),
+                final_path.display()
+            )
+        })?;
 
         Ok(())
     }
@@ -269,13 +288,12 @@ impl History {
                     Ok(v) => v,
                     Err(_) => continue,
                 };
-                let dt_utc: DateTime<Utc> = DateTime::<Utc>::from_utc(
-                    NaiveDateTime::from_timestamp(
-                        ts_micros / 1_000_000,
-                        ((ts_micros % 1_000_000) * 1_000) as u32,
-                    ),
-                    Utc,
-                );
+                let seconds = ts_micros / 1_000_000;
+                let nanoseconds = ((ts_micros % 1_000_000) * 1_000) as u32;
+                let dt_utc = Utc
+                    .timestamp_opt(seconds, nanoseconds)
+                    .single()
+                    .expect("invalid timestamp");
                 dt_utc.date_naive()
             } else {
                 continue;

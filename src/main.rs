@@ -105,7 +105,7 @@ async fn main() -> Result<()> {
                 match path_result {
                     Ok(path) => {
                         if let Err(e) = history.add(&name, history::State::Downloaded, 1) {
-                            error!(name = %name, "history.add failed: {}", e);
+                            error!(name = %name, "history.add failed: {:#}", e);
                         }
                         let _ = tx.send(Ok(path));
                     }
@@ -231,7 +231,7 @@ async fn main() -> Result<()> {
                                     history::State::Processed,
                                     row_count as i64,
                                 ) {
-                                    error!("history.add (Processed) failed for {}: {}", name, e);
+                                    error!("history.add (Processed) failed for {}: {:#}", name, e);
                                 } else {
                                     info!(file_name = %name, "processing completed ({} rows)", row_count);
                                 }
