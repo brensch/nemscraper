@@ -1,9 +1,7 @@
 use anyhow::Result;
 use nemscraper::{fetch, process};
-use rand::seq::IteratorRandom;
-use rand::thread_rng;
 use reqwest::Client;
-use std::{collections::HashSet, ffi::OsStr, fs, path::PathBuf, sync::Arc, time::Duration};
+use std::{ffi::OsStr, fs, path::PathBuf, sync::Arc, time::Duration};
 use tokio::{
     sync::{mpsc, Mutex},
     task,
