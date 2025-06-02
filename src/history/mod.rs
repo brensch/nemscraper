@@ -2,7 +2,7 @@ use std::{
     collections::{HashMap, HashSet},
     fs::{self, File},
     io::BufWriter,
-    path::{Path, PathBuf},
+    path::PathBuf,
     sync::{Arc, Mutex},
 };
 
@@ -13,7 +13,7 @@ use arrow::{
     record_batch::RecordBatch,
 };
 use chrono::TimeZone;
-use chrono::{DateTime, NaiveDate, NaiveDateTime, Utc};
+use chrono::{NaiveDate, Utc};
 use glob::glob;
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use parquet::arrow::ArrowWriter;
