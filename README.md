@@ -2,29 +2,6 @@
 scrape all files from the nem archives and compress them to a more usable parquet format.
 
 # Usage
-## monitor files
-
-From within the `assets` directory, you can monitor the number of files in each subdirectory and the disk usage of the assets directory using the following command:
-
-```bash
-watch -n 2 '
-  echo "=== File Counts ==="
-  for dir in */; do
-    echo -n "${dir%/}: "
-    find "$dir" -maxdepth 1 -type f | wc -l
-  done
-
-  echo
-  echo "=== Disk Usage ==="
-  du -sh ./*
-
-  echo
-  echo "=== Processes Matching \"nemscraper\" ==="
-  top -b -n1 | awk "/^ *PID/ || /nemscraper/" || echo "No nemscraper process"
-'
-
-```
-
 ## Remove all processed files to reprocess
 ```bash
 find assets/history -type f -name '*Proc*' -delete
