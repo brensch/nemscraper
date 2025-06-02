@@ -142,6 +142,8 @@ async fn main() -> Result<()> {
             let mut ticker = interval(Duration::from_secs(60));
             loop {
                 if let Err(e) = async {
+                    info!("vacuuming history");
+                    history.vacuum().unwrap();
                     info!("fetching feeds");
 
                     // a) Fetch new URLs

@@ -5,10 +5,11 @@ use arrow::array::Array;
 use arrow::array::{ArrayRef, Int64Builder, StringBuilder};
 use arrow::datatypes::{DataType, Field, Schema as ArrowSchema};
 use arrow::record_batch::RecordBatch;
-use chrono::Utc;
+use chrono::{DateTime, NaiveDateTime, Utc};
 use glob::glob;
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use parquet::arrow::arrow_writer::ArrowWriter;
+use std::collections::HashMap;
 use std::{
     collections::HashSet,
     fs::{self, File},
@@ -257,6 +258,164 @@ impl History {
 
         // 7) Record in the in‐memory set
         guard.insert((file_name.to_string(), state));
+        Ok(())
+    }
+
+    /// Consolidate (“vacuum”) all tiny per‐row Parquet files into one file per UTC‐day &
+    /// per State.  After writing the consolidated file, delete the originals.
+    /// The in‐memory HashSet remains valid, since nothing ever gets removed from it
+    /// until the entire history directory is reloaded on `new()`.
+    pub fn vacuum(&self) -> Result<()> {
+        // 1) Scan for all "*.parquet" files in history_dir and group by (date, state).
+        let mut buckets: HashMap<(chrono::NaiveDate, State), Vec<PathBuf>> = HashMap::new();
+        let pattern = format!("{}/{}", self.history_dir.display(), "*.parquet");
+        for entry in glob(&pattern).context("invalid glob pattern for vacuum")? {
+            let path = match entry {
+                Ok(p) => p,
+                Err(e) => {
+                    eprintln!("warning: cannot read glob entry: {:?}", e);
+                    continue;
+                }
+            };
+            if !path.is_file() {
+                continue;
+            }
+
+            // Expect file_name = "<safe_fname>---<State>---<ts>.parquet"
+            let file_name = match path.file_name().and_then(|f| f.to_str()) {
+                Some(n) => n,
+                None => continue,
+            };
+            let parts: Vec<&str> = file_name.split("---").collect();
+            if parts.len() != 3 {
+                // Either not our tiny file or already a consolidated file
+                continue;
+            }
+
+            let state_str = parts[1];
+            let ts_and_ext = parts[2];
+            if !ts_and_ext.ends_with(".parquet") {
+                continue;
+            }
+            let ts_str = &ts_and_ext[..ts_and_ext.len() - ".parquet".len()];
+            if ts_str == "consolidated" {
+                // Skip any already‐consolidated files
+                continue;
+            }
+
+            // Parse ts as microseconds
+            let ts_micros: i64 = match ts_str.parse() {
+                Ok(v) => v,
+                Err(_) => continue,
+            };
+
+            // Convert to UTC date
+            let dt: DateTime<Utc> = DateTime::<Utc>::from_utc(
+                NaiveDateTime::from_timestamp(
+                    ts_micros / 1_000_000,
+                    ((ts_micros % 1_000_000) * 1_000) as u32,
+                ),
+                Utc,
+            );
+            let date = dt.date_naive();
+
+            // Parse State
+            let state = match State::from_str(state_str) {
+                Some(s) => s,
+                None => continue,
+            };
+
+            buckets.entry((date, state)).or_default().push(path.clone());
+        }
+
+        // 2) For each (date, state) bucket: merge → write one consolidated file → delete originals
+        for ((date, state), paths) in buckets {
+            if paths.is_empty() {
+                continue;
+            }
+
+            let date_str = date.format("%Y%m%d").to_string();
+            let consolidated_name =
+                format!("{}---{}---consolidated.parquet", date_str, state.as_str());
+            let consolidated_tmp = format!(
+                "{}---{}---consolidated.parquet.tmp",
+                date_str,
+                state.as_str()
+            );
+
+            let consolidated_path = self.history_dir.join(&consolidated_name);
+            let tmp_path = self.history_dir.join(&consolidated_tmp);
+
+            // Prepare schema: ["file_name":Utf8, "state":Utf8, "event_time":Int64]
+            let arrow_schema = {
+                let fields = vec![
+                    Field::new("file_name", DataType::Utf8, false),
+                    Field::new("state", DataType::Utf8, false),
+                    Field::new("event_time", DataType::Int64, false),
+                ];
+                Arc::new(ArrowSchema::new(fields))
+            };
+
+            // (a) Create the ArrowWriter to tmp_path
+            let tmp_file = File::create(&tmp_path)
+                .with_context(|| format!("could not create `{}`", tmp_path.display()))?;
+            let buf_writer = BufWriter::new(tmp_file);
+            let mut writer = ArrowWriter::try_new(buf_writer, arrow_schema.clone(), None)
+                .context("creating ArrowWriter for consolidated Parquet")?;
+
+            // (b) For each tiny file: open → read batches → write into the ArrowWriter
+            for small_path in &paths {
+                let small_file = File::open(&small_path)
+                    .with_context(|| format!("failed to open `{}`", small_path.display()))?;
+                let builder =
+                    ParquetRecordBatchReaderBuilder::try_new(small_file).with_context(|| {
+                        format!(
+                            "failed to create RecordBatchReaderBuilder for `{}`",
+                            small_path.display()
+                        )
+                    })?;
+                let mut batch_reader =
+                    builder.with_batch_size(1024).build().with_context(|| {
+                        format!(
+                            "failed to build RecordBatchReader for `{}`",
+                            small_path.display()
+                        )
+                    })?;
+
+                while let Some(batch) = batch_reader.next().transpose().with_context(|| {
+                    format!("error reading RecordBatch from `{}`", small_path.display())
+                })? {
+                    writer.write(&batch).with_context(|| {
+                        format!(
+                            "writing batch from `{}` to consolidated file",
+                            small_path.display()
+                        )
+                    })?;
+                }
+            }
+
+            // (c) Close & finalize the consolidated Parquet
+            writer
+                .close()
+                .context("closing ArrowWriter for consolidated Parquet")?;
+
+            // (d) Rename tmp → final
+            fs::rename(&tmp_path, &consolidated_path).with_context(|| {
+                format!(
+                    "renaming `{}` → `{}`",
+                    tmp_path.display(),
+                    consolidated_path.display()
+                )
+            })?;
+
+            // (e) Delete all the tiny files in this bucket
+            for small_path in &paths {
+                fs::remove_file(&small_path).with_context(|| {
+                    format!("failed to delete small file `{}`", small_path.display())
+                })?;
+            }
+        }
+
         Ok(())
     }
 }
