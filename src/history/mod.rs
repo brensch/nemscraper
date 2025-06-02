@@ -325,7 +325,7 @@ impl History {
                 Field::new("state", ArrowDataType::Utf8, false),
                 Field::new(
                     "event_time",
-                    ArrowDataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
+                    ArrowDataType::Timestamp(TimeUnit::Microsecond, None),
                     false,
                 ),
                 Field::new("count", ArrowDataType::Int64, false),
