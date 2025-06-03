@@ -1,4 +1,6 @@
 use anyhow::Result;
+use history::state::State;
+use history::store::History;
 use nemscraper::{fetch, process};
 use reqwest::Client;
 use std::{ffi::OsStr, fs, path::PathBuf, sync::Arc, time::Duration};
@@ -11,7 +13,6 @@ use tracing::{debug, error, info};
 use tracing_subscriber::{fmt, EnvFilter};
 
 mod history;
-use history::History;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -71,7 +72,7 @@ async fn main() -> Result<()> {
                     .to_string();
 
                 // Skip if already downloaded/processed
-                if history.get(&name, &history::State::Downloaded) {
+                if history.get(&name, &State::Downloaded) {
                     debug!(
                         name = %name,
                         "already in history (downloaded/processed), skipping {}",
@@ -104,7 +105,7 @@ async fn main() -> Result<()> {
 
                 match path_result {
                     Ok(path) => {
-                        if let Err(e) = history.add(&name, history::State::Downloaded, 1) {
+                        if let Err(e) = history.add(&name, State::Downloaded, 1) {
                             error!(name = %name, "history.add failed: {:#}", e);
                         }
                         let _ = tx.send(Ok(path));
@@ -125,7 +126,7 @@ async fn main() -> Result<()> {
             continue;
         }
         let name = path.file_name().unwrap().to_string_lossy().to_string();
-        if history.get(&name, &history::State::Processed) {
+        if history.get(&name, &State::Processed) {
             debug!(name = %name, "already processed {}", path.display());
             continue;
         }
@@ -156,7 +157,7 @@ async fn main() -> Result<()> {
                             .unwrap()
                             .to_string_lossy()
                             .to_string();
-                        if history.get(&name, &history::State::Downloaded) {
+                        if history.get(&name, &State::Downloaded) {
                             debug!(url = %url, "already seen, skipping");
                             continue;
                         }
@@ -205,7 +206,7 @@ async fn main() -> Result<()> {
                         let name = zip_path.file_name().unwrap().to_string_lossy().to_string();
 
                         // If already processed, skip
-                        if history.get(&name, &history::State::Processed) {
+                        if history.get(&name, &State::Processed) {
                             debug!(name = %name, "already processed {}, skipping", name);
                             continue;
                         }
@@ -226,11 +227,9 @@ async fn main() -> Result<()> {
                         match split_res {
                             Ok(row_count) => {
                                 // Only add to history if the split succeeded
-                                if let Err(e) = history_clone.add(
-                                    &name,
-                                    history::State::Processed,
-                                    row_count as i64,
-                                ) {
+                                if let Err(e) =
+                                    history_clone.add(&name, State::Processed, row_count as i64)
+                                {
                                     error!("history.add (Processed) failed for {}: {:#}", name, e);
                                 } else {
                                     info!(file_name = %name, "processing completed ({} rows)", row_count);

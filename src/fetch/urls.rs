@@ -1,5 +1,6 @@
-// data/src/fetch/urls.rs
+use anyhow::Context;
 use anyhow::Result;
+use futures::future::try_join_all;
 use reqwest::Client;
 use scraper::{Html, Selector};
 use std::collections::BTreeMap;
@@ -7,24 +8,16 @@ use std::time::Duration;
 use tokio::time::sleep;
 use url::Url;
 
-// static CURRENT_FEED_URLS: &[&str] = &[
-//     "https://nemweb.com.au/Reports/Current/FPP/",
-//     // "https://nemweb.com.au/Reports/Current/FPPDAILY/",
-//     // "https://nemweb.com.au/Reports/Current/FPPRATES/",
-//     // "https://nemweb.com.au/Reports/Current/FPPRUN/",
-//     // "https://nemweb.com.au/Reports/Current/PD7Day/",
-//     // "https://nemweb.com.au/Reports/Current/P5_Reports/",
-// ];
-
 static CURRENT_FEED_URLS: &[&str] = &[
-    "https://nemweb.com.au/Reports/Current/Adjusted_Prices_Reports/",
     // "https://nemweb.com.au/Reports/Current/Ancillary_Services_Payments/", // - csv only
-    "https://nemweb.com.au/Reports/Current/Bidmove_Complete/",
-    "https://nemweb.com.au/Reports/Current/Billing/",
     // "https://nemweb.com.au/Reports/Current/Causer_Pays/", // - non cid format. unfortunate.
     // "https://nemweb.com.au/Reports/Current/Causer_Pays_Elements/", // - csv only, needed though for translations
-    "https://nemweb.com.au/Reports/Current/Causer_Pays_Scada/",
     // "https://nemweb.com.au/Reports/Current/CDEII/", // element type seemingly
+    // "https://nemweb.com.au/Reports/Current/IBEI/", // elements
+    "https://nemweb.com.au/Reports/Current/Adjusted_Prices_Reports/",
+    "https://nemweb.com.au/Reports/Current/Bidmove_Complete/",
+    "https://nemweb.com.au/Reports/Current/Billing/",
+    "https://nemweb.com.au/Reports/Current/Causer_Pays_Scada/",
     "https://nemweb.com.au/Reports/Current/CSC_CSP_Settlements/",
     "https://nemweb.com.au/Reports/Current/Daily_Reports/",
     "https://nemweb.com.au/Reports/Current/DAILYOCD/",
@@ -41,12 +34,10 @@ static CURRENT_FEED_URLS: &[&str] = &[
     "https://nemweb.com.au/Reports/Current/FPPRATES/",
     "https://nemweb.com.au/Reports/Current/FPPRUN/",
     "https://nemweb.com.au/Reports/Current/HistDemand/",
-    // "https://nemweb.com.au/Reports/Current/IBEI/", // elements
     "https://nemweb.com.au/Reports/Current/Marginal_Loss_Factors/",
     "https://nemweb.com.au/Reports/Current/MCCDispatch/",
     "https://nemweb.com.au/Reports/Current/Medium_Term_PASA_Reports/",
     "https://nemweb.com.au/Reports/Current/Mktsusp_Pricing/",
-    // done to here
     "https://nemweb.com.au/Reports/Current/MTPASA_DUIDAvailability/",
     "https://nemweb.com.au/Reports/Current/MTPASA_RegionAvailability/",
     "https://nemweb.com.au/Reports/Current/Network/",
@@ -90,6 +81,8 @@ static ARCHIVE_FEED_URLS: &[&str] = &[
     "https://nemweb.com.au/Reports/Archive/FPPRUN/",
     "https://nemweb.com.au/Reports/Archive/P5_Reports/",
 ];
+const MAX_RETRIES: usize = 3;
+const RETRY_DELAY: Duration = Duration::from_secs(1);
 
 /// Fetch all ZIP URLs from the current feeds concurrently.
 pub async fn fetch_current_zip_urls(client: &Client) -> Result<BTreeMap<String, Vec<String>>> {
@@ -101,59 +94,83 @@ pub async fn fetch_archive_zip_urls(client: &Client) -> Result<BTreeMap<String, 
     fetch_zip_urls(client, ARCHIVE_FEED_URLS).await
 }
 
-const MAX_RETRIES: usize = 3;
-const RETRY_DELAY: Duration = Duration::from_secs(1);
+/// Helper that does the retry loop for a single feed URL, returning (feed_url, Vec<zip-links>).
+async fn fetch_feed_links(
+    client: Client,
+    feed_url: String,
+    selector: Selector,
+) -> Result<(String, Vec<String>)> {
+    let mut attempt = 0;
 
-async fn fetch_zip_urls(client: &Client, feeds: &[&str]) -> Result<BTreeMap<String, Vec<String>>> {
-    let selector =
-        Selector::parse(r#"a[href$=".zip"]"#).expect("Invalid CSS selector for .zip links");
+    loop {
+        attempt += 1;
+        let resp = client.get(&feed_url).send().await;
 
-    let mut map = BTreeMap::new();
+        match resp {
+            Ok(resp) if resp.status().is_success() => {
+                let html = resp
+                    .text()
+                    .await
+                    .with_context(|| format!("reading body of {}", feed_url))?;
 
-    for &feed in feeds {
-        let feed_url = feed.to_string();
-        let sel = selector.clone();
-        let mut attempt = 0;
+                let base = Url::parse(&feed_url)
+                    .with_context(|| format!("parsing base URL {}", feed_url))?;
 
-        // retry loop
-        let links = loop {
-            attempt += 1;
+                let links = Html::parse_document(&html)
+                    .select(&selector)
+                    .filter_map(|elem| elem.value().attr("href"))
+                    .filter_map(|href| base.join(href).ok())
+                    .map(|url| url.to_string())
+                    .collect::<Vec<String>>();
 
-            // 1) fetch page
-            let resp = client.get(&feed_url).send().await;
-            match resp {
-                Ok(resp) if resp.status().is_success() => {
-                    // 2) get body text
-                    match resp.text().await {
-                        Ok(html) => {
-                            // 3) parse links
-                            let base = Url::parse(&feed_url)?;
-                            let urls = Html::parse_document(&html)
-                                .select(&sel)
-                                .filter_map(|e| e.value().attr("href"))
-                                .filter_map(|href| base.join(href).ok())
-                                .map(|u| u.to_string())
-                                .collect::<Vec<_>>();
-                            break urls;
-                        }
-                        Err(_) if attempt < MAX_RETRIES => {
-                            sleep(RETRY_DELAY).await;
-                            continue;
-                        }
-                        Err(e) => return Err(e.into()),
-                    }
-                }
-                Err(_) if attempt < MAX_RETRIES => {
-                    sleep(RETRY_DELAY).await;
-                    continue;
-                }
-                Ok(resp) => return Err(anyhow::anyhow!("HTTP error: {}", resp.status())),
-                Err(e) => return Err(e.into()),
+                return Ok((feed_url, links));
             }
-        };
 
-        map.insert(feed_url, links);
+            Err(_) if attempt < MAX_RETRIES => {
+                sleep(RETRY_DELAY).await;
+                continue;
+            }
+
+            Ok(resp) => {
+                return Err(anyhow::anyhow!(
+                    "HTTP error {} when fetching {}",
+                    resp.status(),
+                    feed_url
+                ));
+            }
+
+            Err(e) => {
+                return Err(e).context(format!(
+                    "network error when fetching {} on attempt {}",
+                    feed_url, attempt
+                ));
+            }
+        }
     }
+}
 
+/// Run all feed‐fetch tasks in parallel, then collect into a BTreeMap.
+async fn fetch_zip_urls(client: &Client, feeds: &[&str]) -> Result<BTreeMap<String, Vec<String>>> {
+    // Pre‐parse the selector once
+    let selector =
+        Selector::parse(r#"a[href$=".zip"]"#).expect("invalid CSS selector for .zip links");
+
+    // Build one future per feed URL
+    let fetch_futures = feeds.iter().map(|&feed_url| {
+        let client = client.clone();
+        let selector = selector.clone();
+        let feed_url_string = feed_url.to_owned();
+        // Call our helper
+        fetch_feed_links(client, feed_url_string, selector)
+    });
+
+    // Wait for all of them to finish (error if any one fails)
+    let results: Vec<(String, Vec<String>)> = try_join_all(fetch_futures).await?;
+
+    // Flatten into a BTreeMap
+    let mut map = BTreeMap::new();
+    for (url, links) in results {
+        map.insert(url, links);
+    }
     Ok(map)
 }

@@ -1,4 +1,3 @@
-// data/src/fetch/zips.rs
 use anyhow::Result;
 use reqwest::Client;
 use std::path::{Path, PathBuf};
