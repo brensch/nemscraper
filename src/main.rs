@@ -145,9 +145,8 @@ async fn main() -> Result<()> {
                 if let Err(e) = async {
                     info!("vacuuming history");
                     history.vacuum().unwrap();
-                    info!("fetching feeds");
 
-                    // a) Fetch new URLs
+                    info!("fetching feeds");
                     let feeds = fetch::urls::fetch_current_zip_urls(&client).await?;
                     let all_urls_iter = feeds.values().flat_map(|urls| urls.iter().cloned());
 
