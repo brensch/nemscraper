@@ -2,7 +2,7 @@ use anyhow::{Context, Result};
 use std::fs::File;
 use std::io::{BufRead, BufReader};
 use std::path::Path;
-use tracing::{debug, error, instrument, warn};
+use tracing::{debug, instrument, warn};
 use zip::ZipArchive;
 
 use super::csv_batch_processor::CsvBatchProcessor;

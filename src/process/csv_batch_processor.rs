@@ -1,9 +1,6 @@
-use anyhow::{Context, Result};
-use std::fs::File;
-use std::io::{BufRead, BufReader};
+use anyhow::Result;
 use std::path::Path;
-use tracing::{debug, error, instrument, warn};
-use zip::ZipArchive;
+use tracing::error;
 
 use super::chunk_polars::csv_to_parquet;
 
