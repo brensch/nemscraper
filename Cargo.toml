@@ -52,3 +52,4 @@ polars = { version = "0.48.1", features = [
     "default",
 ] }
 sysinfo = "0.35.1"
+serde_yaml = "0.9.34"

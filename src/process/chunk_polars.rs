@@ -188,7 +188,7 @@ pub fn csv_to_parquet(file_name: &str, data: &str, out_dir: &Path) -> Result<(),
 
     let prefix = if all_trimmed_names.len() >= 4 {
         format!(
-            "{}_{}_{}",
+            "{}---{}---{}",
             all_trimmed_names[1], all_trimmed_names[2], all_trimmed_names[3]
         )
     } else {
@@ -198,12 +198,12 @@ pub fn csv_to_parquet(file_name: &str, data: &str, out_dir: &Path) -> Result<(),
     let final_name = if prefix.is_empty() {
         format!("{}.parquet", file_name)
     } else {
-        format!("{}_{}.parquet", prefix, file_name)
+        format!("{}---{}.parquet", prefix, file_name)
     };
     let tmp_name = if prefix.is_empty() {
         format!("{}.parquet.tmp", file_name)
     } else {
-        format!("{}_{}.parquet.tmp", prefix, file_name)
+        format!("{}---{}.parquet.tmp", prefix, file_name)
     };
     let final_path = out_dir.join(final_name);
     let tmp_path = out_dir.join(tmp_name);
