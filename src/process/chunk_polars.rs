@@ -6,7 +6,7 @@ use std::fs;
 use std::io::Cursor;
 use std::path::Path;
 use std::sync::Arc;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 /// 1) Trim whitespace + strip outer quotes if present.
 ///    Always returns an owned String.
@@ -19,7 +19,7 @@ fn clean_str(raw: &str) -> String {
     }
 }
 
-/// 2) Infer “would-be” dtype from a cleaned string, treating ANY parseable
+/// 2) Infer "would-be" dtype from a cleaned string, treating ANY parseable
 ///    number (integer or float) as Float64. Otherwise String.
 fn infer_dtype_from_str(s: &str) -> DataType {
     if s.parse::<f64>().is_ok() {
@@ -46,9 +46,9 @@ fn promote_sample_dtype(dt: &DataType) -> DataType {
     }
 }
 
-/// 4) After forcing schema and full read, check if any string column’s first‐row,
-///    once cleaned, would change dtype (String → Float64). Return true if any do.
-fn check_first_row_trim(df: &DataFrame) -> PolarsResult<bool> {
+/// 4) Check if any string column's first‐row, once cleaned, would change dtype.
+///    Returns true if any columns would change type after cleaning.
+fn detect_type_changes(df: &DataFrame) -> PolarsResult<bool> {
     let mut any_changed = false;
 
     for col_name in df.get_column_names() {
@@ -81,20 +81,152 @@ fn check_first_row_trim(df: &DataFrame) -> PolarsResult<bool> {
     Ok(any_changed)
 }
 
-/// 5) Main CSV→Parquet routine:
+/// 5) Extract date from filename for partitioning.
+///    Looks for common date patterns and returns a standardized date string for partitioning.
+fn extract_date_from_filename(filename: &str) -> Option<String> {
+    // Look for YYYYMMDD pattern (8 consecutive digits)
+    let chars: Vec<char> = filename.chars().collect();
+    for i in 0..chars.len().saturating_sub(7) {
+        if chars[i..i + 8].iter().all(|c| c.is_ascii_digit()) {
+            let date_str: String = chars[i..i + 8].iter().collect();
+            // Validate it looks like a reasonable date
+            if let (Ok(year), Ok(month), Ok(day)) = (
+                date_str[0..4].parse::<u32>(),
+                date_str[4..6].parse::<u32>(),
+                date_str[6..8].parse::<u32>(),
+            ) {
+                if year >= 2000
+                    && year <= 2030
+                    && month >= 1
+                    && month <= 12
+                    && day >= 1
+                    && day <= 31
+                {
+                    return Some(format!(
+                        "{}-{}-{}",
+                        &date_str[0..4],
+                        &date_str[4..6],
+                        &date_str[6..8]
+                    ));
+                }
+            }
+        }
+    }
+
+    // Look for YYYY-MM-DD or YYYY_MM_DD pattern
+    for i in 0..chars.len().saturating_sub(9) {
+        if chars.len() >= i + 10 {
+            let potential_date: String = chars[i..i + 10].iter().collect();
+            if (potential_date.contains('-') || potential_date.contains('_')) {
+                let parts: Vec<&str> = potential_date.split(&['-', '_'][..]).collect();
+                if parts.len() == 3 {
+                    if let (Ok(year), Ok(month), Ok(day)) = (
+                        parts[0].parse::<u32>(),
+                        parts[1].parse::<u32>(),
+                        parts[2].parse::<u32>(),
+                    ) {
+                        if year >= 2000
+                            && year <= 2030
+                            && month >= 1
+                            && month <= 12
+                            && day >= 1
+                            && day <= 31
+                        {
+                            return Some(format!("{:04}-{:02}-{:02}", year, month, day));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    None
+}
+
+/// 6) Write DataFrame to Parquet file with date-based Hive partitioning.
+///    Creates directory structure: table_name/date=YYYY-MM-DD/data.parquet
+fn write_partitioned_parquet(
+    df: &mut DataFrame,
+    file_name: &str,
+    out_dir: &Path,
+    table_name: &str,
+) -> Result<(), Box<dyn Error>> {
+    // Extract date from filename for partitioning
+    let partition_date = extract_date_from_filename(file_name).unwrap_or_else(|| {
+        // Fallback to a default date if none found
+        warn!(
+            "No date found in filename '{}', using default partition",
+            file_name
+        );
+        "unknown-date".to_string()
+    });
+
+    // Create table directory
+    let table_dir = out_dir.join(table_name);
+    fs::create_dir_all(&table_dir)?;
+
+    // Create date partition directory
+    let partition_dir = table_dir.join(format!("date={}", partition_date));
+    fs::create_dir_all(&partition_dir)?;
+
+    // Write the entire dataframe to this partition
+    write_parquet_file(df, file_name, &partition_dir, 0)?;
+
+    info!(
+        "Wrote Parquet file to table '{}' with date partition '{}'",
+        table_name, partition_date
+    );
+    Ok(())
+}
+
+/// 7) Write a single Parquet file with atomic rename.
+fn write_parquet_file(
+    df: &mut DataFrame,
+    file_name: &str,
+    out_dir: &Path,
+    partition_idx: usize,
+) -> Result<(), Box<dyn Error>> {
+    // Generate unique filename for this partition
+    let final_name = if partition_idx == 0 {
+        format!("{}.parquet", file_name)
+    } else {
+        format!("{}_{}.parquet", file_name, partition_idx)
+    };
+    let tmp_name = format!("{}.tmp", final_name);
+
+    let final_path = out_dir.join(final_name);
+    let tmp_path = out_dir.join(tmp_name);
+
+    // Write to temporary Parquet file
+    {
+        let mut tmp_file = fs::File::create(&tmp_path)?;
+        ParquetWriter::new(&mut tmp_file)
+            .with_compression(ParquetCompression::Brotli(Some(BrotliLevel::try_new(5)?)))
+            .finish(df)?;
+    }
+
+    // Atomic rename to final file
+    fs::rename(&tmp_path, &final_path)?;
+
+    debug!("Wrote Parquet file: {}", final_path.display());
+    Ok(())
+}
+
+/// 8) Main CSV→Parquet routine with date-based Hive partitioning:
 ///
 ///    - Automatically detect date columns matching "%Y/%m/%d %H:%M:%S" (in sample).
 ///    - Sample first N rows to infer a provisional schema and identify date columns.
 ///    - Promote any integerish/Float32 → Float64 in that schema.
-///    - Re-read full CSV with `.with_dtype_overwrite(...)` so no Int64 remains.
-///    - For each detected date column, `strptime(...)` into
-///      `Datetime(TimeUnit::Milliseconds, Some("+10:00"))`.
-///    - Build filename prefix from headers 1,2,3.
-///    - If any string column’s first row (after `clean_str`) “looks numeric,” do a full‐column
-///      `clean_str(...)` → cast to Float64 (or leave as String).
-///    - Write to `<prefix>_<file>.parquet.tmp` → rename to `.parquet`.
+///    - Re-read full CSV with .with_dtype_overwrite(...) so no Int64 remains.
+///    - For each detected date column, strptime(...) into
+///      Datetime(TimeUnit::Milliseconds, Some("+10:00")).
+///    - Build table name from column headers 1,2,3 (0-indexed).
+///    - Extract date from filename for partitioning.
+///    - Apply type cleaning if needed.
+///    - Write to Hive-partitioned structure: table_name/date=YYYY-MM-DD/data.parquet
 pub fn csv_to_parquet(file_name: &str, data: &str, out_dir: &Path) -> Result<(), Box<dyn Error>> {
-    debug!("starting");
+    debug!("Starting CSV to Parquet conversion with Hive partitioning");
+
     // ─── Step A: SAMPLE‐READ (first 1,000 rows) ───────────────────────────────────
     let sample_size = 1000;
     let mut sample_cursor = Cursor::new(data.as_bytes());
@@ -174,42 +306,32 @@ pub fn csv_to_parquet(file_name: &str, data: &str, out_dir: &Path) -> Result<(),
 
         df.replace(col_name, parsed_with_tz.into_series())?;
         debug!(
-            "  Parsed date column `{}` into Datetime(TimeUnit::Milliseconds, \"+10:00\")",
+            "  Parsed date column {} into Datetime(TimeUnit::Milliseconds, \"+10:00\")",
             col_name
         );
     }
 
-    // ─── Step D: BUILD PREFIX FROM COLUMN HEADERS 1,2,3 ─────────────────────────────
+    // ─── Step D: BUILD TABLE NAME FROM COLUMN HEADERS 1,2,3 ─────────────────────────────
     let all_trimmed_names: Vec<String> = df
         .get_column_names()
         .iter()
         .map(|hdr| clean_str(hdr.as_str()))
         .collect();
 
-    let prefix = if all_trimmed_names.len() >= 4 {
+    let table_name = if all_trimmed_names.len() >= 4 {
         format!(
             "{}---{}---{}",
             all_trimmed_names[1], all_trimmed_names[2], all_trimmed_names[3]
         )
     } else {
-        String::new()
+        // Fallback if less than 4 columns
+        "default_table".to_string()
     };
 
-    let final_name = if prefix.is_empty() {
-        format!("{}.parquet", file_name)
-    } else {
-        format!("{}---{}.parquet", prefix, file_name)
-    };
-    let tmp_name = if prefix.is_empty() {
-        format!("{}.parquet.tmp", file_name)
-    } else {
-        format!("{}---{}.parquet.tmp", prefix, file_name)
-    };
-    let final_path = out_dir.join(final_name);
-    let tmp_path = out_dir.join(tmp_name);
+    debug!("Table name: {}", table_name);
 
-    // ─── Step E: CHECK FIRST‐ROW TRIM FOR STRING COLUMNS ────────────────────────────
-    let type_changed = check_first_row_trim(&df)?;
+    // ─── Step E: CHECK AND APPLY TYPE CHANGES ────────────────────────────────────────
+    let type_changed = detect_type_changes(&df)?;
     if type_changed {
         for col_name in df.get_column_names_owned() {
             if date_cols.contains(&col_name) {
@@ -234,7 +356,7 @@ pub fn csv_to_parquet(file_name: &str, data: &str, out_dir: &Path) -> Result<(),
             }
 
             debug!(
-                "Column `{}`: first-row cleaned dtype {:?} → casting entire column to {:?}",
+                "Column {}: first-row cleaned dtype {:?} → casting entire column to {:?}",
                 col_name,
                 col.dtype(),
                 new_dtype
@@ -254,17 +376,8 @@ pub fn csv_to_parquet(file_name: &str, data: &str, out_dir: &Path) -> Result<(),
         }
     }
 
-    // ─── Step F: WRITE to temporary Parquet ────────────────────────────────────────
-    {
-        let mut tmp_file = fs::File::create(&tmp_path)?;
-        ParquetWriter::new(&mut tmp_file)
-            .with_compression(ParquetCompression::Brotli(Some(BrotliLevel::try_new(5)?)))
-            .finish(&mut df.clone())?;
-    }
+    // ─── Step F: WRITE DATE-PARTITIONED PARQUET FILES ───────────────────────────────
+    write_partitioned_parquet(&mut df, file_name, out_dir, &table_name)?;
 
-    // ─── Step G: ATOMIC RENAME → final .parquet ────────────────────────────────────
-    fs::rename(&tmp_path, &final_path)?;
-
-    info!("Wrote final Parquet: {}", final_path.display());
     Ok(())
 }
