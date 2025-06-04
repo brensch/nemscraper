@@ -2214,6 +2214,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "arrow",
+ "arrow-csv",
  "arrow-schema",
  "async-trait",
  "chrono",
@@ -3714,6 +3715,7 @@ dependencies = [
  "url",
  "wasm-bindgen",
  "wasm-bindgen-futures",
+ "wasm-streams",
  "web-sys",
  "webpki-roots",
  "winreg",

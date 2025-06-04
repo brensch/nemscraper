@@ -5,14 +5,44 @@ use nemscraper::{fetch, process};
 use reqwest::Client;
 use std::{ffi::OsStr, fs, path::PathBuf, sync::Arc, time::Duration};
 use tokio::{
+    signal,
     sync::{mpsc, Mutex},
     task,
     time::{interval, sleep},
 };
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, warn};
 use tracing_subscriber::{fmt, EnvFilter};
 
 mod history;
+
+// Add graceful shutdown handler
+async fn shutdown_signal() {
+    let ctrl_c = async {
+        signal::ctrl_c()
+            .await
+            .expect("failed to install Ctrl+C handler");
+    };
+
+    #[cfg(unix)]
+    let terminate = async {
+        signal::unix::signal(signal::unix::SignalKind::terminate())
+            .expect("failed to install signal handler")
+            .recv()
+            .await;
+    };
+
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+
+    tokio::select! {
+        _ = ctrl_c => {
+            info!("Received Ctrl+C signal, shutting down gracefully...");
+        },
+        _ = terminate => {
+            info!("Received SIGTERM signal, shutting down gracefully...");
+        },
+    }
+}
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -23,7 +53,8 @@ async fn main() -> Result<()> {
         .with_env_filter(env)
         .with_span_events(fmt::format::FmtSpan::CLOSE)
         .init();
-    info!("startup");
+
+    info!("Starting application with PID: {}", std::process::id());
 
     // ─── 2) configure dirs ───────────────────────────────────────────
     let client = Client::new();
@@ -46,7 +77,8 @@ async fn main() -> Result<()> {
     let url_rx = Arc::new(Mutex::new(url_rx));
 
     // ─── 5) spawn download workers ───────────────────────────────────
-    for _ in 0..2 {
+    // Reduce concurrent downloads to manage memory
+    for worker_id in 0..2 {
         let client = client.clone();
         let zips_dir = zips_dir.clone();
         let tx = processor_tx.clone();
@@ -54,6 +86,7 @@ async fn main() -> Result<()> {
         let history = history.clone();
 
         task::spawn(async move {
+            info!("Download worker {} started", worker_id);
             loop {
                 // Lock & recv one URL
                 let maybe_url = {
@@ -62,7 +95,10 @@ async fn main() -> Result<()> {
                 };
                 let url = match maybe_url {
                     Some(u) => u,
-                    None => break, // channel closed
+                    None => {
+                        info!("Download worker {} shutting down", worker_id);
+                        break;
+                    }
                 };
 
                 let name = PathBuf::from(&url)
@@ -81,28 +117,9 @@ async fn main() -> Result<()> {
                     continue;
                 }
 
-                info!(name = %name, "downloading {}", url);
+                info!(name = %name, worker_id = worker_id, "downloading {}", url);
 
-                // retry up to 3 times
-                let path_result = async {
-                    let mut attempt = 0;
-                    loop {
-                        attempt += 1;
-                        match fetch::zips::download_zip(&client, &url, &zips_dir).await {
-                            Ok(path) => return Ok(path),
-                            Err(e) if attempt < 3 => {
-                                error!(
-                                    "attempt {}/3 for {} failed: {}, retrying…",
-                                    attempt, url, e
-                                );
-                                sleep(Duration::from_secs((1 << attempt) as u64)).await;
-                            }
-                            Err(e) => return Err(e),
-                        }
-                    }
-                }
-                .await;
-
+                let path_result = fetch::zips::download_zip(&client, &url, &zips_dir).await;
                 match path_result {
                     Ok(path) => {
                         if let Err(e) = history.add(&name, State::Downloaded, 1) {
@@ -175,19 +192,21 @@ async fn main() -> Result<()> {
         });
     }
 
-    // ─── 7) spawn “processor” workers (one per CPU core) ──────────────
+    // ─── 7) spawn "processor" workers ──────────────
     let processor_rx = Arc::new(Mutex::new(processor_rx));
+    // Reduce workers to prevent memory issues
     let num_cores = std::thread::available_parallelism()
         .map(|n| n.get())
         .unwrap_or(1);
 
     info!("spawning {} processor workers", num_cores);
-    for _ in 0..num_cores {
+    for worker_id in 0..num_cores {
         let rx = processor_rx.clone();
         let history = history.clone();
         let parquet_dir = parquet_dir.clone();
 
         task::spawn(async move {
+            info!("Processor worker {} started", worker_id);
             loop {
                 // 1) Lock & receive exactly one message
                 let msg_opt = {
@@ -197,7 +216,10 @@ async fn main() -> Result<()> {
 
                 let msg = match msg_opt {
                     Some(m) => m,
-                    None => break, // channel closed → exit worker
+                    None => {
+                        info!("Processor worker {} shutting down", worker_id);
+                        break;
+                    }
                 };
 
                 match msg {
@@ -209,7 +231,7 @@ async fn main() -> Result<()> {
                             debug!(name = %name, "already processed {}, skipping", name);
                             continue;
                         }
-                        debug!(file_name = %name, "processing");
+                        info!(file_name = %name, worker_id = worker_id, "processing");
 
                         // Run the blocking split on a dedicated blocking thread
                         let split_path = zip_path.clone();
@@ -231,7 +253,7 @@ async fn main() -> Result<()> {
                                 {
                                     error!("history.add (Processed) failed for {}: {:#}", name, e);
                                 } else {
-                                    info!(file_name = %name, "processing completed ({} rows)", row_count);
+                                    info!(file_name = %name, worker_id = worker_id, "processing completed ({} rows)", row_count);
                                 }
                             }
                             Err(e) => {
@@ -253,7 +275,8 @@ async fn main() -> Result<()> {
     drop(processor_tx);
     drop(url_tx);
 
-    // ─── 9) keep main alive until shutdown (e.g. Ctrl+C). ─────────────
-    futures::future::pending::<()>().await;
+    // ─── 9) wait for shutdown signal instead of pending forever ─────────────
+    shutdown_signal().await;
+    info!("Application shutting down gracefully");
     Ok(())
 }
