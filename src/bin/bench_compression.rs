@@ -154,10 +154,10 @@ fn main() -> Result<()> {
 
             // concat all batches
             for p in files {
-                let mut batch_reader = ParquetRecordBatchReaderBuilder::try_new(File::open(p)?)?
+                let batch_reader = ParquetRecordBatchReaderBuilder::try_new(File::open(p)?)?
                     .with_batch_size(1024)
                     .build()?;
-                while let Some(batch) = batch_reader.next() {
+                for batch in batch_reader {
                     let batch: RecordBatch = batch?;
                     writer.write(&batch)?;
                 }

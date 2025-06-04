@@ -117,7 +117,7 @@ fn main() -> Result<()> {
 
                 // concat all batches
                 for path in &files {
-                    let mut batch_reader = ParquetRecordBatchReaderBuilder::try_new(
+                    let batch_reader = ParquetRecordBatchReaderBuilder::try_new(
                         File::open(path).expect("open part file"),
                     )
                     .expect("build batch reader")
@@ -125,7 +125,7 @@ fn main() -> Result<()> {
                     .build()
                     .expect("finalize reader");
 
-                    while let Some(batch) = batch_reader.next() {
+                    for batch in batch_reader {
                         let batch: RecordBatch = batch.expect("read batch");
                         writer.write(&batch).expect("write batch");
                     }

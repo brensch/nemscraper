@@ -54,7 +54,7 @@ fn parse_header_and_create_string_schema(
     let headers: Vec<String> = header_line
         .trim()
         .split(',')
-        .map(|s| clean_str(s))
+        .map(clean_str)
         .collect();
 
     // Create schema with all string fields
@@ -263,12 +263,9 @@ fn extract_date_from_filename(filename: &str) -> Option<String> {
                 date_str[4..6].parse::<u32>(),
                 date_str[6..8].parse::<u32>(),
             ) {
-                if year >= 2000
-                    && year <= 2030
-                    && month >= 1
-                    && month <= 12
-                    && day >= 1
-                    && day <= 31
+                if (2000..=2030).contains(&year)
+                    && (1..=12).contains(&month)
+                    && (1..=31).contains(&day)
                 {
                     return Some(format!(
                         "{}-{}-{}",
@@ -293,12 +290,9 @@ fn extract_date_from_filename(filename: &str) -> Option<String> {
                         parts[1].parse::<u32>(),
                         parts[2].parse::<u32>(),
                     ) {
-                        if year >= 2000
-                            && year <= 2030
-                            && month >= 1
-                            && month <= 12
-                            && day >= 1
-                            && day <= 31
+                        if (2000..=2030).contains(&year)
+                            && (1..=12).contains(&month)
+                            && (1..=31).contains(&day)
                         {
                             return Some(format!("{:04}-{:02}-{:02}", year, month, day));
                         }

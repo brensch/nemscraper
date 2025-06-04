@@ -249,7 +249,7 @@ async fn main() -> Result<()> {
                             Ok(row_count) => {
                                 // Only add to history if the split succeeded
                                 if let Err(e) =
-                                    history_clone.add(&name, State::Processed, row_count as i64)
+                                    history_clone.add(&name, State::Processed, row_count)
                                 {
                                     error!("history.add (Processed) failed for {}: {:#}", name, e);
                                 } else {

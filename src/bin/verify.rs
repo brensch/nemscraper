@@ -65,7 +65,7 @@ fn main() -> Result<()> {
         .par_iter()
         .map(|zip_path| {
             // Open the ZIP file from disk
-            let file = File::open(&zip_path)
+            let file = File::open(zip_path)
                 .with_context(|| format!("Failed to open ZIP '{}'", zip_path.display()))?;
             let mut archive = ZipArchive::new(file)
                 .with_context(|| format!("Failed to read ZIP archive '{}'", zip_path.display()))?;
@@ -115,7 +115,7 @@ fn main() -> Result<()> {
     let per_parquet_counts: Vec<(PathBuf, usize)> = parquet_paths
         .par_iter()
         .map(|pq_path| {
-            let file = File::open(&pq_path)
+            let file = File::open(pq_path)
                 .with_context(|| format!("Failed to open Parquet '{}'", pq_path.display()))?;
             let reader = SerializedFileReader::new(file).with_context(|| {
                 format!(

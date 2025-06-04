@@ -1,7 +1,6 @@
 use parquet::file::reader::{FileReader, SerializedFileReader};
 use regex::Regex;
 use serde::Serialize;
-use serde_yaml;
 use std::collections::HashMap;
 use std::env;
 use std::fs::{self, File};
