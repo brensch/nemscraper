@@ -1,15 +1,21 @@
-use chrono::NaiveDateTime;
-use polars::prelude::*;
-use std::borrow::Cow;
+use arrow::array::*;
+use arrow::compute;
+use arrow::csv::{Reader, ReaderBuilder};
+use arrow::datatypes::*;
+use arrow::record_batch::RecordBatch;
+use chrono::{NaiveDateTime, TimeZone, Utc};
+use parquet::arrow::ArrowWriter;
+use parquet::basic::BrotliLevel;
+use parquet::basic::{Compression, ZstdLevel};
+use parquet::file::properties::WriterProperties;
 use std::error::Error;
-use std::fs;
+use std::fs::File;
 use std::io::Cursor;
 use std::path::Path;
 use std::sync::Arc;
 use tracing::{debug, info, warn};
 
 /// 1) Trim whitespace + strip outer quotes if present.
-///    Always returns an owned String.
 fn clean_str(raw: &str) -> String {
     let trimmed = raw.trim();
     if trimmed.starts_with('"') && trimmed.ends_with('"') && trimmed.len() >= 2 {
@@ -19,18 +25,17 @@ fn clean_str(raw: &str) -> String {
     }
 }
 
-/// 2) Infer "would-be" dtype from a cleaned string, treating ANY parseable
-///    number (integer or float) as Float64. Otherwise String.
-fn infer_dtype_from_str(s: &str) -> DataType {
+/// 2) Infer Arrow dtype from a cleaned string, treating ANY parseable number as Float64.
+fn infer_arrow_dtype_from_str(s: &str) -> DataType {
     if s.parse::<f64>().is_ok() {
         DataType::Float64
     } else {
-        DataType::String
+        DataType::Utf8
     }
 }
 
-/// 3) Promote any integer‐type or Float32 to Float64 in a sample‐inferred dtype.
-fn promote_sample_dtype(dt: &DataType) -> DataType {
+/// 3) Promote integer types to Float64 in Arrow schema.
+fn promote_to_float64(dt: &DataType) -> DataType {
     match dt {
         DataType::Int8
         | DataType::Int16
@@ -46,50 +51,209 @@ fn promote_sample_dtype(dt: &DataType) -> DataType {
     }
 }
 
-/// 4) Check if any string column's first‐row, once cleaned, would change dtype.
-///    Returns true if any columns would change type after cleaning.
-fn detect_type_changes(df: &DataFrame) -> PolarsResult<bool> {
-    let mut any_changed = false;
+/// Schema inference and trimming detection from first batch
+struct SchemaInfo {
+    schema: Schema,
+    date_columns: Vec<String>,
+    trim_columns: Vec<String>,
+    table_name: String,
+}
 
-    for col_name in df.get_column_names() {
-        let col = df.column(col_name)?;
-        // Only inspect columns with DataType::String
-        let str_ca = match col.str() {
-            Ok(ca) => ca,
-            Err(_) => continue,
-        };
-        if let Some(orig_val) = str_ca.get(0) {
-            let cleaned = clean_str(orig_val);
-            let new_dtype = infer_dtype_from_str(&cleaned);
-            let old_dtype = col.dtype();
-            if old_dtype != &new_dtype {
-                println!(
-                    "Column '{}' first‐row WOULD change type: {:?} (orig=\"{}\") → {:?} (cleaned=\"{}\")",
-                    col_name, old_dtype, orig_val, new_dtype, cleaned
-                );
-                any_changed = true;
+/// 4) Sample the first batch to infer schema, detect date columns and trimming needs.
+fn sample_and_infer_schema(data: &str) -> Result<SchemaInfo, Box<dyn Error>> {
+    let mut cursor = Cursor::new(data.as_bytes());
+
+    // Read first 1000 rows only for sampling
+    let reader = ReaderBuilder::new(Arc::new(Schema::empty()))
+        .with_header(true)
+        .with_batch_size(1000) // Only read first 1000 rows
+        .build(&mut cursor)?;
+
+    let first_batch = reader
+        .into_iter()
+        .next()
+        .transpose()?
+        .ok_or("No data found in CSV")?;
+
+    let mut final_fields = Vec::new();
+    let mut date_columns = Vec::new();
+    let mut trim_columns = Vec::new();
+
+    // Extract header names for table naming (columns 1,2,3)
+    let header_names: Vec<String> = first_batch
+        .schema()
+        .fields()
+        .iter()
+        .map(|f| clean_str(f.name()))
+        .collect();
+
+    let table_name = if header_names.len() >= 4 {
+        format!(
+            "{}---{}---{}",
+            header_names[1], header_names[2], header_names[3]
+        )
+    } else {
+        "default_table".to_string()
+    };
+
+    // Analyze each column
+    for (col_idx, field) in first_batch.schema().fields().iter().enumerate() {
+        let col_name = field.name();
+        let array = first_batch.column(col_idx);
+
+        // Check if this is a string column that needs analysis
+        if let Some(string_array) = array.as_any().downcast_ref::<StringArray>() {
+            let mut needs_trimming = false;
+            let mut is_date_column = false;
+            let mut inferred_type = DataType::Utf8;
+
+            // Check first non-null value
+            if let Some(first_val) = string_array.iter().find_map(|v| v) {
+                let cleaned = clean_str(first_val);
+
+                // Check if trimming changed the value
+                if cleaned != first_val {
+                    needs_trimming = true;
+                }
+
+                // Check if it's a date column
+                if NaiveDateTime::parse_from_str(&cleaned, "%Y/%m/%d %H:%M:%S").is_ok() {
+                    is_date_column = true;
+                    // Date columns stay as Utf8 initially, we'll convert later
+                } else {
+                    // Try to infer numeric type
+                    inferred_type = infer_arrow_dtype_from_str(&cleaned);
+                }
             }
-            if cleaned != orig_val {
-                println!(
-                    "  (trimmed text changed: \"{}\" → \"{}\")",
-                    orig_val, cleaned
-                );
+
+            if needs_trimming {
+                trim_columns.push(col_name.clone());
             }
+
+            if is_date_column {
+                date_columns.push(col_name.clone());
+                // Keep as Utf8 for now, will convert to timestamp later
+                final_fields.push(Field::new(col_name, DataType::Utf8, true));
+            } else {
+                final_fields.push(Field::new(col_name, inferred_type, true));
+            }
+        } else {
+            // Non-string column, promote integers to Float64
+            let promoted_type = promote_to_float64(field.data_type());
+            final_fields.push(Field::new(col_name, promoted_type, field.is_nullable()));
         }
     }
 
-    Ok(any_changed)
+    debug!("Date columns detected: {:?}", date_columns);
+    debug!("Trim columns detected: {:?}", trim_columns);
+
+    Ok(SchemaInfo {
+        schema: Schema::new(final_fields),
+        date_columns,
+        trim_columns,
+        table_name,
+    })
 }
 
-/// 5) Extract date from filename for partitioning.
-///    Looks for common date patterns and returns a standardized date string for partitioning.
+/// 5) Apply string trimming to specified columns in a RecordBatch.
+fn apply_trimming(
+    batch: &RecordBatch,
+    trim_columns: &[String],
+) -> Result<RecordBatch, Box<dyn Error>> {
+    if trim_columns.is_empty() {
+        return Ok(batch.clone());
+    }
+
+    let mut new_columns = Vec::with_capacity(batch.num_columns());
+
+    for (col_idx, field) in batch.schema().fields().iter().enumerate() {
+        let array = batch.column(col_idx);
+
+        if trim_columns.contains(field.name()) {
+            // Apply trimming to this column
+            if let Some(string_array) = array.as_any().downcast_ref::<StringArray>() {
+                let trimmed: StringArray = string_array
+                    .iter()
+                    .map(|opt_str| opt_str.map(clean_str))
+                    .collect();
+                new_columns.push(Arc::new(trimmed) as ArrayRef);
+            } else {
+                new_columns.push(array.clone());
+            }
+        } else {
+            new_columns.push(array.clone());
+        }
+    }
+
+    Ok(RecordBatch::try_new(batch.schema(), new_columns)?)
+}
+
+/// 6) Convert date columns from Utf8 to Timestamp with timezone.
+fn convert_date_columns(
+    batch: &RecordBatch,
+    date_columns: &[String],
+) -> Result<RecordBatch, Box<dyn Error>> {
+    if date_columns.is_empty() {
+        return Ok(batch.clone());
+    }
+
+    let mut new_fields = Vec::new();
+    let mut new_columns = Vec::new();
+
+    for (col_idx, field) in batch.schema().fields().iter().enumerate() {
+        let array = batch.column(col_idx);
+
+        if date_columns.contains(field.name()) {
+            // Convert this date column
+            if let Some(string_array) = array.as_any().downcast_ref::<StringArray>() {
+                // Parse dates and convert to timestamps (milliseconds since epoch)
+                let timestamps: TimestampMillisecondArray = string_array
+                    .iter()
+                    .map(|opt_str| {
+                        opt_str.and_then(|s| {
+                            let cleaned = clean_str(s);
+                            NaiveDateTime::parse_from_str(&cleaned, "%Y/%m/%d %H:%M:%S")
+                                .ok()
+                                .map(|dt| {
+                                    // Convert to GMT+10 timezone
+                                    let offset = chrono::FixedOffset::east_opt(10 * 3600).unwrap(); // +10:00
+                                    offset
+                                        .from_local_datetime(&dt)
+                                        .single()
+                                        .map(|dt_tz| dt_tz.timestamp_millis())
+                                        .unwrap_or(0)
+                                })
+                        })
+                    })
+                    .collect();
+
+                new_fields.push(Field::new(
+                    field.name(),
+                    DataType::Timestamp(TimeUnit::Millisecond, Some("+10:00".into())),
+                    field.is_nullable(),
+                ));
+                new_columns.push(Arc::new(timestamps) as ArrayRef);
+            } else {
+                new_fields.push((**field).clone());
+                new_columns.push(array.clone());
+            }
+        } else {
+            new_fields.push((**field).clone());
+            new_columns.push(array.clone());
+        }
+    }
+
+    let new_schema = Arc::new(Schema::new(new_fields));
+    Ok(RecordBatch::try_new(new_schema, new_columns)?)
+}
+
+/// 7) Extract date from filename for partitioning.
 fn extract_date_from_filename(filename: &str) -> Option<String> {
     // Look for YYYYMMDD pattern (8 consecutive digits)
     let chars: Vec<char> = filename.chars().collect();
     for i in 0..chars.len().saturating_sub(7) {
         if chars[i..i + 8].iter().all(|c| c.is_ascii_digit()) {
             let date_str: String = chars[i..i + 8].iter().collect();
-            // Validate it looks like a reasonable date
             if let (Ok(year), Ok(month), Ok(day)) = (
                 date_str[0..4].parse::<u32>(),
                 date_str[4..6].parse::<u32>(),
@@ -117,7 +281,7 @@ fn extract_date_from_filename(filename: &str) -> Option<String> {
     for i in 0..chars.len().saturating_sub(9) {
         if chars.len() >= i + 10 {
             let potential_date: String = chars[i..i + 10].iter().collect();
-            if (potential_date.contains('-') || potential_date.contains('_')) {
+            if potential_date.contains('-') || potential_date.contains('_') {
                 let parts: Vec<&str> = potential_date.split(&['-', '_'][..]).collect();
                 if parts.len() == 3 {
                     if let (Ok(year), Ok(month), Ok(day)) = (
@@ -139,21 +303,21 @@ fn extract_date_from_filename(filename: &str) -> Option<String> {
             }
         }
     }
-
     None
 }
 
-/// 6) Write DataFrame to Parquet file with date-based Hive partitioning.
-///    Creates directory structure: table_name/date=YYYY-MM-DD/data.parquet
-fn write_partitioned_parquet(
-    df: &mut DataFrame,
-    file_name: &str,
-    out_dir: &Path,
-    table_name: &str,
-) -> Result<(), Box<dyn Error>> {
-    // Extract date from filename for partitioning
+/// 8) Main CSV→Parquet conversion using Arrow (memory efficient, single pass).
+pub fn csv_to_parquet(file_name: &str, data: &str, out_dir: &Path) -> Result<(), Box<dyn Error>> {
+    debug!("Starting Arrow-based CSV to Parquet conversion");
+
+    // Step A: Sample and infer schema (reads only first 1000 rows)
+    let schema_info = sample_and_infer_schema(data)?;
+
+    debug!("Inferred schema: {:?}", schema_info.schema);
+    debug!("Table name: {}", schema_info.table_name);
+
+    // Step B: Setup output directory structure
     let partition_date = extract_date_from_filename(file_name).unwrap_or_else(|| {
-        // Fallback to a default date if none found
         warn!(
             "No date found in filename '{}', using default partition",
             file_name
@@ -161,223 +325,56 @@ fn write_partitioned_parquet(
         "unknown-date".to_string()
     });
 
-    // Create table directory
-    let table_dir = out_dir.join(table_name);
-    fs::create_dir_all(&table_dir)?;
-
-    // Create date partition directory
+    let table_dir = out_dir.join(&schema_info.table_name);
+    std::fs::create_dir_all(&table_dir)?;
     let partition_dir = table_dir.join(format!("date={}", partition_date));
-    fs::create_dir_all(&partition_dir)?;
+    std::fs::create_dir_all(&partition_dir)?;
 
-    // Write the entire dataframe to this partition
-    write_parquet_file(df, file_name, &partition_dir, 0)?;
+    // Step C: Setup Parquet writer
+    let final_name = format!("{}.parquet", file_name);
+    let tmp_name = format!("{}.tmp", final_name);
+    let final_path = partition_dir.join(final_name);
+    let tmp_path = partition_dir.join(tmp_name);
+
+    let tmp_file = File::create(&tmp_path)?;
+    let props = WriterProperties::builder()
+        .set_compression(Compression::BROTLI(BrotliLevel::try_new(5)?))
+        .build();
+
+    // Step D: Single-pass CSV read with transformations
+    let mut cursor = Cursor::new(data.as_bytes());
+    let reader = ReaderBuilder::new(Arc::new(schema_info.schema.clone()))
+        .with_header(true)
+        .with_batch_size(8192) // Process in 8K row batches
+        .build(&mut cursor)?;
+
+    let mut writer =
+        ArrowWriter::try_new(tmp_file, Arc::new(schema_info.schema.clone()), Some(props))?;
+
+    // Process each batch
+    for batch_result in reader {
+        let batch = batch_result?;
+
+        // Apply trimming if needed
+        let trimmed_batch = apply_trimming(&batch, &schema_info.trim_columns)?;
+
+        // Convert date columns if needed
+        let final_batch = convert_date_columns(&trimmed_batch, &schema_info.date_columns)?;
+
+        // Write batch to Parquet
+        writer.write(&final_batch)?;
+    }
+
+    writer.close()?;
+
+    // Atomic rename
+    std::fs::rename(&tmp_path, &final_path)?;
 
     info!(
         "Wrote Parquet file to table '{}' with date partition '{}'",
-        table_name, partition_date
+        schema_info.table_name, partition_date
     );
-    Ok(())
-}
 
-/// 7) Write a single Parquet file with atomic rename.
-fn write_parquet_file(
-    df: &mut DataFrame,
-    file_name: &str,
-    out_dir: &Path,
-    partition_idx: usize,
-) -> Result<(), Box<dyn Error>> {
-    // Generate unique filename for this partition
-    let final_name = if partition_idx == 0 {
-        format!("{}.parquet", file_name)
-    } else {
-        format!("{}_{}.parquet", file_name, partition_idx)
-    };
-    let tmp_name = format!("{}.tmp", final_name);
-
-    let final_path = out_dir.join(final_name);
-    let tmp_path = out_dir.join(tmp_name);
-
-    // Write to temporary Parquet file
-    {
-        let mut tmp_file = fs::File::create(&tmp_path)?;
-        ParquetWriter::new(&mut tmp_file)
-            .with_compression(ParquetCompression::Brotli(Some(BrotliLevel::try_new(5)?)))
-            .finish(df)?;
-    }
-
-    // Atomic rename to final file
-    fs::rename(&tmp_path, &final_path)?;
-
-    debug!("Wrote Parquet file: {}", final_path.display());
-    Ok(())
-}
-
-/// 8) Main CSV→Parquet routine with date-based Hive partitioning:
-///
-///    - Automatically detect date columns matching "%Y/%m/%d %H:%M:%S" (in sample).
-///    - Sample first N rows to infer a provisional schema and identify date columns.
-///    - Promote any integerish/Float32 → Float64 in that schema.
-///    - Re-read full CSV with .with_dtype_overwrite(...) so no Int64 remains.
-///    - For each detected date column, strptime(...) into
-///      Datetime(TimeUnit::Milliseconds, Some("+10:00")).
-///    - Build table name from column headers 1,2,3 (0-indexed).
-///    - Extract date from filename for partitioning.
-///    - Apply type cleaning if needed.
-///    - Write to Hive-partitioned structure: table_name/date=YYYY-MM-DD/data.parquet
-pub fn csv_to_parquet(file_name: &str, data: &str, out_dir: &Path) -> Result<(), Box<dyn Error>> {
-    debug!("Starting CSV to Parquet conversion with Hive partitioning");
-
-    // ─── Step A: SAMPLE‐READ (first 1,000 rows) ───────────────────────────────────
-    let sample_size = 1000;
-    let mut sample_cursor = Cursor::new(data.as_bytes());
-
-    let sample_opts = CsvReadOptions::default()
-        .with_has_header(true)
-        .with_n_rows(Some(sample_size))
-        .with_infer_schema_length(Some(sample_size))
-        .with_ignore_errors(true);
-    let sample_df: DataFrame = CsvReader::new(&mut sample_cursor)
-        .with_options(sample_opts)
-        .finish()?;
-
-    // ─── Step B: BUILD A FORCED‐DTYPE VECTOR AND IDENTIFY DATE COLUMNS ─────────────
-    let mut forced_dtypes: Vec<DataType> = Vec::with_capacity(sample_df.width());
-    let mut date_cols: Vec<PlSmallStr> = Vec::new();
-
-    for s in sample_df.get_columns() {
-        let name = s.name().clone();
-        let orig_dtype = s.dtype();
-        // If Polars inferred String, check if the first non-null sample parses as date.
-        if orig_dtype == &DataType::String {
-            if let Ok(str_ca) = s.str() {
-                if let Some(val0) = str_ca.get(0) {
-                    let cleaned0 = clean_str(val0);
-                    if NaiveDateTime::parse_from_str(&cleaned0, "%Y/%m/%d %H:%M:%S").is_ok() {
-                        // Detected date format in sample → mark as a date column
-                        date_cols.push(name.clone());
-                        forced_dtypes.push(DataType::String);
-                        continue;
-                    }
-                }
-            }
-            // Otherwise, keep as String
-            forced_dtypes.push(DataType::String);
-        } else {
-            // Not a string column. Promote ints/Float32 → Float64; leave others unchanged.
-            let forced = promote_sample_dtype(orig_dtype);
-            forced_dtypes.push(forced);
-        }
-    }
-
-    // Log forced dtypes paired with column names
-    let dtypes_ref: Arc<Vec<DataType>> = Arc::new(forced_dtypes);
-
-    // ─── Step C: FULL‐READ with FORCED‐DTYPE VECTOR ──────────────────────────────────
-    let mut full_cursor = Cursor::new(data.as_bytes());
-    let full_opts = CsvReadOptions::default()
-        .with_has_header(true)
-        .with_dtype_overwrite(Some(dtypes_ref.clone()));
-    let mut df: DataFrame = CsvReader::new(&mut full_cursor)
-        .with_options(full_opts)
-        .finish()?; // now ints → Float64; date columns are still String
-
-    // Log the schema after full read
-    debug!("Step C schema: {:#?}", df.schema());
-
-    // ─── Step C2: FOR EACH DETECTED DATE COLUMN, PARSE AS DATETIME(GMT+10) ─────────
-    for col_name in &date_cols {
-        if !df.get_column_names().contains(&col_name) {
-            continue; // Skip if the column was not found in the DataFrame
-        }
-        let col = df.column(col_name)?;
-        let utf8_col: &StringChunked = col.str()?;
-
-        let fmt: Option<&str> = Some("%Y/%m/%d %H:%M:%S");
-        let tu = TimeUnit::Milliseconds;
-        let use_cache = true;
-        // we are assuming the date is in GMT+10
-        let tz_aware = false;
-        let tz: TimeZone = unsafe { TimeZone::from_static("+10:00") };
-        let amb = StringChunked::full("ambiguous".into(), "", utf8_col.len());
-
-        let parsed_naive = utf8_col.as_datetime(fmt, tu, use_cache, tz_aware, None, &amb)?;
-        let mut parsed_with_tz: DatetimeChunked = parsed_naive;
-        parsed_with_tz.set_time_zone(tz)?;
-
-        df.replace(col_name, parsed_with_tz.into_series())?;
-        debug!(
-            "  Parsed date column {} into Datetime(TimeUnit::Milliseconds, \"+10:00\")",
-            col_name
-        );
-    }
-
-    // ─── Step D: BUILD TABLE NAME FROM COLUMN HEADERS 1,2,3 ─────────────────────────────
-    let all_trimmed_names: Vec<String> = df
-        .get_column_names()
-        .iter()
-        .map(|hdr| clean_str(hdr.as_str()))
-        .collect();
-
-    let table_name = if all_trimmed_names.len() >= 4 {
-        format!(
-            "{}---{}---{}",
-            all_trimmed_names[1], all_trimmed_names[2], all_trimmed_names[3]
-        )
-    } else {
-        // Fallback if less than 4 columns
-        "default_table".to_string()
-    };
-
-    debug!("Table name: {}", table_name);
-
-    // ─── Step E: CHECK AND APPLY TYPE CHANGES ────────────────────────────────────────
-    let type_changed = detect_type_changes(&df)?;
-    if type_changed {
-        for col_name in df.get_column_names_owned() {
-            if date_cols.contains(&col_name) {
-                continue;
-            }
-
-            let col = df.column(&col_name)?;
-            let str_ca = match col.str() {
-                Ok(ca) => ca,
-                Err(_) => continue,
-            };
-
-            let orig_val = match str_ca.get(0) {
-                Some(val) => val,
-                None => continue,
-            };
-
-            let cleaned_first = clean_str(orig_val);
-            let new_dtype = infer_dtype_from_str(&cleaned_first);
-            if new_dtype == *col.dtype() {
-                continue;
-            }
-
-            debug!(
-                "Column {}: first-row cleaned dtype {:?} → casting entire column to {:?}",
-                col_name,
-                col.dtype(),
-                new_dtype
-            );
-
-            let s: Series = col.as_series().unwrap().clone();
-            let cleaned_utf8: StringChunked =
-                s.str()?.apply(|opt| opt.map(|v| Cow::Owned(clean_str(v))));
-
-            let casted_series = if new_dtype == DataType::Float64 {
-                cleaned_utf8.into_series().cast(&DataType::Float64)?
-            } else {
-                cleaned_utf8.into_series()
-            };
-
-            df.replace(&col_name, casted_series)?;
-        }
-    }
-
-    // ─── Step F: WRITE DATE-PARTITIONED PARQUET FILES ───────────────────────────────
-    write_partitioned_parquet(&mut df, file_name, out_dir, &table_name)?;
-
+    debug!("Completed Arrow-based conversion: {}", final_path.display());
     Ok(())
 }
