@@ -13,6 +13,7 @@ reqwest = { version = "0.11", default-features = false, features = [
     "rustls-tls",
     "cookies",
     "blocking",
+    "stream",
 ] }
 
 reqwest-middleware = "0.4.2" # <- no extra features here

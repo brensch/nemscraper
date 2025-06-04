@@ -1,6 +1,7 @@
 use anyhow::Context;
 use anyhow::Result;
-use futures::future::try_join_all;
+use futures::stream::{self, StreamExt};
+use futures::TryStreamExt;
 use reqwest::Client;
 use scraper::{Html, Selector};
 use std::collections::BTreeMap;
@@ -149,23 +150,26 @@ async fn fetch_feed_links(
     }
 }
 
-/// Run all feed‐fetch tasks in parallel, then collect into a BTreeMap.
+/// Run all feed‐fetch tasks with max 3 concurrent requests, then collect into a BTreeMap.
 async fn fetch_zip_urls(client: &Client, feeds: &[&str]) -> Result<BTreeMap<String, Vec<String>>> {
     // Pre‐parse the selector once
     let selector =
         Selector::parse(r#"a[href$=".zip"]"#).expect("invalid CSS selector for .zip links");
 
-    // Build one future per feed URL
-    let fetch_futures = feeds.iter().map(|&feed_url| {
-        let client = client.clone();
-        let selector = selector.clone();
-        let feed_url_string = feed_url.to_owned();
-        // Call our helper
-        fetch_feed_links(client, feed_url_string, selector)
-    });
+    // Convert to owned strings first to avoid lifetime issues
+    let owned_feeds: Vec<String> = feeds.iter().map(|s| s.to_string()).collect();
 
-    // Wait for all of them to finish (error if any one fails)
-    let results: Vec<(String, Vec<String>)> = try_join_all(fetch_futures).await?;
+    // Create a stream of futures, but limit to 3 concurrent executions
+    let results: Vec<(String, Vec<String>)> =
+        stream::iter(owned_feeds.into_iter().map(|feed_url| {
+            let client = client.clone();
+            let selector = selector.clone();
+            // Call our helper
+            fetch_feed_links(client, feed_url, selector)
+        }))
+        .buffer_unordered(3) // Limit to 3 concurrent requests
+        .try_collect()
+        .await?;
 
     // Flatten into a BTreeMap
     let mut map = BTreeMap::new();

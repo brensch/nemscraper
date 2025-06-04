@@ -15,54 +15,6 @@ use tracing_subscriber::{fmt, EnvFilter};
 
 mod history;
 
-// Add this function to monitor memory usage
-async fn memory_monitor() {
-    let mut interval = interval(Duration::from_secs(30));
-    loop {
-        interval.tick().await;
-
-        // Read memory info from /proc/meminfo
-        if let Ok(meminfo) = tokio::fs::read_to_string("/proc/meminfo").await {
-            let mut total_kb = 0;
-            let mut available_kb = 0;
-
-            for line in meminfo.lines() {
-                if line.starts_with("MemTotal:") {
-                    if let Some(value) = line.split_whitespace().nth(1) {
-                        total_kb = value.parse::<u64>().unwrap_or(0);
-                    }
-                } else if line.starts_with("MemAvailable:") {
-                    if let Some(value) = line.split_whitespace().nth(1) {
-                        available_kb = value.parse::<u64>().unwrap_or(0);
-                    }
-                }
-            }
-
-            let used_percent = if total_kb > 0 {
-                ((total_kb - available_kb) as f64 / total_kb as f64) * 100.0
-            } else {
-                0.0
-            };
-
-            if used_percent > 80.0 {
-                warn!(
-                    "High memory usage: {:.1}% ({} MB available / {} MB total)",
-                    used_percent,
-                    available_kb / 1024,
-                    total_kb / 1024
-                );
-            } else {
-                info!(
-                    "Memory usage: {:.1}% ({} MB available / {} MB total)",
-                    used_percent,
-                    available_kb / 1024,
-                    total_kb / 1024
-                );
-            }
-        }
-    }
-}
-
 // Add graceful shutdown handler
 async fn shutdown_signal() {
     let ctrl_c = async {
@@ -104,9 +56,6 @@ async fn main() -> Result<()> {
 
     info!("Starting application with PID: {}", std::process::id());
 
-    // Add memory monitoring
-    tokio::spawn(memory_monitor());
-
     // ─── 2) configure dirs ───────────────────────────────────────────
     let client = Client::new();
     let assets = PathBuf::from("assets");
@@ -129,8 +78,7 @@ async fn main() -> Result<()> {
 
     // ─── 5) spawn download workers ───────────────────────────────────
     // Reduce concurrent downloads to manage memory
-    for worker_id in 0..1 {
-        // Reduced from 2 to 1
+    for worker_id in 0..2 {
         let client = client.clone();
         let zips_dir = zips_dir.clone();
         let tx = processor_tx.clone();
@@ -171,26 +119,7 @@ async fn main() -> Result<()> {
 
                 info!(name = %name, worker_id = worker_id, "downloading {}", url);
 
-                // retry up to 3 times
-                let path_result = async {
-                    let mut attempt = 0;
-                    loop {
-                        attempt += 1;
-                        match fetch::zips::download_zip(&client, &url, &zips_dir).await {
-                            Ok(path) => return Ok(path),
-                            Err(e) if attempt < 3 => {
-                                error!(
-                                    "attempt {}/3 for {} failed: {}, retrying…",
-                                    attempt, url, e
-                                );
-                                sleep(Duration::from_secs((1 << attempt) as u64)).await;
-                            }
-                            Err(e) => return Err(e),
-                        }
-                    }
-                }
-                .await;
-
+                let path_result = fetch::zips::download_zip(&client, &url, &zips_dir).await;
                 match path_result {
                     Ok(path) => {
                         if let Err(e) = history.add(&name, State::Downloaded, 1) {
@@ -221,57 +150,54 @@ async fn main() -> Result<()> {
         processor_tx.send(Ok(path.clone()))?;
     }
 
-    // ─── 6) scheduler: periodic fetch → queue → process ─────────────
-    {
-        let url_tx = url_tx.clone();
-        let history = history.clone();
-        let client = client.clone();
+    // // ─── 6) scheduler: periodic fetch → queue → process ─────────────
+    // {
+    //     let url_tx = url_tx.clone();
+    //     let history = history.clone();
+    //     let client = client.clone();
 
-        task::spawn(async move {
-            let mut ticker = interval(Duration::from_secs(60));
-            loop {
-                if let Err(e) = async {
-                    info!("vacuuming history");
-                    history.vacuum().unwrap();
+    //     task::spawn(async move {
+    //         let mut ticker = interval(Duration::from_secs(60));
+    //         loop {
+    //             if let Err(e) = async {
+    //                 info!("vacuuming history");
+    //                 history.vacuum().unwrap();
 
-                    info!("fetching feeds");
-                    let feeds = fetch::urls::fetch_current_zip_urls(&client).await?;
-                    let all_urls_iter = feeds.values().flat_map(|urls| urls.iter().cloned());
+    //                 info!("fetching feeds");
+    //                 let feeds = fetch::urls::fetch_current_zip_urls(&client).await?;
+    //                 let all_urls_iter = feeds.values().flat_map(|urls| urls.iter().cloned());
 
-                    for url in all_urls_iter {
-                        let name = PathBuf::from(&url)
-                            .file_name()
-                            .unwrap()
-                            .to_string_lossy()
-                            .to_string();
-                        if history.get(&name, &State::Downloaded) {
-                            debug!(url = %url, "already seen, skipping");
-                            continue;
-                        }
-                        url_tx
-                            .send(url.clone())
-                            .map_err(|e| anyhow::anyhow!(e.to_string()))?;
-                    }
-                    Ok::<(), anyhow::Error>(())
-                }
-                .await
-                {
-                    error!("scheduler loop failed: {}", e);
-                }
-                ticker.tick().await;
-            }
-        });
-    }
+    //                 for url in all_urls_iter {
+    //                     let name = PathBuf::from(&url)
+    //                         .file_name()
+    //                         .unwrap()
+    //                         .to_string_lossy()
+    //                         .to_string();
+    //                     if history.get(&name, &State::Downloaded) {
+    //                         debug!(url = %url, "already seen, skipping");
+    //                         continue;
+    //                     }
+    //                     url_tx
+    //                         .send(url.clone())
+    //                         .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+    //                 }
+    //                 Ok::<(), anyhow::Error>(())
+    //             }
+    //             .await
+    //             {
+    //                 error!("scheduler loop failed: {}", e);
+    //             }
+    //             ticker.tick().await;
+    //         }
+    //     });
+    // }
 
-    // ─── 7) spawn "processor" workers (reduce based on memory) ──────────────
+    // ─── 7) spawn "processor" workers ──────────────
     let processor_rx = Arc::new(Mutex::new(processor_rx));
     // Reduce workers to prevent memory issues
-    let num_cores = std::cmp::min(
-        std::thread::available_parallelism()
-            .map(|n| n.get())
-            .unwrap_or(1),
-        2, // Cap at 2 workers max
-    );
+    let num_cores = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1);
 
     info!("spawning {} processor workers", num_cores);
     for worker_id in 0..num_cores {
