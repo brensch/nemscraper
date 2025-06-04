@@ -369,7 +369,7 @@ pub fn csv_to_parquet(file_name: &str, data: &str, out_dir: &Path) -> Result<(),
         Schema::new(fields)
     };
 
-    let mut reader = ReaderBuilder::new(Arc::new(string_schema_for_reading))
+    let reader = ReaderBuilder::new(Arc::new(string_schema_for_reading))
         .with_header(true)
         .with_batch_size(8192)
         .build(&mut cursor)?;

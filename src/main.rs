@@ -8,9 +8,9 @@ use tokio::{
     signal,
     sync::{mpsc, Mutex},
     task,
-    time::{interval, sleep},
+    time::interval,
 };
-use tracing::{debug, error, info, warn};
+use tracing::{debug, error, info};
 use tracing_subscriber::{fmt, EnvFilter};
 
 mod history;

@@ -1,5 +1,4 @@
 use parquet::file::reader::{FileReader, SerializedFileReader};
-use parquet::schema::types::ColumnDescriptor;
 use regex::Regex;
 use serde::Serialize;
 use serde_yaml;
