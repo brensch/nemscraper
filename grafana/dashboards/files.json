@@ -18,6 +18,7 @@
     "editable": true,
     "fiscalYearStartMonth": 0,
     "graphTooltip": 0,
+    "id": 2,
     "links": [],
     "panels": [
         {
@@ -105,7 +106,7 @@
                     "editorMode": "code",
                     "format": 0,
                     "rawQuery": true,
-                    "rawSql": "SELECT\r\n  time_bucket($__interval, event_time) AS time,\r\n  state                    AS metric,\r\n  count(*)               AS total_count\r\nFROM read_parquet('/data/history/*.parquet', union_by_name = TRUE)\r\nWHERE $__timeFilter(event_time)\r\nGROUP BY 1, 2\r\nORDER BY 1, 2\r\n",
+                    "rawSql": "SELECT\r\n  time_bucket('10s', event_time) AS time,\r\n  state                    AS metric,\r\n  count(*)               AS total_count\r\nFROM read_parquet('/data/history/*.parquet', union_by_name = TRUE)\r\nWHERE $__timeFilter(event_time)\r\nGROUP BY 1, 2\r\nORDER BY 1, 2\r\n",
                     "refId": "A",
                     "sql": {
                         "columns": [
@@ -214,7 +215,7 @@
                     "editorMode": "code",
                     "format": 1,
                     "rawQuery": true,
-                    "rawSql": "SELECT\r\n  time_bucket($__interval, event_time) AS time,\r\n  CAST(SUM(count) AS BIGINT) AS total_count\r\nFROM read_parquet('/data/history/*Proc*.parquet', union_by_name = TRUE)\r\nWHERE $__timeFilter(event_time)\r\nGROUP BY 1\r\nORDER BY 1;\r\n",
+                    "rawSql": "SELECT\r\n  time_bucket('10s', event_time) AS time,\r\n  CAST(SUM(count) AS BIGINT) AS total_count\r\nFROM read_parquet('/data/history/*Proc*.parquet', union_by_name = TRUE)\r\nWHERE $__timeFilter(event_time)\r\nGROUP BY 1\r\nORDER BY 1;\r\n",
                     "refId": "A",
                     "sql": {
                         "columns": [
@@ -253,5 +254,6 @@
     "timepicker": {},
     "timezone": "browser",
     "title": "New dashboard",
-    "version": 0
+    "uid": "a78f110c-caac-4f47-96d3-5772ce7d2120",
+    "version": 1
 }
