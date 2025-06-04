@@ -150,47 +150,47 @@ async fn main() -> Result<()> {
         processor_tx.send(Ok(path.clone()))?;
     }
 
-    // // ─── 6) scheduler: periodic fetch → queue → process ─────────────
-    // {
-    //     let url_tx = url_tx.clone();
-    //     let history = history.clone();
-    //     let client = client.clone();
+    // ─── 6) scheduler: periodic fetch → queue → process ─────────────
+    {
+        let url_tx = url_tx.clone();
+        let history = history.clone();
+        let client = client.clone();
 
-    //     task::spawn(async move {
-    //         let mut ticker = interval(Duration::from_secs(60));
-    //         loop {
-    //             if let Err(e) = async {
-    //                 info!("vacuuming history");
-    //                 history.vacuum().unwrap();
+        task::spawn(async move {
+            let mut ticker = interval(Duration::from_secs(60));
+            loop {
+                if let Err(e) = async {
+                    info!("vacuuming history");
+                    history.vacuum().unwrap();
 
-    //                 info!("fetching feeds");
-    //                 let feeds = fetch::urls::fetch_current_zip_urls(&client).await?;
-    //                 let all_urls_iter = feeds.values().flat_map(|urls| urls.iter().cloned());
+                    info!("fetching feeds");
+                    let feeds = fetch::urls::fetch_current_zip_urls(&client).await?;
+                    let all_urls_iter = feeds.values().flat_map(|urls| urls.iter().cloned());
 
-    //                 for url in all_urls_iter {
-    //                     let name = PathBuf::from(&url)
-    //                         .file_name()
-    //                         .unwrap()
-    //                         .to_string_lossy()
-    //                         .to_string();
-    //                     if history.get(&name, &State::Downloaded) {
-    //                         debug!(url = %url, "already seen, skipping");
-    //                         continue;
-    //                     }
-    //                     url_tx
-    //                         .send(url.clone())
-    //                         .map_err(|e| anyhow::anyhow!(e.to_string()))?;
-    //                 }
-    //                 Ok::<(), anyhow::Error>(())
-    //             }
-    //             .await
-    //             {
-    //                 error!("scheduler loop failed: {}", e);
-    //             }
-    //             ticker.tick().await;
-    //         }
-    //     });
-    // }
+                    for url in all_urls_iter {
+                        let name = PathBuf::from(&url)
+                            .file_name()
+                            .unwrap()
+                            .to_string_lossy()
+                            .to_string();
+                        if history.get(&name, &State::Downloaded) {
+                            debug!(url = %url, "already seen, skipping");
+                            continue;
+                        }
+                        url_tx
+                            .send(url.clone())
+                            .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+                    }
+                    Ok::<(), anyhow::Error>(())
+                }
+                .await
+                {
+                    error!("scheduler loop failed: {}", e);
+                }
+                ticker.tick().await;
+            }
+        });
+    }
 
     // ─── 7) spawn "processor" workers ──────────────
     let processor_rx = Arc::new(Mutex::new(processor_rx));

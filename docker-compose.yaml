@@ -1,4 +1,3 @@
-version: "3.8"
 
 services:
   grafana:
@@ -8,7 +7,7 @@ services:
       - "3000:3000"
     user: "1000:1000"               
     volumes:
-      - assets:/data                    # mount the shared assets here
+      - assets:/data                   
       - ./grafana/plugins/motherduck-duckdb-datasource:/var/lib/grafana/plugins/motherduck-duckdb-datasource
       - ./grafana/dashboards:/etc/grafana/provisioned_dashboards
       - ./grafana/provisioning/dashboards:/etc/grafana/provisioning/dashboards
@@ -23,7 +22,7 @@ services:
     working_dir: /usr/src/app
     user: "1000:1000"               
     volumes:
-      - assets:/usr/src/app/assets      # same “assets” volume, mounted at a different path
+      - assets:/usr/src/app/assets      
     command: ["./target/release/nemscraper"]
 
 volumes:

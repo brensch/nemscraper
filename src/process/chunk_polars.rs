@@ -1,16 +1,15 @@
 use arrow::array::*;
-use arrow::compute;
-use arrow::csv::{Reader, ReaderBuilder};
+use arrow::csv::ReaderBuilder;
 use arrow::datatypes::*;
 use arrow::record_batch::RecordBatch;
-use chrono::{NaiveDateTime, TimeZone, Utc};
+use chrono::{NaiveDateTime, TimeZone};
 use parquet::arrow::ArrowWriter;
 use parquet::basic::BrotliLevel;
-use parquet::basic::{Compression, ZstdLevel};
+use parquet::basic::Compression;
 use parquet::file::properties::WriterProperties;
 use std::error::Error;
 use std::fs::File;
-use std::io::Cursor;
+use std::io::{BufRead, BufReader, Cursor};
 use std::path::Path;
 use std::sync::Arc;
 use tracing::{debug, info, warn};
@@ -34,24 +33,7 @@ fn infer_arrow_dtype_from_str(s: &str) -> DataType {
     }
 }
 
-/// 3) Promote integer types to Float64 in Arrow schema.
-fn promote_to_float64(dt: &DataType) -> DataType {
-    match dt {
-        DataType::Int8
-        | DataType::Int16
-        | DataType::Int32
-        | DataType::Int64
-        | DataType::UInt8
-        | DataType::UInt16
-        | DataType::UInt32
-        | DataType::UInt64
-        | DataType::Float32 => DataType::Float64,
-        DataType::Float64 => DataType::Float64,
-        other => other.clone(),
-    }
-}
-
-/// Schema inference and trimming detection from first batch
+/// Schema inference and trimming detection
 struct SchemaInfo {
     schema: Schema,
     date_columns: Vec<String>,
@@ -59,49 +41,51 @@ struct SchemaInfo {
     table_name: String,
 }
 
-/// 4) Sample the first batch to infer schema, detect date columns and trimming needs.
-fn sample_and_infer_schema(data: &str) -> Result<SchemaInfo, Box<dyn Error>> {
-    let mut cursor = Cursor::new(data.as_bytes());
+/// 4) Parse CSV header and create initial string schema
+fn parse_header_and_create_string_schema(
+    data: &str,
+) -> Result<(Vec<String>, Schema), Box<dyn Error>> {
+    let cursor = Cursor::new(data.as_bytes());
+    let mut reader = BufReader::new(cursor);
+    let mut header_line = String::new();
+    reader.read_line(&mut header_line)?;
 
-    // Read first 1000 rows only for sampling
-    let reader = ReaderBuilder::new(Arc::new(Schema::empty()))
-        .with_header(true)
-        .with_batch_size(1000) // Only read first 1000 rows
-        .build(&mut cursor)?;
+    // Parse CSV header (simple comma splitting for now)
+    let headers: Vec<String> = header_line
+        .trim()
+        .split(',')
+        .map(|s| clean_str(s))
+        .collect();
 
-    let first_batch = reader
-        .into_iter()
-        .next()
-        .transpose()?
-        .ok_or("No data found in CSV")?;
+    // Create schema with all string fields
+    let fields: Vec<Field> = headers
+        .iter()
+        .map(|name| Field::new(name, DataType::Utf8, true))
+        .collect();
 
+    Ok((headers, Schema::new(fields)))
+}
+
+/// 5) Analyze first batch to detect schema, dates, and trimming needs
+fn analyze_batch_for_schema(
+    batch: &RecordBatch,
+    headers: &[String],
+) -> Result<SchemaInfo, Box<dyn Error>> {
     let mut final_fields = Vec::new();
     let mut date_columns = Vec::new();
     let mut trim_columns = Vec::new();
 
-    // Extract header names for table naming (columns 1,2,3)
-    let header_names: Vec<String> = first_batch
-        .schema()
-        .fields()
-        .iter()
-        .map(|f| clean_str(f.name()))
-        .collect();
-
-    let table_name = if header_names.len() >= 4 {
-        format!(
-            "{}---{}---{}",
-            header_names[1], header_names[2], header_names[3]
-        )
+    // Build table name from headers 1,2,3
+    let table_name = if headers.len() >= 4 {
+        format!("{}---{}---{}", headers[1], headers[2], headers[3])
     } else {
         "default_table".to_string()
     };
 
     // Analyze each column
-    for (col_idx, field) in first_batch.schema().fields().iter().enumerate() {
-        let col_name = field.name();
-        let array = first_batch.column(col_idx);
+    for (col_idx, header) in headers.iter().enumerate() {
+        let array = batch.column(col_idx);
 
-        // Check if this is a string column that needs analysis
         if let Some(string_array) = array.as_any().downcast_ref::<StringArray>() {
             let mut needs_trimming = false;
             let mut is_date_column = false;
@@ -119,7 +103,6 @@ fn sample_and_infer_schema(data: &str) -> Result<SchemaInfo, Box<dyn Error>> {
                 // Check if it's a date column
                 if NaiveDateTime::parse_from_str(&cleaned, "%Y/%m/%d %H:%M:%S").is_ok() {
                     is_date_column = true;
-                    // Date columns stay as Utf8 initially, we'll convert later
                 } else {
                     // Try to infer numeric type
                     inferred_type = infer_arrow_dtype_from_str(&cleaned);
@@ -127,20 +110,23 @@ fn sample_and_infer_schema(data: &str) -> Result<SchemaInfo, Box<dyn Error>> {
             }
 
             if needs_trimming {
-                trim_columns.push(col_name.clone());
+                trim_columns.push(header.clone());
             }
 
             if is_date_column {
-                date_columns.push(col_name.clone());
-                // Keep as Utf8 for now, will convert to timestamp later
-                final_fields.push(Field::new(col_name, DataType::Utf8, true));
+                date_columns.push(header.clone());
+                // Date columns get timestamp type in final schema
+                final_fields.push(Field::new(
+                    header,
+                    DataType::Timestamp(TimeUnit::Millisecond, Some("+10:00".into())),
+                    true,
+                ));
             } else {
-                final_fields.push(Field::new(col_name, inferred_type, true));
+                final_fields.push(Field::new(header, inferred_type, true));
             }
         } else {
-            // Non-string column, promote integers to Float64
-            let promoted_type = promote_to_float64(field.data_type());
-            final_fields.push(Field::new(col_name, promoted_type, field.is_nullable()));
+            // Shouldn't happen since we read everything as strings initially
+            final_fields.push(Field::new(header, DataType::Utf8, true));
         }
     }
 
@@ -155,7 +141,7 @@ fn sample_and_infer_schema(data: &str) -> Result<SchemaInfo, Box<dyn Error>> {
     })
 }
 
-/// 5) Apply string trimming to specified columns in a RecordBatch.
+/// 6) Apply string trimming to specified columns in a RecordBatch.
 fn apply_trimming(
     batch: &RecordBatch,
     trim_columns: &[String],
@@ -188,26 +174,23 @@ fn apply_trimming(
     Ok(RecordBatch::try_new(batch.schema(), new_columns)?)
 }
 
-/// 6) Convert date columns from Utf8 to Timestamp with timezone.
-fn convert_date_columns(
+/// 7) Convert columns to their final types (dates, numbers, etc.)
+fn convert_to_final_types(
     batch: &RecordBatch,
-    date_columns: &[String],
+    schema_info: &SchemaInfo,
 ) -> Result<RecordBatch, Box<dyn Error>> {
-    if date_columns.is_empty() {
-        return Ok(batch.clone());
-    }
-
     let mut new_fields = Vec::new();
     let mut new_columns = Vec::new();
 
     for (col_idx, field) in batch.schema().fields().iter().enumerate() {
         let array = batch.column(col_idx);
+        let target_field = &schema_info.schema.fields()[col_idx];
 
-        if date_columns.contains(field.name()) {
-            // Convert this date column
+        if schema_info.date_columns.contains(field.name()) {
+            // Convert date column
             if let Some(string_array) = array.as_any().downcast_ref::<StringArray>() {
-                // Parse dates and convert to timestamps (milliseconds since epoch)
-                let timestamps: TimestampMillisecondArray = string_array
+                // Parse naive datetimes first
+                let naive_timestamps: Vec<Option<i64>> = string_array
                     .iter()
                     .map(|opt_str| {
                         opt_str.and_then(|s| {
@@ -215,8 +198,9 @@ fn convert_date_columns(
                             NaiveDateTime::parse_from_str(&cleaned, "%Y/%m/%d %H:%M:%S")
                                 .ok()
                                 .map(|dt| {
-                                    // Convert to GMT+10 timezone
-                                    let offset = chrono::FixedOffset::east_opt(10 * 3600).unwrap(); // +10:00
+                                    // Treat the naive datetime as being in +10:00 timezone
+                                    // and convert to UTC timestamp
+                                    let offset = chrono::FixedOffset::east_opt(10 * 3600).unwrap();
                                     offset
                                         .from_local_datetime(&dt)
                                         .single()
@@ -227,18 +211,38 @@ fn convert_date_columns(
                     })
                     .collect();
 
-                new_fields.push(Field::new(
-                    field.name(),
-                    DataType::Timestamp(TimeUnit::Millisecond, Some("+10:00".into())),
-                    field.is_nullable(),
-                ));
+                // Create timezone-aware timestamp array
+                let timestamps =
+                    TimestampMillisecondArray::from(naive_timestamps).with_timezone("+10:00");
+
+                new_fields.push((**target_field).clone()); // Use target field with correct timestamp type
                 new_columns.push(Arc::new(timestamps) as ArrayRef);
             } else {
-                new_fields.push((**field).clone());
+                new_fields.push((**target_field).clone());
+                new_columns.push(array.clone());
+            }
+        } else if target_field.data_type() == &DataType::Float64 {
+            // Convert numeric column
+            if let Some(string_array) = array.as_any().downcast_ref::<StringArray>() {
+                let floats: Float64Array = string_array
+                    .iter()
+                    .map(|opt_str| {
+                        opt_str.and_then(|s| {
+                            let cleaned = clean_str(s);
+                            cleaned.parse::<f64>().ok()
+                        })
+                    })
+                    .collect();
+
+                new_fields.push((**target_field).clone()); // Use target field with Float64 type
+                new_columns.push(Arc::new(floats) as ArrayRef);
+            } else {
+                new_fields.push((**target_field).clone());
                 new_columns.push(array.clone());
             }
         } else {
-            new_fields.push((**field).clone());
+            // Keep as string
+            new_fields.push((**target_field).clone());
             new_columns.push(array.clone());
         }
     }
@@ -247,7 +251,7 @@ fn convert_date_columns(
     Ok(RecordBatch::try_new(new_schema, new_columns)?)
 }
 
-/// 7) Extract date from filename for partitioning.
+/// 8) Extract date from filename for partitioning.
 fn extract_date_from_filename(filename: &str) -> Option<String> {
     // Look for YYYYMMDD pattern (8 consecutive digits)
     let chars: Vec<char> = filename.chars().collect();
@@ -306,17 +310,28 @@ fn extract_date_from_filename(filename: &str) -> Option<String> {
     None
 }
 
-/// 8) Main CSV→Parquet conversion using Arrow (memory efficient, single pass).
+/// 9) Main CSV→Parquet conversion using Arrow (memory efficient, single pass).
 pub fn csv_to_parquet(file_name: &str, data: &str, out_dir: &Path) -> Result<(), Box<dyn Error>> {
     debug!("Starting Arrow-based CSV to Parquet conversion");
 
-    // Step A: Sample and infer schema (reads only first 1000 rows)
-    let schema_info = sample_and_infer_schema(data)?;
+    // Step A: Parse header and create initial string schema
+    let (headers, string_schema) = parse_header_and_create_string_schema(data)?;
+    debug!("Headers: {:?}", headers);
 
-    debug!("Inferred schema: {:?}", schema_info.schema);
+    // Step B: Read first batch with string schema to analyze
+    let mut cursor = Cursor::new(data.as_bytes());
+    let mut reader = ReaderBuilder::new(Arc::new(string_schema))
+        .with_header(true)
+        .with_batch_size(1000)
+        .build(&mut cursor)?;
+
+    let first_batch = reader.next().ok_or("No data found in CSV")??;
+    let schema_info = analyze_batch_for_schema(&first_batch, &headers)?;
+
+    debug!("Final schema: {:?}", schema_info.schema);
     debug!("Table name: {}", schema_info.table_name);
 
-    // Step B: Setup output directory structure
+    // Step C: Setup output directory
     let partition_date = extract_date_from_filename(file_name).unwrap_or_else(|| {
         warn!(
             "No date found in filename '{}', using default partition",
@@ -330,7 +345,7 @@ pub fn csv_to_parquet(file_name: &str, data: &str, out_dir: &Path) -> Result<(),
     let partition_dir = table_dir.join(format!("date={}", partition_date));
     std::fs::create_dir_all(&partition_dir)?;
 
-    // Step C: Setup Parquet writer
+    // Step D: Setup Parquet writer with final schema
     let final_name = format!("{}.parquet", file_name);
     let tmp_name = format!("{}.tmp", final_name);
     let final_path = partition_dir.join(final_name);
@@ -341,15 +356,23 @@ pub fn csv_to_parquet(file_name: &str, data: &str, out_dir: &Path) -> Result<(),
         .set_compression(Compression::BROTLI(BrotliLevel::try_new(5)?))
         .build();
 
-    // Step D: Single-pass CSV read with transformations
-    let mut cursor = Cursor::new(data.as_bytes());
-    let reader = ReaderBuilder::new(Arc::new(schema_info.schema.clone()))
-        .with_header(true)
-        .with_batch_size(8192) // Process in 8K row batches
-        .build(&mut cursor)?;
-
     let mut writer =
         ArrowWriter::try_new(tmp_file, Arc::new(schema_info.schema.clone()), Some(props))?;
+
+    // Step E: Re-read full CSV and process in batches
+    let mut cursor = Cursor::new(data.as_bytes());
+    let string_schema_for_reading = {
+        let fields: Vec<Field> = headers
+            .iter()
+            .map(|name| Field::new(name, DataType::Utf8, true))
+            .collect();
+        Schema::new(fields)
+    };
+
+    let mut reader = ReaderBuilder::new(Arc::new(string_schema_for_reading))
+        .with_header(true)
+        .with_batch_size(8192)
+        .build(&mut cursor)?;
 
     // Process each batch
     for batch_result in reader {
@@ -358,8 +381,8 @@ pub fn csv_to_parquet(file_name: &str, data: &str, out_dir: &Path) -> Result<(),
         // Apply trimming if needed
         let trimmed_batch = apply_trimming(&batch, &schema_info.trim_columns)?;
 
-        // Convert date columns if needed
-        let final_batch = convert_date_columns(&trimmed_batch, &schema_info.date_columns)?;
+        // Convert to final types
+        let final_batch = convert_to_final_types(&trimmed_batch, &schema_info)?;
 
         // Write batch to Parquet
         writer.write(&final_batch)?;
