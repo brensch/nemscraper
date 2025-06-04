@@ -5,14 +5,92 @@ use nemscraper::{fetch, process};
 use reqwest::Client;
 use std::{ffi::OsStr, fs, path::PathBuf, sync::Arc, time::Duration};
 use tokio::{
+    signal,
     sync::{mpsc, Mutex},
     task,
     time::{interval, sleep},
 };
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, warn};
 use tracing_subscriber::{fmt, EnvFilter};
 
 mod history;
+
+// Add this function to monitor memory usage
+async fn memory_monitor() {
+    let mut interval = interval(Duration::from_secs(30));
+    loop {
+        interval.tick().await;
+
+        // Read memory info from /proc/meminfo
+        if let Ok(meminfo) = tokio::fs::read_to_string("/proc/meminfo").await {
+            let mut total_kb = 0;
+            let mut available_kb = 0;
+
+            for line in meminfo.lines() {
+                if line.starts_with("MemTotal:") {
+                    if let Some(value) = line.split_whitespace().nth(1) {
+                        total_kb = value.parse::<u64>().unwrap_or(0);
+                    }
+                } else if line.starts_with("MemAvailable:") {
+                    if let Some(value) = line.split_whitespace().nth(1) {
+                        available_kb = value.parse::<u64>().unwrap_or(0);
+                    }
+                }
+            }
+
+            let used_percent = if total_kb > 0 {
+                ((total_kb - available_kb) as f64 / total_kb as f64) * 100.0
+            } else {
+                0.0
+            };
+
+            if used_percent > 80.0 {
+                warn!(
+                    "High memory usage: {:.1}% ({} MB available / {} MB total)",
+                    used_percent,
+                    available_kb / 1024,
+                    total_kb / 1024
+                );
+            } else {
+                info!(
+                    "Memory usage: {:.1}% ({} MB available / {} MB total)",
+                    used_percent,
+                    available_kb / 1024,
+                    total_kb / 1024
+                );
+            }
+        }
+    }
+}
+
+// Add graceful shutdown handler
+async fn shutdown_signal() {
+    let ctrl_c = async {
+        signal::ctrl_c()
+            .await
+            .expect("failed to install Ctrl+C handler");
+    };
+
+    #[cfg(unix)]
+    let terminate = async {
+        signal::unix::signal(signal::unix::SignalKind::terminate())
+            .expect("failed to install signal handler")
+            .recv()
+            .await;
+    };
+
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+
+    tokio::select! {
+        _ = ctrl_c => {
+            info!("Received Ctrl+C signal, shutting down gracefully...");
+        },
+        _ = terminate => {
+            info!("Received SIGTERM signal, shutting down gracefully...");
+        },
+    }
+}
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -23,7 +101,11 @@ async fn main() -> Result<()> {
         .with_env_filter(env)
         .with_span_events(fmt::format::FmtSpan::CLOSE)
         .init();
-    info!("startup");
+
+    info!("Starting application with PID: {}", std::process::id());
+
+    // Add memory monitoring
+    tokio::spawn(memory_monitor());
 
     // ─── 2) configure dirs ───────────────────────────────────────────
     let client = Client::new();
@@ -46,7 +128,9 @@ async fn main() -> Result<()> {
     let url_rx = Arc::new(Mutex::new(url_rx));
 
     // ─── 5) spawn download workers ───────────────────────────────────
-    for _ in 0..2 {
+    // Reduce concurrent downloads to manage memory
+    for worker_id in 0..1 {
+        // Reduced from 2 to 1
         let client = client.clone();
         let zips_dir = zips_dir.clone();
         let tx = processor_tx.clone();
@@ -54,6 +138,7 @@ async fn main() -> Result<()> {
         let history = history.clone();
 
         task::spawn(async move {
+            info!("Download worker {} started", worker_id);
             loop {
                 // Lock & recv one URL
                 let maybe_url = {
@@ -62,7 +147,10 @@ async fn main() -> Result<()> {
                 };
                 let url = match maybe_url {
                     Some(u) => u,
-                    None => break, // channel closed
+                    None => {
+                        info!("Download worker {} shutting down", worker_id);
+                        break;
+                    }
                 };
 
                 let name = PathBuf::from(&url)
@@ -81,7 +169,7 @@ async fn main() -> Result<()> {
                     continue;
                 }
 
-                info!(name = %name, "downloading {}", url);
+                info!(name = %name, worker_id = worker_id, "downloading {}", url);
 
                 // retry up to 3 times
                 let path_result = async {
@@ -175,19 +263,24 @@ async fn main() -> Result<()> {
         });
     }
 
-    // ─── 7) spawn “processor” workers (one per CPU core) ──────────────
+    // ─── 7) spawn "processor" workers (reduce based on memory) ──────────────
     let processor_rx = Arc::new(Mutex::new(processor_rx));
-    let num_cores = std::thread::available_parallelism()
-        .map(|n| n.get())
-        .unwrap_or(1);
+    // Reduce workers to prevent memory issues
+    let num_cores = std::cmp::min(
+        std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(1),
+        2, // Cap at 2 workers max
+    );
 
     info!("spawning {} processor workers", num_cores);
-    for _ in 0..num_cores {
+    for worker_id in 0..num_cores {
         let rx = processor_rx.clone();
         let history = history.clone();
         let parquet_dir = parquet_dir.clone();
 
         task::spawn(async move {
+            info!("Processor worker {} started", worker_id);
             loop {
                 // 1) Lock & receive exactly one message
                 let msg_opt = {
@@ -197,7 +290,10 @@ async fn main() -> Result<()> {
 
                 let msg = match msg_opt {
                     Some(m) => m,
-                    None => break, // channel closed → exit worker
+                    None => {
+                        info!("Processor worker {} shutting down", worker_id);
+                        break;
+                    }
                 };
 
                 match msg {
@@ -209,7 +305,7 @@ async fn main() -> Result<()> {
                             debug!(name = %name, "already processed {}, skipping", name);
                             continue;
                         }
-                        debug!(file_name = %name, "processing");
+                        info!(file_name = %name, worker_id = worker_id, "processing");
 
                         // Run the blocking split on a dedicated blocking thread
                         let split_path = zip_path.clone();
@@ -231,7 +327,7 @@ async fn main() -> Result<()> {
                                 {
                                     error!("history.add (Processed) failed for {}: {:#}", name, e);
                                 } else {
-                                    info!(file_name = %name, "processing completed ({} rows)", row_count);
+                                    info!(file_name = %name, worker_id = worker_id, "processing completed ({} rows)", row_count);
                                 }
                             }
                             Err(e) => {
@@ -253,7 +349,8 @@ async fn main() -> Result<()> {
     drop(processor_tx);
     drop(url_tx);
 
-    // ─── 9) keep main alive until shutdown (e.g. Ctrl+C). ─────────────
-    futures::future::pending::<()>().await;
+    // ─── 9) wait for shutdown signal instead of pending forever ─────────────
+    shutdown_signal().await;
+    info!("Application shutting down gracefully");
     Ok(())
 }
