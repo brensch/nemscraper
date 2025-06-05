@@ -14,7 +14,7 @@ use tokio::{
     },
     task,
 };
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, warn};
 use tracing_subscriber::{fmt, EnvFilter};
 
 mod history;
@@ -25,7 +25,10 @@ async fn main() -> Result<()> {
     // 1) init logging
     init_logging();
 
-    info!("Starting application with PID: {}", std::process::id());
+    info!(
+        "=== Starting application (main) with PID={} ===",
+        std::process::id()
+    );
 
     // 2) configure dirs
     let client = Client::new();
@@ -34,10 +37,15 @@ async fn main() -> Result<()> {
     let parquet_dir = assets.join("parquet");
     let history_dir = assets.join("history");
     create_dirs(&[&zips_dir, &parquet_dir, &history_dir])?;
+    info!(
+        "Ensured directories exist: zips='{:#?}', parquet='{:#?}', history='{:#?}'",
+        zips_dir, parquet_dir, history_dir
+    );
 
     // 3) history & lookup store
     let history = Arc::new(History::new(history_dir)?);
     history.clone().spawn_vacuum_loop();
+    info!("Spawned history vacuum loop");
 
     // 4) channels
     //
@@ -49,6 +57,8 @@ async fn main() -> Result<()> {
     let (url_tx, url_rx) = mpsc::unbounded_channel::<String>();
     let url_rx_mu = Arc::new(Mutex::new(url_rx));
 
+    info!("Created channels: url_tx/url_rx and processor_tx/processor_rx");
+
     // 5) spawn download workers
     spawn_download_workers(
         2,
@@ -59,11 +69,18 @@ async fn main() -> Result<()> {
         history.clone(),
     )
     .await;
+    info!("Spawned download workers");
 
     // 6) enqueue existing ZIPs (one‐time)
     enqueue_existing_zips(&zips_dir, processor_tx.clone())?;
+    info!(
+        "Enqueued existing ZIPs from '{:?}' onto processor queue",
+        zips_dir
+    );
 
+    // 7) spawn URL fetcher
     spawn_fetch_zip_urls(client.clone(), url_tx.clone());
+    info!("Spawned URL fetcher task (spawn_fetch_zip_urls)");
 
     // 8) spawn processor workers
     let num_cores = std::thread::available_parallelism()
@@ -76,8 +93,10 @@ async fn main() -> Result<()> {
         parquet_dir.clone(),
     )
     .await;
+    info!("Spawned {} processor workers", num_cores);
 
     // 9) drop the senders so that, once the channels drain, workers will exit
+    info!("Dropping main()'s copies of processor_tx and url_tx");
     drop(processor_tx);
     drop(url_tx);
 
@@ -95,12 +114,14 @@ fn init_logging() {
         .with_env_filter(env)
         .with_span_events(fmt::format::FmtSpan::CLOSE)
         .init();
+    info!("Logging initialized");
 }
 
 /// Create any directories that do not already exist
 fn create_dirs(dirs: &[&PathBuf]) -> Result<()> {
     for d in dirs {
         fs::create_dir_all(d)?;
+        debug!("Ensured directory exists: {:?}", d);
     }
     Ok(())
 }
@@ -126,6 +147,7 @@ async fn spawn_download_workers(
             info!("Download worker {} started", worker_id);
             loop {
                 // 1) grab one URL
+                debug!("Download worker {} waiting for URL...", worker_id);
                 let maybe_url = {
                     let mut guard = url_rx_mu.lock().await;
                     guard.recv().await
@@ -133,7 +155,10 @@ async fn spawn_download_workers(
                 let url = match maybe_url {
                     Some(u) => u,
                     None => {
-                        info!("Download worker {} shutting down", worker_id);
+                        info!(
+                            "Download worker {} shutting down: url channel closed",
+                            worker_id
+                        );
                         break;
                     }
                 };
@@ -141,30 +166,66 @@ async fn spawn_download_workers(
                 // 2) compute filename/key for history
                 let name = PathBuf::from(&url)
                     .file_name()
-                    .unwrap()
+                    .unwrap_or_else(|| OsStr::new("unknown"))
                     .to_string_lossy()
                     .to_string();
 
+                debug!(
+                    "Download worker {} received URL='{}', derived name='{}'",
+                    worker_id, url, name
+                );
+
                 // 3) skip if already downloaded or processed
                 if history.get(&name, &State::Downloaded) {
-                    debug!(%name, "already in history (downloaded), skipping {}", url);
+                    debug!(
+                        "Download worker {}: already in history (downloaded), skipping URL='{}'",
+                        worker_id, url
+                    );
                     continue;
                 }
 
-                info!(%name, worker_id = worker_id, "downloading {}", url);
+                info!("Download worker {} downloading '{}'", worker_id, url);
                 let path_result = fetch::zips::download_zip(&client, &url, &zips_dir).await;
 
                 match path_result {
                     Ok(path) => {
+                        info!(
+                            "Download worker {} successfully downloaded to {:?}",
+                            worker_id, path
+                        );
                         if let Err(e) = history.add(&name, State::Downloaded, 1) {
-                            error!(%name, "history.add (Downloaded) failed: {:#}", e);
+                            error!(
+                                "Download worker {}: history.add(state=Downloaded) failed for '{}': {:#}",
+                                worker_id, name, e
+                            );
+                        } else {
+                            debug!(
+                                "Download worker {}: recorded Downloaded for '{}'",
+                                worker_id, name
+                            );
                         }
                         // send the newly downloaded ZIP path to processor channel
-                        let _ = processor_tx.send(Ok(path));
+                        let sent = processor_tx.send(Ok(path.clone()));
+                        if sent.is_err() {
+                            warn!(
+                                "Download worker {}: failed to send Ok({:?}) to processor; channel may be closed",
+                                worker_id, path
+                            );
+                        }
                     }
                     Err(e) => {
-                        error!("download failed after retries for {}: {}", url, e);
-                        let _ = processor_tx.send(Err((url.clone(), e.to_string())));
+                        error!(
+                            "Download worker {}: download failed after retries for '{}': {}",
+                            worker_id, url, e
+                        );
+                        // send error to processor channel so it can log upstream
+                        let sent = processor_tx.send(Err((url.clone(), e.to_string())));
+                        if sent.is_err() {
+                            warn!(
+                                "Download worker {}: failed to send Err(({},{:?})) to processor; channel may be closed",
+                                worker_id, url, e
+                            );
+                        }
                     }
                 }
             }
@@ -182,8 +243,14 @@ fn enqueue_existing_zips(
         if path.extension() != Some(OsStr::new("zip")) {
             continue;
         }
-        // re‐enqueue any ZIP that hasn’t been Processed
-        processor_tx.send(Ok(path.clone()))?;
+        info!("Enqueue existing ZIP for processing: {:?}", path);
+        let send_res = processor_tx.send(Ok(path.clone()));
+        if let Err(err) = send_res {
+            warn!(
+                "enqueue_existing_zips: failed to send Ok({:?}) to processor: {}",
+                path, err
+            );
+        }
     }
     Ok(())
 }
@@ -199,7 +266,7 @@ async fn spawn_processor_workers(
     history: Arc<History>,
     parquet_dir: PathBuf,
 ) {
-    info!("spawning {} processor workers", num_workers);
+    info!("Spawning {} processor workers", num_workers);
 
     for worker_id in 0..num_workers {
         let rx = Arc::clone(&processor_rx);
@@ -210,6 +277,7 @@ async fn spawn_processor_workers(
             info!("Processor worker {} started", worker_id);
             loop {
                 // 1) lock & receive exactly one message
+                debug!("Processor worker {} waiting for message...", worker_id);
                 let msg_opt = {
                     let mut guard = rx.lock().await;
                     guard.recv().await
@@ -218,58 +286,104 @@ async fn spawn_processor_workers(
                 let msg = match msg_opt {
                     Some(m) => m,
                     None => {
-                        info!("Processor worker {} shutting down", worker_id);
+                        info!(
+                            "Processor worker {} shutting down: processor channel closed and drained",
+                            worker_id
+                        );
                         break;
                     }
                 };
 
                 match msg {
                     Ok(zip_path) => {
-                        let name = zip_path.file_name().unwrap().to_string_lossy().to_string();
+                        let name = zip_path
+                            .file_name()
+                            .unwrap_or_else(|| OsStr::new("unknown"))
+                            .to_string_lossy()
+                            .to_string();
 
                         // skip if already marked as processed in history
                         if history.get(&name, &State::Processed) {
-                            debug!(%name, worker_id = worker_id, "already processed, skipping");
+                            debug!(
+                                "Processor worker {}: '{}' already processed, skipping",
+                                worker_id, name
+                            );
                             continue;
                         }
-                        info!(%name, worker_id = worker_id, "processing");
+
+                        info!("Processor worker {}: processing '{}'", worker_id, name);
 
                         // Run the blocking split on a blocking thread
                         let split_path = zip_path.clone();
                         let out_dir = parquet_dir.clone();
                         let history_clone = Arc::clone(&history);
 
-                        let split_res: Result<i64> = task::spawn_blocking(move || {
+                        // Spawn blocking work, but catch panics explicitly
+                        let join_handle = task::spawn_blocking(move || {
                             process::split::split_zip_to_parquet(&split_path, &out_dir)
-                        })
-                        .await
-                        .unwrap(); // unwrap the JoinHandle
+                        });
+
+                        debug!(
+                            "Processor worker {}: spawn_blocking for '{}'",
+                            worker_id, name
+                        );
+
+                        let split_res: Result<i64> = match join_handle.await {
+                            Ok(inner_res) => {
+                                debug!(
+                                    "Processor worker {}: split_block returned for '{}'",
+                                    worker_id, name
+                                );
+                                inner_res
+                            }
+                            Err(join_err) => {
+                                error!(
+                                    "Processor worker {}: split thread panicked for '{}': {:?}",
+                                    worker_id, name, join_err
+                                );
+                                // Skip to next message rather than panicking
+                                continue;
+                            }
+                        };
 
                         match split_res {
                             Ok(row_count) => {
-                                // Only record history if we got no error
+                                info!(
+                                    "Processor worker {}: split succeeded for '{}' ({} rows)",
+                                    worker_id, name, row_count
+                                );
                                 if let Err(e) =
                                     history_clone.add(&name, State::Processed, row_count)
                                 {
-                                    error!("history.add (Processed) failed for {}: {:#}", name, e);
-                                    return;
+                                    error!(
+                                        "Processor worker {}: history.add(state=Processed) failed for '{}': {:#}",
+                                        worker_id, name, e
+                                    );
+                                    // Continue rather than return, so this worker stays alive
+                                    continue;
                                 }
-                                info!(
-                                    file_name = %name,
-                                    worker_id = worker_id,
-                                    "processing completed ({} rows)",
-                                    row_count
+                                debug!(
+                                    "Processor worker {}: recorded Processed for '{}'",
+                                    worker_id, name
                                 );
                             }
-
                             Err(e) => {
-                                error!("split {} failed: {}", name, e);
-                                // do not record history on error
+                                error!(
+                                    "Processor worker {}: split '{}' failed with error: {}",
+                                    worker_id, name, e
+                                );
+                                // do not record history on error, but keep worker alive
+                                continue;
                             }
                         }
                     }
-                    Err((url, _err_str)) => {
-                        error!("error processing URL: {}", url);
+                    Err((url, err_str)) => {
+                        error!(
+                            "Processor worker {}: error processing URL '{}': {}",
+                            worker_id, url, err_str
+                        );
+                        // After logging, continue listening for more messages
+                        continue;
                     }
                 }
             }
