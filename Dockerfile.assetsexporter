@@ -1,0 +1,19 @@
+# Dockerfile.assetsexporter
+
+FROM alpine:latest
+
+# Install coreutils so we have 'du' (awk is already in busybox)
+RUN apk add --no-cache coreutils
+
+# Create the directories that will be bind-mounted at runtime
+RUN mkdir -p /assets
+RUN mkdir -p /textfile
+
+# Copy in our exporter script
+COPY export_assets_size.sh /usr/local/bin/export_assets_size.sh
+
+# Make sure it’s executable
+RUN chmod +x /usr/local/bin/export_assets_size.sh
+
+# When the container starts, run our exporter loop
+ENTRYPOINT ["/usr/local/bin/export_assets_size.sh"]

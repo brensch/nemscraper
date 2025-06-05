@@ -1,3 +1,4 @@
+version: '3.7'
 
 services:
   grafana:
@@ -5,9 +6,9 @@ services:
     restart: always
     ports:
       - "3000:3000"
-    user: "1000:1000"               
+    user: "1000:1000"
     volumes:
-      - assets:/data                   
+      - assets:/data
       - ./grafana/plugins/motherduck-duckdb-datasource:/var/lib/grafana/plugins/motherduck-duckdb-datasource
       - ./grafana/dashboards:/etc/grafana/provisioned_dashboards
       - ./grafana/provisioning/dashboards:/etc/grafana/provisioning/dashboards
@@ -15,21 +16,67 @@ services:
     environment:
       GF_PLUGINS_ALLOW_LOADING_UNSIGNED_PLUGINS: "motherduck-duckdb-datasource"
 
+  prometheus:
+    image: prom/prometheus:latest
+    restart: always
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./prometheus/prometheus.yaml:/etc/prometheus/prometheus.yaml:ro
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yaml"
+
+  node-exporter:
+    image: prom/node-exporter:latest
+    restart: always
+    ports:
+      - "9100:9100"
+    volumes:
+      - /proc:/host/proc:ro
+      - /sys:/host/sys:ro
+      - /:/rootfs:ro
+      # Mount our dedicated “textfile” folder for metrics
+      - node_exporter_textfile:/var/lib/node_exporter/textfile_collector:ro
+    command:
+      - "--path.procfs=/host/proc"
+      - "--path.sysfs=/host/sys"
+      - "--path.rootfs=/rootfs"
+      - "--collector.textfile.directory=/var/lib/node_exporter/textfile_collector"
+
+  assets-exporter:
+    build:
+      context: .
+      dockerfile: Dockerfile.assetsexporter
+    restart: always
+    volumes:
+      # Mount the host's ./assets folder (read/write) → /assets
+      - assets:/assets
+      # Mount the “textfile” directory so we can write .prom files there
+      - node_exporter_textfile:/textfile
+
   nemscraper:
     build:
       context: .
       dockerfile: Dockerfile.nemscraper
     working_dir: /usr/src/app
-    user: "1000:1000"               
+    user: "1000:1000"
     volumes:
-      - assets:/usr/src/app/assets      
+      - assets:/usr/src/app/assets
     command: ["./target/release/nemscraper"]
 
 volumes:
   assets:
     driver: local
     driver_opts:
-      # bind the host’s ./assets folder into a named volume called “assets”
+      # Bind the host’s ./assets folder into a named volume called “assets”
       type: "none"
       o: "bind"
       device: "${PWD}/assets"
+
+  node_exporter_textfile:
+    driver: local
+    driver_opts:
+      # Bind a host folder ./node_exporter_textfile into this named volume
+      type: "none"
+      o: "bind"
+      device: "${PWD}/node_exporter_textfile"
