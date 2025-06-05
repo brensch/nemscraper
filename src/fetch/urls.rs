@@ -2,11 +2,17 @@ use anyhow::Context;
 use anyhow::Result;
 use futures::stream::{self, StreamExt};
 use futures::TryStreamExt;
+use once_cell::sync::Lazy;
 use reqwest::Client;
 use scraper::{Html, Selector};
 use std::collections::BTreeMap;
+use std::thread;
 use std::time::Duration;
+use tokio::sync::mpsc;
+use tokio::task;
+use tokio::time::interval;
 use tokio::time::sleep;
+use tokio::time::Interval;
 use url::Url;
 
 static CURRENT_FEED_URLS: &[&str] = &[
@@ -82,25 +88,22 @@ static ARCHIVE_FEED_URLS: &[&str] = &[
     "https://nemweb.com.au/Reports/Archive/FPPRUN/",
     "https://nemweb.com.au/Reports/Archive/P5_Reports/",
 ];
-const MAX_RETRIES: usize = 3;
-const RETRY_DELAY: Duration = Duration::from_secs(1);
+/// Parse the CSS selector exactly one time, at program start.
+/// We want `a[href$=".zip"]` to be reused on every fetch, so we don't re‐parse it each time.
+static ZIP_SELECTOR: Lazy<Selector> = Lazy::new(|| {
+    Selector::parse(r#"a[href$=".zip"]"#).expect("Invalid CSS selector for .zip links")
+});
 
-/// Fetch all ZIP URLs from the current feeds concurrently.
-pub async fn fetch_current_zip_urls(client: &Client) -> Result<BTreeMap<String, Vec<String>>> {
-    fetch_zip_urls(client, CURRENT_FEED_URLS).await
-}
+/// Maximum number of retries when fetching a feed page
+const MAX_RETRIES: u32 = 3;
+/// Delay between retries
+const RETRY_DELAY: Duration = Duration::from_secs(5);
 
-/// Fetch all ZIP URLs from the archive feeds concurrently.
-pub async fn fetch_archive_zip_urls(client: &Client) -> Result<BTreeMap<String, Vec<String>>> {
-    fetch_zip_urls(client, ARCHIVE_FEED_URLS).await
-}
-
-/// Helper that does the retry loop for a single feed URL, returning (feed_url, Vec<zip-links>).
-async fn fetch_feed_links(
-    client: Client,
-    feed_url: String,
-    selector: Selector,
-) -> Result<(String, Vec<String>)> {
+/// Helper that does the retry loop for a single feed URL, returning `Vec<zip‐links>`.
+///
+/// NOTE: we removed the `selector` parameter—inside this function we now refer to the
+///       global `ZIP_SELECTOR`.
+async fn fetch_feed_links(client: Client, feed_url: String) -> Result<Vec<String>> {
     let mut attempt = 0;
 
     loop {
@@ -108,30 +111,36 @@ async fn fetch_feed_links(
         let resp = client.get(&feed_url).send().await;
 
         match resp {
+            // 1) We got an HTTP response; check if it's 2xx
             Ok(resp) if resp.status().is_success() => {
+                // a) read the body as text
                 let html = resp
                     .text()
                     .await
                     .with_context(|| format!("reading body of {}", feed_url))?;
 
+                // b) parse feed_url into a Url so we can resolve relative <a href>
                 let base = Url::parse(&feed_url)
                     .with_context(|| format!("parsing base URL {}", feed_url))?;
 
+                // c) extract all <a href="…"> elements ending in `.zip`
                 let links = Html::parse_document(&html)
-                    .select(&selector)
+                    .select(&*ZIP_SELECTOR) // use the global selector
                     .filter_map(|elem| elem.value().attr("href"))
                     .filter_map(|href| base.join(href).ok())
                     .map(|url| url.to_string())
                     .collect::<Vec<String>>();
 
-                return Ok((feed_url, links));
+                return Ok(links);
             }
 
+            // 2) Transient network error, and we still have retries left
             Err(_) if attempt < MAX_RETRIES => {
                 sleep(RETRY_DELAY).await;
                 continue;
             }
 
+            // 3) We got a non‐2xx status on the final attempt (or once attempt ≥ MAX_RETRIES)
             Ok(resp) => {
                 return Err(anyhow::anyhow!(
                     "HTTP error {} when fetching {}",
@@ -140,9 +149,10 @@ async fn fetch_feed_links(
                 ));
             }
 
+            // 4) A network error and we exhausted all retries
             Err(e) => {
                 return Err(e).context(format!(
-                    "network error when fetching {} on attempt {}",
+                    "Network error when fetching {} on attempt {}",
                     feed_url, attempt
                 ));
             }
@@ -150,31 +160,50 @@ async fn fetch_feed_links(
     }
 }
 
-/// Run all feed‐fetch tasks with max 3 concurrent requests, then collect into a BTreeMap.
-async fn fetch_zip_urls(client: &Client, feeds: &[&str]) -> Result<BTreeMap<String, Vec<String>>> {
-    // Pre‐parse the selector once
-    let selector =
-        Selector::parse(r#"a[href$=".zip"]"#).expect("invalid CSS selector for .zip links");
+/// “Tick” every five minutes, but split that five‐minute window evenly across all feeds.
+/// Each pass fetches exactly one feed’s ZIP links, then sends them down `url_tx`.
+///
+/// - `client`   : shared `reqwest::Client` for all requests
+/// - `feeds`    : slice of feed URLs (e.g. `&["https://example.com/feed1", "https://.../feed2"]`)
+/// - `url_tx`   : an `mpsc::UnboundedSender<String>` where each discovered ZIP link will be sent
+///
+/// This function never returns; it continuously loops, fetching one feed per tick.
+pub fn spawn_fetch_zip_urls(
+    client: Client,
+    url_tx: mpsc::UnboundedSender<String>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        // Convert &str feeds → owned String vector
+        let owned_feeds: Vec<String> = CURRENT_FEED_URLS.iter().map(|s| s.to_string()).collect();
+        let num_feeds = owned_feeds.len() as u32;
 
-    // Convert to owned strings first to avoid lifetime issues
-    let owned_feeds: Vec<String> = feeds.iter().map(|s| s.to_string()).collect();
+        // Each feed should be fetched once per 5 minutes
+        let frequency_seconds = 5 * 60; // 300
+        let tick_secs = frequency_seconds / num_feeds; // e.g. 100s if 3 feeds
+        let tick_duration = Duration::from_secs(tick_secs as u64);
 
-    // Create a stream of futures, but limit to 3 concurrent executions
-    let results: Vec<(String, Vec<String>)> =
-        stream::iter(owned_feeds.into_iter().map(|feed_url| {
-            let client = client.clone();
-            let selector = selector.clone();
-            // Call our helper
-            fetch_feed_links(client, feed_url, selector)
-        }))
-        .buffer_unordered(3) // Limit to 3 concurrent requests
-        .try_collect()
-        .await?;
+        let mut ticker = tokio::time::interval(tick_duration);
+        let mut current_feed: usize = 0;
 
-    // Flatten into a BTreeMap
-    let mut map = BTreeMap::new();
-    for (url, links) in results {
-        map.insert(url, links);
-    }
-    Ok(map)
+        loop {
+            // Wait until the next tick (asynchronously)
+            ticker.tick().await;
+
+            let feed_url = owned_feeds[current_feed].clone();
+
+            // Call the async fetch with retries
+            match fetch_feed_links(client.clone(), feed_url.clone()).await {
+                Ok(links) => {
+                    for zip_link in links {
+                        let _ = url_tx.send(zip_link);
+                    }
+                }
+                Err(e) => {
+                    eprintln!("Failed to fetch links from {}: {}", feed_url, e);
+                }
+            }
+
+            current_feed = (current_feed + 1) % owned_feeds.len();
+        }
+    })
 }

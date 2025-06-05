@@ -1546,6 +1546,7 @@ dependencies = [
  "chrono",
  "futures",
  "glob",
+ "once_cell",
  "parquet",
  "rayon",
  "regex",

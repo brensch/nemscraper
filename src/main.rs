@@ -1,7 +1,10 @@
 use anyhow::Result;
 use history::state::State;
 use history::store::History;
-use nemscraper::{fetch, process};
+use nemscraper::{
+    fetch::{self, urls::spawn_fetch_zip_urls},
+    process,
+};
 use reqwest::Client;
 use std::{ffi::OsStr, fs, path::PathBuf, sync::Arc, time::Duration};
 use tokio::{
@@ -36,6 +39,7 @@ async fn main() -> Result<()> {
 
     // 3) history & lookup store
     let history = Arc::new(History::new(history_dir)?);
+    history.clone().spawn_vacuum_loop();
 
     // 4) channels
     //
@@ -59,10 +63,9 @@ async fn main() -> Result<()> {
     .await;
 
     // 6) enqueue existing ZIPs (one‐time)
-    enqueue_existing_zips(&zips_dir, processor_tx.clone(), Arc::clone(&history))?;
+    enqueue_existing_zips(&zips_dir, processor_tx.clone())?;
 
-    // 7) spawn scheduler (periodic fetch)
-    spawn_scheduler(client.clone(), url_tx.clone(), Arc::clone(&history));
+    spawn_fetch_zip_urls(client.clone(), url_tx.clone());
 
     // 8) spawn processor workers
     let num_cores = std::thread::available_parallelism()
@@ -146,7 +149,7 @@ async fn spawn_download_workers(
 
                 // 3) skip if already downloaded or processed
                 if history.get(&name, &State::Downloaded) {
-                    debug!(%name, "already in history (downloaded/processed), skipping {}", url);
+                    debug!(%name, "already in history (downloaded), skipping {}", url);
                     continue;
                 }
 
@@ -175,63 +178,16 @@ async fn spawn_download_workers(
 fn enqueue_existing_zips(
     zips_dir: &PathBuf,
     processor_tx: UnboundedSender<Result<PathBuf, (String, String)>>,
-    history: Arc<History>,
 ) -> Result<()> {
     for entry in fs::read_dir(zips_dir)? {
         let path = entry?.path();
         if path.extension() != Some(OsStr::new("zip")) {
             continue;
         }
-        let name = path.file_name().unwrap().to_string_lossy().to_string();
-        if history.get(&name, &State::Processed) {
-            debug!(%name, "already processed {}, skipping", path.display());
-            continue;
-        }
         // re‐enqueue any ZIP that hasn’t been Processed
         processor_tx.send(Ok(path.clone()))?;
     }
     Ok(())
-}
-
-/// Spawn a background task that every 60s:
-///  1) vacuums history
-///  2) fetches the latest ZIP URLs from the feed
-///  3) pushes any new URLs into `url_tx`
-fn spawn_scheduler(client: Client, url_tx: mpsc::UnboundedSender<String>, history: Arc<History>) {
-    task::spawn(async move {
-        let mut ticker = interval(Duration::from_secs(60));
-        loop {
-            if let Err(e) = async {
-                info!("vacuuming history");
-                history.vacuum().unwrap();
-
-                info!("fetching feeds");
-                let feeds = fetch::urls::fetch_current_zip_urls(&client).await?;
-                let all_urls_iter = feeds.values().flat_map(|urls| urls.iter().cloned());
-
-                for url in all_urls_iter {
-                    let name = PathBuf::from(&url)
-                        .file_name()
-                        .unwrap()
-                        .to_string_lossy()
-                        .to_string();
-                    if history.get(&name, &State::Downloaded) {
-                        debug!(url = %url, "already seen, skipping");
-                        continue;
-                    }
-                    url_tx
-                        .send(url.clone())
-                        .map_err(|e| anyhow::anyhow!(e.to_string()))?;
-                }
-                Ok::<(), anyhow::Error>(())
-            }
-            .await
-            {
-                error!("scheduler loop failed: {}", e);
-            }
-            ticker.tick().await;
-        }
-    });
 }
 
 /// Spawn `num_workers` tasks that read from `processor_rx`. Each message is either:
@@ -315,7 +271,7 @@ async fn spawn_processor_workers(
                         }
                     }
                     Err((url, _err_str)) => {
-                        error!("upstream download error for URL {}", url);
+                        error!("error processing URL: {}", url);
                     }
                 }
             }

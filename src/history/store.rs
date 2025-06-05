@@ -16,6 +16,8 @@ use std::{
     io::BufWriter,
     path::PathBuf,
     sync::{Arc, Mutex},
+    thread,
+    time::Duration,
 };
 
 /// `History` manages a directory of per‐row Parquet files and can “vacuum”
@@ -218,7 +220,7 @@ impl History {
     /// one output per (UTC‐date, state). After successfully writing the new
     /// consolidated file, delete only the old tiny files (leave any old
     /// consolidated files alone).
-    pub fn vacuum(&self) -> Result<()> {
+    fn vacuum(&self) -> Result<()> {
         // 1) Scan for all "*.parquet" in history_dir and group by (date, state).
         let mut buckets: HashMap<(NaiveDate, State), Vec<PathBuf>> = HashMap::new();
         let pattern = format!("{}/{}", self.history_dir.display(), "*.parquet");
@@ -368,5 +370,24 @@ impl History {
         }
 
         Ok(())
+    }
+
+    /// Start a background thread that calls `self.vacuum()` every 30 seconds.
+    ///
+    /// You must call this with an `Arc<History>`. The returned `JoinHandle`
+    /// can be discarded if you never need to `join()` on it, or you can
+    /// keep it around if you want to shut it down cleanly later.
+    pub fn spawn_vacuum_loop(self: Arc<Self>) -> thread::JoinHandle<()> {
+        thread::spawn(move || {
+            loop {
+                // Sleep for 30 seconds between vacuums
+                thread::sleep(Duration::from_secs(30));
+
+                // Call vacuum(); report any errors but keep looping
+                if let Err(err) = self.vacuum() {
+                    eprintln!("History::vacuum() failed: {:?}", err);
+                }
+            }
+        })
     }
 }

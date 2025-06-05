@@ -51,6 +51,11 @@ pub async fn download_zip(
                 )));
             }
             Err(e) => {
+                if let Some(req_err) = e.downcast_ref::<reqwest::Error>() {
+                    if req_err.status() == Some(reqwest::StatusCode::NOT_FOUND) {
+                        return Err(e.context(format!("got 404, bailing: {}", url_str)));
+                    }
+                }
                 // Clean up any partial file before retry
                 let _ = tokio::fs::remove_file(&dest_path).await;
 
@@ -71,7 +76,11 @@ pub async fn download_zip(
 }
 
 /// Single download attempt - downloads the URL and streams to the given path.
-async fn download_attempt(client: &Client, url: &Url, dest_path: &Path) -> Result<()> {
+async fn download_attempt(
+    client: &Client,
+    url: &Url,
+    dest_path: &Path,
+) -> Result<(), anyhow::Error> {
     let resp = client.get(url.as_str()).send().await?.error_for_status()?;
 
     // Create the output file
