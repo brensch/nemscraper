@@ -1,18 +1,12 @@
 use anyhow::Context;
 use anyhow::Result;
-use futures::stream::{self, StreamExt};
-use futures::TryStreamExt;
+use futures::stream::StreamExt;
 use once_cell::sync::Lazy;
 use reqwest::Client;
 use scraper::{Html, Selector};
-use std::collections::BTreeMap;
-use std::thread;
 use std::time::Duration;
 use tokio::sync::mpsc;
-use tokio::task;
-use tokio::time::interval;
 use tokio::time::sleep;
-use tokio::time::Interval;
 use url::Url;
 
 static CURRENT_FEED_URLS: &[&str] = &[

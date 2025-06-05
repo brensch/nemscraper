@@ -6,15 +6,13 @@ use nemscraper::{
     process,
 };
 use reqwest::Client;
-use std::{ffi::OsStr, fs, path::PathBuf, sync::Arc, time::Duration};
+use std::{ffi::OsStr, fs, path::PathBuf, sync::Arc};
 use tokio::{
-    signal,
     sync::{
-        mpsc::{self, UnboundedReceiver, UnboundedSender},
+        mpsc::{self, UnboundedSender},
         Mutex,
     },
     task,
-    time::interval,
 };
 use tracing::{debug, error, info};
 use tracing_subscriber::{fmt, EnvFilter};
