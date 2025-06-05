@@ -29,6 +29,170 @@
             "fieldConfig": {
                 "defaults": {
                     "color": {
+                        "mode": "thresholds"
+                    },
+                    "custom": {
+                        "align": "auto",
+                        "cellOptions": {
+                            "type": "auto"
+                        },
+                        "inspect": false
+                    },
+                    "mappings": [],
+                    "thresholds": {
+                        "mode": "absolute",
+                        "steps": [
+                            {
+                                "color": "green"
+                            },
+                            {
+                                "color": "red",
+                                "value": 80
+                            }
+                        ]
+                    }
+                },
+                "overrides": []
+            },
+            "gridPos": {
+                "h": 8,
+                "w": 7,
+                "x": 0,
+                "y": 0
+            },
+            "id": 3,
+            "options": {
+                "cellHeight": "sm",
+                "footer": {
+                    "countRows": false,
+                    "fields": "",
+                    "reducer": [
+                        "sum"
+                    ],
+                    "show": false
+                },
+                "showHeader": true
+            },
+            "pluginVersion": "12.0.1",
+            "targets": [
+                {
+                    "editorMode": "code",
+                    "format": 1,
+                    "rawQuery": true,
+                    "rawSql": "SELECT\r\n  state,\r\n  COUNT(DISTINCT file_name) AS unique_file_count\r\nFROM read_parquet('/data/history/*.parquet', union_by_name = TRUE)\r\nWHERE $__timeFilter(event_time)\r\nGROUP BY state\r\nORDER BY state;\r\n",
+                    "refId": "A",
+                    "sql": {
+                        "columns": [
+                            {
+                                "parameters": [],
+                                "type": "function"
+                            }
+                        ],
+                        "groupBy": [
+                            {
+                                "property": {
+                                    "type": "string"
+                                },
+                                "type": "groupBy"
+                            }
+                        ],
+                        "limit": 50
+                    }
+                }
+            ],
+            "title": "Unique Values",
+            "type": "table"
+        },
+        {
+            "datasource": {
+                "type": "motherduck-duckdb-datasource",
+                "uid": "P18CE15CC9D3BAB28"
+            },
+            "fieldConfig": {
+                "defaults": {
+                    "color": {
+                        "mode": "thresholds"
+                    },
+                    "custom": {
+                        "align": "auto",
+                        "cellOptions": {
+                            "type": "auto"
+                        },
+                        "inspect": false
+                    },
+                    "mappings": [],
+                    "thresholds": {
+                        "mode": "absolute",
+                        "steps": [
+                            {
+                                "color": "green"
+                            },
+                            {
+                                "color": "red",
+                                "value": 80
+                            }
+                        ]
+                    }
+                },
+                "overrides": []
+            },
+            "gridPos": {
+                "h": 8,
+                "w": 7,
+                "x": 7,
+                "y": 0
+            },
+            "id": 4,
+            "options": {
+                "cellHeight": "sm",
+                "footer": {
+                    "countRows": false,
+                    "fields": "",
+                    "reducer": [
+                        "sum"
+                    ],
+                    "show": false
+                },
+                "showHeader": true
+            },
+            "pluginVersion": "12.0.1",
+            "targets": [
+                {
+                    "editorMode": "code",
+                    "format": 1,
+                    "rawQuery": true,
+                    "rawSql": "SELECT\r\n  state,\r\n  COUNT(*) AS total_count\r\nFROM read_parquet('/data/history/*.parquet', union_by_name = TRUE)\r\nWHERE $__timeFilter(event_time)\r\nGROUP BY state\r\nORDER BY state;\r\n",
+                    "refId": "A",
+                    "sql": {
+                        "columns": [
+                            {
+                                "parameters": [],
+                                "type": "function"
+                            }
+                        ],
+                        "groupBy": [
+                            {
+                                "property": {
+                                    "type": "string"
+                                },
+                                "type": "groupBy"
+                            }
+                        ],
+                        "limit": 50
+                    }
+                }
+            ],
+            "title": "Total Values",
+            "type": "table"
+        },
+        {
+            "datasource": {
+                "type": "motherduck-duckdb-datasource",
+                "uid": "P18CE15CC9D3BAB28"
+            },
+            "fieldConfig": {
+                "defaults": {
+                    "color": {
                         "mode": "palette-classic"
                     },
                     "custom": {
@@ -84,7 +248,7 @@
                 "h": 9,
                 "w": 24,
                 "x": 0,
-                "y": 0
+                "y": 8
             },
             "id": 2,
             "options": {
@@ -127,7 +291,7 @@
                     }
                 }
             ],
-            "title": "New panel",
+            "title": "File State",
             "type": "timeseries"
         },
         {
@@ -193,7 +357,7 @@
                 "h": 10,
                 "w": 24,
                 "x": 0,
-                "y": 9
+                "y": 17
             },
             "id": 1,
             "options": {
@@ -253,7 +417,7 @@
     },
     "timepicker": {},
     "timezone": "browser",
-    "title": "New dashboard",
+    "title": "File Stats",
     "uid": "a78f110c-caac-4f47-96d3-5772ce7d2120",
     "version": 1
 }
