@@ -1,4 +1,4 @@
-use anyhow::Result;
+use anyhow::{anyhow, Result};
 use std::path::Path;
 use tracing::error;
 
@@ -74,17 +74,19 @@ impl CsvBatchProcessor {
 
     /// Flush whatever is in `self.batch` (if nonempty) to Parquet, increment batch_index, clear batch.
     pub fn flush_batch(&mut self, file_name: &str, out_dir: &Path) -> Result<()> {
-        if !self.batch.is_empty() {
-            let batch_name = format!("{}-batch-{}", file_name, self.batch_index);
-            csv_to_parquet(&batch_name, self.batch.as_str(), out_dir).unwrap_or_else(|e| {
-                error!(
-                    "csv_to_parquet error on {} batch {}: {:?}",
-                    file_name, self.batch_index, e
-                )
-            });
-            self.batch_index += 1;
-            self.batch.clear();
+        if self.batch.is_empty() {
+            return Err(anyhow!("Batch is empty"));
         }
+        let batch_name = format!("{}-batch-{}", file_name, self.batch_index);
+        csv_to_parquet(&batch_name, self.batch.as_str(), out_dir).unwrap_or_else(|e| {
+            error!(
+                "csv_to_parquet error on {} batch {}: {:?}",
+                file_name, self.batch_index, e
+            )
+        });
+        self.batch_index += 1;
+        self.batch.clear();
+
         Ok(())
     }
 
