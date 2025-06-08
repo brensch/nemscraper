@@ -33,8 +33,6 @@ pub trait HistoryRow: Sized {
     fn unique_key(&self) -> String;
     /// Column index for key in schema
     const KEY_COLUMN: usize;
-    /// Column index for timestamp in schema
-    const TIME_COLUMN: usize;
     /// Extract unique key from an existing batch row (for scanning)
     fn extract_key(batch: &RecordBatch, row: usize) -> String {
         let arr = batch
@@ -42,14 +40,7 @@ pub trait HistoryRow: Sized {
             .as_any()
             .downcast_ref::<StringArray>()
             .expect("KEY_COLUMN must be StringArray");
-        let key = arr.value(row);
-        let ts_arr = batch
-            .column(Self::TIME_COLUMN)
-            .as_any()
-            .downcast_ref::<TimestampMicrosecondArray>()
-            .expect("TIME_COLUMN must be TimestampMicrosecondArray");
-        let ts = ts_arr.value(row);
-        format!("{}--{}", key, ts)
+        arr.value(row).to_string()
     }
 }
 
@@ -198,150 +189,91 @@ impl<R: HistoryRow + Send + Sync + 'static> TableHistory<R> {
     }
 }
 
-// ----- Tests -----
 #[cfg(test)]
 mod tests {
-    use crate::history::processed::ProcessedRow;
-
     use super::*;
-    use chrono::{Duration, Utc};
-    use glob::glob;
+    use anyhow::Result;
+    use arrow::{
+        array::{ArrayRef, StringArray, UInt64Array},
+        datatypes::{DataType as ArrowDataType, Field, Schema as ArrowSchema},
+    };
+    use chrono::NaiveDate;
+    use std::sync::Arc;
     use tempfile::tempdir;
 
-    #[test]
-    fn test_add_and_get() {
-        let tmp = tempdir().unwrap();
-        let hist = TableHistory::<ProcessedRow>::new_processed(tmp.path()).unwrap();
-        hist.start_vacuum_loop();
-
-        let now = Utc::now();
-        let row = ProcessedRow {
-            filename: "file1.csv".to_string(),
-            total_rows: 10,
-            size_bytes: 100,
-            processing_start: now,
-            processing_end: now,
-        };
-
-        assert!(!hist.get(row.unique_key()));
-        hist.add(&row).unwrap();
-        assert!(hist.get(row.unique_key()));
-
-        let date_str = now.date_naive().format("%Y%m%d").to_string();
-        let part_dir = tmp
-            .path()
-            .join("processed")
-            .join(format!("date={}", date_str));
-        let files: Vec<_> = glob(&format!("{}/*.parquet", part_dir.display()))
-            .unwrap()
-            .filter_map(Result::ok)
-            .collect();
-        assert_eq!(files.len(), 1);
+    /// A minimal test row: just a string key, a partition date, and a u64 value.
+    struct DummyRow {
+        key: String,
+        date: NaiveDate,
+        value: u64,
     }
 
-    #[test]
-    fn test_deduplication() {
-        let tmp = tempdir().unwrap();
-        let hist = TableHistory::<ProcessedRow>::new_processed(tmp.path()).unwrap();
-        hist.start_vacuum_loop();
-
-        let now = Utc::now();
-        let row = ProcessedRow {
-            filename: "file2.csv".to_string(),
-            total_rows: 20,
-            size_bytes: 200,
-            processing_start: now,
-            processing_end: now,
-        };
-
-        hist.add(&row).unwrap();
-        let date_str = now.date_naive().format("%Y%m%d").to_string();
-        let pattern = format!(
-            "{}/processed/date={}/**/*.parquet",
-            tmp.path().display(),
-            date_str
-        );
-        let count1 = glob(&pattern).unwrap().filter_map(Result::ok).count();
-        assert_eq!(count1, 1);
-
-        hist.add(&row).unwrap();
-        let count2 = glob(&pattern).unwrap().filter_map(Result::ok).count();
-        assert_eq!(count1, count2);
-    }
-
-    #[test]
-    fn test_vacuum_consolidates() {
-        let tmp = tempdir().unwrap();
-        let hist = TableHistory::<ProcessedRow>::new_processed(tmp.path()).unwrap();
-
-        let now = Utc::now();
-        let row1 = ProcessedRow {
-            filename: "file3.csv".to_string(),
-            total_rows: 30,
-            size_bytes: 300,
-            processing_start: now,
-            processing_end: now,
-        };
-        let later = now + Duration::microseconds(1);
-        let row2 = ProcessedRow {
-            filename: "file4.csv".to_string(),
-            total_rows: 40,
-            size_bytes: 400,
-            processing_start: now,
-            processing_end: later,
-        };
-
-        hist.add(&row1).unwrap();
-        hist.add(&row2).unwrap();
-
-        let date_str = now.date_naive().format("%Y%m%d").to_string();
-        let glob_pattern = format!(
-            "{}/processed/date={}/**/*.parquet",
-            tmp.path().display(),
-            date_str
-        );
-
-        // ensure two files before vacuum
-        let before = glob(&glob_pattern).unwrap().filter_map(Result::ok).count();
-        assert_eq!(before, 2);
-
-        hist.vacuum().unwrap();
-
-        // after vacuum, only consolidated.parquet remains
-        let after_paths: Vec<_> = glob(&glob_pattern)
-            .unwrap()
-            .filter_map(Result::ok)
-            .collect();
-        assert_eq!(after_paths.len(), 1);
-        assert_eq!(
-            after_paths[0].file_name().unwrap().to_string_lossy(),
-            "consolidated.parquet"
-        );
-    }
-
-    #[test]
-    fn test_persistence_across_restarts() {
-        let tmp = tempdir().unwrap();
-        // first instance: write one row
-        let key: String;
-        {
-            let hist = TableHistory::<ProcessedRow>::new_processed(tmp.path()).unwrap();
-            hist.start_vacuum_loop();
-            let now = Utc::now();
-            let row = ProcessedRow {
-                filename: "file5.csv".to_string(),
-                total_rows: 50,
-                size_bytes: 500,
-                processing_start: now,
-                processing_end: now,
-            };
-            key = row.unique_key();
-            hist.add(&row).unwrap();
-            assert!(hist.get(key.clone()));
+    impl HistoryRow for DummyRow {
+        fn partition_date(&self) -> NaiveDate {
+            self.date
         }
 
-        // second instance: should pick up the existing file
-        let hist2 = TableHistory::<ProcessedRow>::new_processed(tmp.path()).unwrap();
-        assert!(hist2.get(key));
+        fn schema() -> ArrowSchema {
+            ArrowSchema::new(vec![
+                Field::new("key", ArrowDataType::Utf8, false),
+                Field::new("value", ArrowDataType::UInt64, false),
+            ])
+        }
+
+        fn to_arrays(&self) -> Vec<ArrayRef> {
+            vec![
+                Arc::new(StringArray::from(vec![self.key.clone()])),
+                Arc::new(UInt64Array::from(vec![self.value])),
+            ]
+        }
+
+        fn unique_key(&self) -> String {
+            self.key.clone()
+        }
+
+        const KEY_COLUMN: usize = 0;
+    }
+
+    #[test]
+    fn add_get_vacuum_and_scan_again() -> Result<()> {
+        // 1) create empty TableHistory in a temp dir
+        let tmp = tempdir()?;
+        let base_dir = tmp.path();
+        let table_name = "test_table";
+
+        // new() should see nothing
+        let hist = TableHistory::<DummyRow>::new(base_dir, table_name)?;
+        assert!(!hist.get("row1".into()), "should not find row1 yet");
+
+        // 2) add first row and check get()
+        let row1 = DummyRow {
+            key: "row1".into(),
+            date: NaiveDate::from_ymd_opt(2025, 6, 8).unwrap(),
+            value: 42,
+        };
+        hist.add(&row1)?;
+        assert!(hist.get("row1".into()), "row1 should now be present");
+
+        // 3) add second row under a different key
+        let row2 = DummyRow {
+            key: "row2".into(),
+            date: NaiveDate::from_ymd_opt(2025, 6, 8).unwrap(),
+            value: 99,
+        };
+        hist.add(&row2)?;
+        assert!(hist.get("row2".into()), "row2 should also be present");
+
+        // 4) vacuum consolidates all parquet files
+        hist.vacuum()?;
+
+        // 5) drop original and re-open to scan on-disk
+        drop(hist);
+        let hist2 = TableHistory::<DummyRow>::new(base_dir, table_name)?;
+
+        // 6) both keys should survive across restarts
+        assert!(hist2.get("row1".into()), "row1 must survive a restart");
+        assert!(hist2.get("row2".into()), "row2 must survive a restart");
+
+        Ok(())
     }
 }

@@ -31,7 +31,6 @@ pub struct DownloadedRow {
 
 impl HistoryRow for DownloadedRow {
     const KEY_COLUMN: usize = 0;
-    const TIME_COLUMN: usize = 4;
 
     fn partition_date(&self) -> NaiveDate {
         self.download_end.date_naive()
