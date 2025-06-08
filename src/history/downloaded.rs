@@ -4,10 +4,7 @@ use arrow::{
     datatypes::{DataType as ArrowDataType, Field, Schema as ArrowSchema, TimeUnit},
 };
 use chrono::{DateTime, NaiveDate, TimeZone, Utc};
-use std::{
-    path::PathBuf,
-    sync::Arc,
-};
+use std::{path::PathBuf, sync::Arc};
 
 use crate::history::table_history::{HistoryRow, TableHistory};
 
@@ -17,6 +14,7 @@ pub struct DownloadedRow {
     pub size_bytes: u64,
     pub download_start: DateTime<Utc>,
     pub download_end: DateTime<Utc>,
+    pub thread: u32,
 }
 
 impl HistoryRow for DownloadedRow {
@@ -41,6 +39,7 @@ impl HistoryRow for DownloadedRow {
                 ArrowDataType::Timestamp(TimeUnit::Microsecond, None),
                 false,
             ),
+            Field::new("thread", ArrowDataType::UInt32, false),
         ])
     }
 

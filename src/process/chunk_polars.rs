@@ -398,12 +398,11 @@ pub fn csv_to_parquet(file_name: &str, data: &str, out_dir: &Path) -> Result<u64
     // Atomically rename into place
     fs::rename(&tmp_path, &final_path).context("renaming Parquet file into place")?;
 
-    info!(
+    debug!(
         "Wrote {} bytes of Parquet to {}",
         parquet_bytes,
         final_path.display()
     );
-    debug!("Completed Arrow-based conversion: {}", final_path.display());
 
     Ok(parquet_bytes)
 }
