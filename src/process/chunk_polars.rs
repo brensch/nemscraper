@@ -8,7 +8,9 @@ use parquet::basic::BrotliLevel;
 use parquet::basic::Compression;
 use parquet::file::properties::WriterProperties;
 use std::error::Error;
+use std::fs;
 use std::fs::File;
+use std::io::Seek;
 use std::io::{BufRead, BufReader, Cursor};
 use std::path::Path;
 use std::sync::Arc;
@@ -51,11 +53,7 @@ fn parse_header_and_create_string_schema(
     reader.read_line(&mut header_line)?;
 
     // Parse CSV header (simple comma splitting for now)
-    let headers: Vec<String> = header_line
-        .trim()
-        .split(',')
-        .map(clean_str)
-        .collect();
+    let headers: Vec<String> = header_line.trim().split(',').map(clean_str).collect();
 
     // Create schema with all string fields
     let fields: Vec<Field> = headers
@@ -305,7 +303,8 @@ fn extract_date_from_filename(filename: &str) -> Option<String> {
 }
 
 /// 9) Main CSV→Parquet conversion using Arrow (memory efficient, single pass).
-pub fn csv_to_parquet(file_name: &str, data: &str, out_dir: &Path) -> Result<(), Box<dyn Error>> {
+/// Returns the exact number of bytes written into the Parquet file.
+pub fn csv_to_parquet(file_name: &str, data: &str, out_dir: &Path) -> Result<u64, Box<dyn Error>> {
     debug!("Starting Arrow-based CSV to Parquet conversion");
 
     // Step A: Parse header and create initial string schema
@@ -314,18 +313,16 @@ pub fn csv_to_parquet(file_name: &str, data: &str, out_dir: &Path) -> Result<(),
 
     // Step B: Read first batch with string schema to analyze
     let mut cursor = Cursor::new(data.as_bytes());
-    let mut reader = ReaderBuilder::new(Arc::new(string_schema))
+    let mut reader = ReaderBuilder::new(Arc::new(string_schema.clone()))
         .with_header(true)
-        .with_batch_size(1000)
+        .with_batch_size(1_000)
         .build(&mut cursor)?;
-
     let first_batch = reader.next().ok_or("No data found in CSV")??;
     let schema_info = analyze_batch_for_schema(&first_batch, &headers)?;
-
     debug!("Final schema: {:?}", schema_info.schema);
     debug!("Table name: {}", schema_info.table_name);
 
-    // Step C: Setup output directory
+    // Step C: Setup output directory and partition
     let partition_date = extract_date_from_filename(file_name).unwrap_or_else(|| {
         warn!(
             "No date found in filename '{}', using default partition",
@@ -335,25 +332,30 @@ pub fn csv_to_parquet(file_name: &str, data: &str, out_dir: &Path) -> Result<(),
     });
 
     let table_dir = out_dir.join(&schema_info.table_name);
-    std::fs::create_dir_all(&table_dir)?;
+    fs::create_dir_all(&table_dir)?;
     let partition_dir = table_dir.join(format!("date={}", partition_date));
-    std::fs::create_dir_all(&partition_dir)?;
+    fs::create_dir_all(&partition_dir)?;
 
     // Step D: Setup Parquet writer with final schema
     let final_name = format!("{}.parquet", file_name);
     let tmp_name = format!("{}.tmp", final_name);
-    let final_path = partition_dir.join(final_name);
-    let tmp_path = partition_dir.join(tmp_name);
+    let final_path = partition_dir.join(&final_name);
+    let tmp_path = partition_dir.join(&tmp_name);
 
-    let tmp_file = File::create(&tmp_path)?;
+    // Open one file handle, clone it for the writer, so we can read back the final position:
+    let mut tmp_file = File::create(&tmp_path)?;
+    let writer_file = tmp_file.try_clone()?;
     let props = WriterProperties::builder()
         .set_compression(Compression::BROTLI(BrotliLevel::try_new(5)?))
         .build();
 
-    let mut writer =
-        ArrowWriter::try_new(tmp_file, Arc::new(schema_info.schema.clone()), Some(props))?;
+    let mut writer = ArrowWriter::try_new(
+        writer_file,
+        Arc::new(schema_info.schema.clone()),
+        Some(props),
+    )?;
 
-    // Step E: Re-read full CSV and process in batches
+    // Step E: Re-read full CSV and write each batch
     let mut cursor = Cursor::new(data.as_bytes());
     let string_schema_for_reading = {
         let fields: Vec<Field> = headers
@@ -362,36 +364,33 @@ pub fn csv_to_parquet(file_name: &str, data: &str, out_dir: &Path) -> Result<(),
             .collect();
         Schema::new(fields)
     };
-
-    let reader = ReaderBuilder::new(Arc::new(string_schema_for_reading))
+    let mut csv_reader = ReaderBuilder::new(Arc::new(string_schema_for_reading))
         .with_header(true)
-        .with_batch_size(8192)
+        .with_batch_size(8_192)
         .build(&mut cursor)?;
 
-    // Process each batch
-    for batch_result in reader {
+    for batch_result in csv_reader {
         let batch = batch_result?;
-
-        // Apply trimming if needed
-        let trimmed_batch = apply_trimming(&batch, &schema_info.trim_columns)?;
-
-        // Convert to final types
-        let final_batch = convert_to_final_types(&trimmed_batch, &schema_info)?;
-
-        // Write batch to Parquet
+        let trimmed = apply_trimming(&batch, &schema_info.trim_columns)?;
+        let final_batch = convert_to_final_types(&trimmed, &schema_info)?;
         writer.write(&final_batch)?;
     }
 
+    // Finish writing (flush metadata etc.)
     writer.close()?;
 
-    // Atomic rename
-    std::fs::rename(&tmp_path, &final_path)?;
+    // Now get the total number of bytes actually written:
+    let parquet_bytes = tmp_file.stream_position()?;
+
+    // Atomically rename into place
+    fs::rename(&tmp_path, &final_path)?;
 
     info!(
-        "Wrote Parquet file to table '{}' with date partition '{}'",
-        schema_info.table_name, partition_date
+        "Wrote {} bytes of Parquet to {}",
+        parquet_bytes,
+        final_path.display()
     );
-
     debug!("Completed Arrow-based conversion: {}", final_path.display());
-    Ok(())
+
+    Ok(parquet_bytes)
 }

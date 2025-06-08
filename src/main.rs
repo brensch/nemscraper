@@ -1,21 +1,27 @@
 use anyhow::Result;
+use chrono::Utc;
 use history::state::State;
-use history::store::History;
+use history::store::TableHistory;
 use nemscraper::{
     fetch::{self, urls::spawn_fetch_zip_urls},
+    history::store::HistoryRow,
     process,
 };
 use reqwest::Client;
+use std::time::Duration;
+
 use std::{ffi::OsStr, fs, path::PathBuf, sync::Arc};
 use tokio::{
     sync::{
         mpsc::{self, UnboundedSender},
         Mutex,
     },
-    task,
+    task, time,
 };
 use tracing::{debug, error, info, warn};
 use tracing_subscriber::{fmt, EnvFilter};
+
+use crate::history::store::{DownloadedRow, ProcessedRow};
 
 mod history;
 mod utils;
@@ -43,8 +49,9 @@ async fn main() -> Result<()> {
     );
 
     // 3) history & lookup store
-    let history = Arc::new(History::new(history_dir)?);
-    history.clone().spawn_vacuum_loop();
+    // let history = Arc::new(History::new(history_dir)?);
+    let downloaded = TableHistory::<DownloadedRow>::new_downloaded(history_dir.clone())?;
+    let processed = TableHistory::<ProcessedRow>::new_processed(history_dir.clone())?;
     info!("Spawned history vacuum loop");
 
     // 4) channels
@@ -66,21 +73,21 @@ async fn main() -> Result<()> {
         zips_dir.clone(),
         processor_tx.clone(),
         url_rx_mu.clone(),
-        history.clone(),
+        downloaded.clone(),
     )
     .await;
     info!("Spawned download workers");
 
     // 6) enqueue existing ZIPs (one‐time)
-    enqueue_existing_zips(&zips_dir, processor_tx.clone())?;
+    spawn_existing_zip_check(zips_dir.clone(), processor_tx.clone());
     info!(
         "Enqueued existing ZIPs from '{:?}' onto processor queue",
         zips_dir
     );
 
-    // 7) spawn URL fetcher
-    spawn_fetch_zip_urls(client.clone(), url_tx.clone());
-    info!("Spawned URL fetcher task (spawn_fetch_zip_urls)");
+    // // 7) spawn URL fetcher
+    // spawn_fetch_zip_urls(client.clone(), url_tx.clone());
+    // info!("Spawned URL fetcher task (spawn_fetch_zip_urls)");
 
     // 8) spawn processor workers
     let num_cores = std::thread::available_parallelism()
@@ -89,7 +96,7 @@ async fn main() -> Result<()> {
     spawn_processor_workers(
         num_cores,
         processor_rx_mu.clone(),
-        Arc::clone(&history),
+        processed.clone(),
         parquet_dir.clone(),
     )
     .await;
@@ -134,14 +141,14 @@ async fn spawn_download_workers(
     zips_dir: PathBuf,
     processor_tx: UnboundedSender<Result<PathBuf, (String, String)>>,
     url_rx_mu: Arc<Mutex<mpsc::UnboundedReceiver<String>>>,
-    history: Arc<History>,
+    downloaded: Arc<TableHistory<DownloadedRow>>,
 ) {
     for worker_id in 0..n_workers {
         let client = client.clone();
         let zips_dir = zips_dir.clone();
         let processor_tx = processor_tx.clone();
         let url_rx_mu = url_rx_mu.clone();
-        let history = history.clone();
+        let downloaded = downloaded.clone();
 
         task::spawn(async move {
             info!("Download worker {} started", worker_id);
@@ -176,7 +183,7 @@ async fn spawn_download_workers(
                 );
 
                 // 3) skip if already downloaded or processed
-                if history.get(&name, &State::Downloaded) {
+                if downloaded.get(name.clone()) {
                     debug!(
                         "Download worker {}: already in history (downloaded), skipping URL='{}'",
                         worker_id, url
@@ -185,6 +192,7 @@ async fn spawn_download_workers(
                 }
 
                 info!("Download worker {} downloading '{}'", worker_id, url);
+                let start_time = Utc::now();
                 let path_result = fetch::zips::download_zip(&client, &url, &zips_dir).await;
 
                 match path_result {
@@ -193,7 +201,14 @@ async fn spawn_download_workers(
                             "Download worker {} successfully downloaded to {:?}",
                             worker_id, path
                         );
-                        if let Err(e) = history.add(&name, State::Downloaded, 1) {
+
+                        if let Err(e) = downloaded.add(&DownloadedRow {
+                            filename: name.clone(),
+                            url: url,
+                            size_bytes: 123,
+                            download_start: start_time,
+                            download_end: Utc::now(),
+                        }) {
                             error!(
                                 "Download worker {}: history.add(state=Downloaded) failed for '{}': {:#}",
                                 worker_id, name, e
@@ -233,19 +248,18 @@ async fn spawn_download_workers(
     }
 }
 
-/// On startup, look at `zips_dir` and send any ZIPs not yet marked as Processed into `processor_tx`.
+/// Look at `zips_dir` and send any ZIPs not yet marked as Processed into `processor_tx`.
 fn enqueue_existing_zips(
     zips_dir: &PathBuf,
-    processor_tx: UnboundedSender<Result<PathBuf, (String, String)>>,
+    processor_tx: &UnboundedSender<Result<PathBuf, (String, String)>>,
 ) -> Result<()> {
-    for entry in fs::read_dir(zips_dir)? {
+    for entry in std::fs::read_dir(zips_dir)? {
         let path = entry?.path();
-        if path.extension() != Some(OsStr::new("zip")) {
+        if path.extension() != Some(std::ffi::OsStr::new("zip")) {
             continue;
         }
         info!("Enqueue existing ZIP for processing: {:?}", path);
-        let send_res = processor_tx.send(Ok(path.clone()));
-        if let Err(err) = send_res {
+        if let Err(err) = processor_tx.send(Ok(path.clone())) {
             warn!(
                 "enqueue_existing_zips: failed to send Ok({:?}) to processor: {}",
                 path, err
@@ -253,6 +267,28 @@ fn enqueue_existing_zips(
         }
     }
     Ok(())
+}
+
+/// Spawn a background task that:
+///  1. Calls enqueue_existing_zips() immediately,
+///  2. Then sleeps for 24 h,
+///  3. And repeats.
+fn spawn_existing_zip_check(
+    zips_dir: PathBuf,
+    processor_tx: UnboundedSender<Result<PathBuf, (String, String)>>,
+) {
+    task::spawn(async move {
+        loop {
+            // 1) run it now
+            info!("doing zip check");
+            if let Err(err) = enqueue_existing_zips(&zips_dir, &processor_tx) {
+                error!("Failed to enqueue zips: {:?}", err);
+            }
+
+            // 2) wait one day before next run
+            time::sleep(Duration::from_secs(24 * 60 * 60)).await;
+        }
+    });
 }
 
 /// Spawn `num_workers` tasks that read from `processor_rx`. Each message is either:
@@ -263,14 +299,14 @@ fn enqueue_existing_zips(
 async fn spawn_processor_workers(
     num_workers: usize,
     processor_rx: Arc<Mutex<mpsc::UnboundedReceiver<Result<PathBuf, (String, String)>>>>,
-    history: Arc<History>,
+    processed: Arc<TableHistory<ProcessedRow>>,
     parquet_dir: PathBuf,
 ) {
     info!("Spawning {} processor workers", num_workers);
 
     for worker_id in 0..num_workers {
         let rx = Arc::clone(&processor_rx);
-        let history = Arc::clone(&history);
+        let processed = Arc::clone(&processed);
         let parquet_dir = parquet_dir.clone();
 
         task::spawn(async move {
@@ -303,7 +339,7 @@ async fn spawn_processor_workers(
                             .to_string();
 
                         // skip if already marked as processed in history
-                        if history.get(&name, &State::Processed) {
+                        if processed.get(name.clone()) {
                             debug!(
                                 "Processor worker {}: '{}' already processed, skipping",
                                 worker_id, name
@@ -316,9 +352,10 @@ async fn spawn_processor_workers(
                         // Run the blocking split on a blocking thread
                         let split_path = zip_path.clone();
                         let out_dir = parquet_dir.clone();
-                        let history_clone = Arc::clone(&history);
+                        let history_clone = Arc::clone(&processed);
 
                         // Spawn blocking work, but catch panics explicitly
+                        let start_processing = Utc::now();
                         let join_handle = task::spawn_blocking(move || {
                             process::split::split_zip_to_parquet(&split_path, &out_dir)
                         });
@@ -345,6 +382,7 @@ async fn spawn_processor_workers(
                                 continue;
                             }
                         };
+                        let end_processing = Utc::now();
 
                         match split_res {
                             Ok(row_count) => {
@@ -352,9 +390,13 @@ async fn spawn_processor_workers(
                                     "Processor worker {}: split succeeded for '{}' ({} rows)",
                                     worker_id, name, row_count
                                 );
-                                if let Err(e) =
-                                    history_clone.add(&name, State::Processed, row_count)
-                                {
+                                if let Err(e) = history_clone.add(&ProcessedRow {
+                                    filename: name.clone(),
+                                    total_rows: row_count,
+                                    size_bytes: -1,
+                                    processing_start: start_processing,
+                                    processing_end: end_processing,
+                                }) {
                                     error!(
                                         "Processor worker {}: history.add(state=Processed) failed for '{}': {:#}",
                                         worker_id, name, e

@@ -1,393 +1,339 @@
-use super::state::State;
 use anyhow::{Context, Result};
 use arrow::{
-    array::{StringArray, TimestampMicrosecondArray},
+    array::{ArrayRef, Int64Array, StringArray, TimestampMicrosecondArray},
     datatypes::{DataType as ArrowDataType, Field, Schema as ArrowSchema, TimeUnit},
     record_batch::RecordBatch,
 };
-use chrono::TimeZone;
-use chrono::{NaiveDate, Utc};
+use chrono::{DateTime, NaiveDate, TimeZone, Utc};
 use glob::glob;
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use parquet::arrow::ArrowWriter;
 use std::{
-    collections::{HashMap, HashSet},
+    collections::HashSet,
     fs::{self, File},
     io::BufWriter,
+    marker::PhantomData,
     path::PathBuf,
     sync::{Arc, Mutex},
     thread,
     time::Duration,
 };
 
-/// `History` manages a directory of per‐row Parquet files and can “vacuum”
-/// them into one consolidated file per (UTC) date & state. Each row now also
-/// carries a `count` field. Internally, we keep `seen` as an `Arc<Mutex<…>>`
-/// so that multiple threads can safely call `add` or `get` at once.
-///
-/// Calling `new(...)` will scan the directory and populate that HashSet from
-/// all existing tiny‐file Parquets, so that `add(...)` won’t re‐insert duplicates.
-pub struct History {
-    history_dir: PathBuf,
-    /// Tracks which `(safe_fname, state, ts_micros)` have already been added.
-    /// Wrapped in `Arc<Mutex<…>>` for thread safety.
-    seen: Arc<Mutex<HashSet<(String, State, i64)>>>,
+/// Trait representing a row in the history table.
+/// - Defines schema, to_arrays, unique_key for writes.
+/// - Provides column indices and a small extractor for dedupe scanning.
+pub trait HistoryRow: Sized {
+    /// Partition date (UTC naive) for hive partitioning
+    fn partition_date(&self) -> NaiveDate;
+    /// Arrow schema for this row type
+    fn schema() -> ArrowSchema;
+    /// Convert this row into column arrays matching the schema
+    fn to_arrays(&self) -> Vec<ArrayRef>;
+    /// Unique dedupe key for this row (used when writing)
+    fn unique_key(&self) -> String;
+    /// Column index for key in schema
+    const KEY_COLUMN: usize;
+    /// Column index for timestamp in schema
+    const TIME_COLUMN: usize;
+    /// Extract unique key from an existing batch row (for scanning)
+    fn extract_key(batch: &RecordBatch, row: usize) -> String {
+        let arr = batch
+            .column(Self::KEY_COLUMN)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("KEY_COLUMN type must be StringArray");
+        let key = arr.value(row);
+        let ts_arr = batch
+            .column(Self::TIME_COLUMN)
+            .as_any()
+            .downcast_ref::<TimestampMicrosecondArray>()
+            .expect("TIME_COLUMN type must be TimestampMicrosecondArray");
+        let ts = ts_arr.value(row);
+        format!("{}--{}", key, ts)
+    }
 }
 
-impl History {
-    /// Create a new `History` pointing at `history_dir`. If the directory does not exist,
-    /// this returns an error. Otherwise, it scans every `*.parquet` file in that directory,
-    /// parses out `(safe_fname, state, ts_micros)`, and populates `self.seen` so that
-    /// subsequent `add(...)` calls won’t re‐insert duplicates.
-    ///
-    /// Note: Accepts `impl Into<PathBuf>` for greater flexibility.
-    pub fn new(history_dir: impl Into<PathBuf>) -> Result<Self> {
-        let history_dir: PathBuf = history_dir.into();
-        if !history_dir.is_dir() {
-            anyhow::bail!(
-                "history_dir `{}` does not exist or is not a directory",
-                history_dir.display()
-            );
-        }
+/// Generic hive-partitioned history table.
+pub struct TableHistory<R: HistoryRow> {
+    base_dir: PathBuf,
+    table: String,
+    schema: Arc<ArrowSchema>,
+    seen: Arc<Mutex<HashSet<String>>>,
+    _marker: PhantomData<R>,
+}
 
-        let mut initial_set = HashSet::new();
-        let pattern = format!("{}/{}", history_dir.display(), "*.parquet");
+impl<R: HistoryRow + Send + Sync + 'static> TableHistory<R> {
+    /// Create, scan existing data into `seen`, and spawn a background vacuum loop.
+    pub fn new(base_dir: impl Into<PathBuf>, table: &str) -> Result<Arc<Self>> {
+        let base_dir = base_dir.into();
+        let table_dir = base_dir.join(table);
+        fs::create_dir_all(&table_dir)
+            .with_context(|| format!("could not create `{}`", table_dir.display()))?;
 
-        for entry in glob(&pattern).context("invalid glob pattern for History::new")? {
-            let path = match entry {
-                Ok(p) => p,
-                Err(e) => {
-                    eprintln!("warning: cannot read glob entry: {:?}", e);
-                    continue;
+        let schema = Arc::new(R::schema());
+        let mut seen_set = HashSet::new();
+
+        // Scan dedupe keys only
+        for part in fs::read_dir(&table_dir)? {
+            let part = part?;
+            if !part.file_type()?.is_dir() {
+                continue;
+            }
+            let part_dir = part.path();
+            for entry in glob(&format!("{}/*.parquet", part_dir.display()))? {
+                let path = entry?;
+                let file = File::open(&path)
+                    .with_context(|| format!("failed to open `{}`", path.display()))?;
+                let mut reader = ParquetRecordBatchReaderBuilder::try_new(file)?
+                    .with_batch_size(1024)
+                    .build()?;
+                while let Some(batch) = reader.next().transpose()? {
+                    for i in 0..batch.num_rows() {
+                        let key = R::extract_key(&batch, i);
+                        seen_set.insert(key);
+                    }
                 }
-            };
-            if !path.is_file() {
-                continue;
             }
-            let file_name = match path.file_name().and_then(|f| f.to_str()) {
-                Some(n) => n,
-                None => continue,
-            };
-
-            // Expect either:
-            // - "<safe_fname>---<State>---<ts>.parquet"
-            // - "<YYYYMMDD>---<State>---consolidated.parquet"
-            let parts: Vec<&str> = file_name.split("---").collect();
-            if parts.len() != 3 {
-                continue;
-            }
-
-            // Parse state
-            let state = match State::from_str(parts[1]) {
-                Some(s) => s,
-                None => continue,
-            };
-
-            if parts[2] == "consolidated.parquet" {
-                // We do not insert consolidated files into `seen` because they are aggregates.
-                continue;
-            }
-
-            // Filename is "<safe_fname>---<State>---<ts>.parquet"
-            if !parts[2].ends_with(".parquet") {
-                continue;
-            }
-            let ts_str = &parts[2][..parts[2].len() - ".parquet".len()];
-            let ts_micros: i64 = match ts_str.parse() {
-                Ok(v) => v,
-                Err(_) => continue,
-            };
-
-            // `safe_fname` is everything before the first '---'
-            let safe_fname = parts[0].to_string();
-            initial_set.insert((safe_fname, state, ts_micros));
         }
 
-        Ok(History {
-            history_dir,
-            seen: Arc::new(Mutex::new(initial_set)),
-        })
+        let tbl = Arc::new(Self {
+            base_dir,
+            table: table.to_string(),
+            schema,
+            seen: Arc::new(Mutex::new(seen_set)),
+            _marker: PhantomData,
+        });
+
+        // spawn vacuum loop: runs every 30s
+        {
+            let tbl_clone = Arc::clone(&tbl);
+            thread::spawn(move || loop {
+                thread::sleep(Duration::from_secs(30));
+                if let Err(e) = tbl_clone.vacuum() {
+                    eprintln!("vacuum error: {:?}", e);
+                }
+            });
+        }
+
+        Ok(tbl)
     }
 
-    /// Append a single event.  
-    /// - `safe_fname`: a unique identifier for this row  
-    /// - `state`: Downloaded or Processed  
-    /// - `count`: the integer count to record in the "count" column  
-    ///  
-    /// The timestamp is taken as `Utc::now()`.  If an entry with the same  
-    /// `(safe_fname, state, ts_micros)` already exists, this is a no‐op.
-    pub fn add(&self, safe_fname: &str, state: State, count: i64) -> Result<()> {
-        // 1) Grab the current UTC timestamp in microseconds:
-        let now_utc = Utc::now();
-        let ts_micros = now_utc.timestamp_micros();
-
-        // 2) Check for duplicates under the mutex. If already seen, skip writing.
+    /// Add a new row of type R
+    pub fn add(&self, row: &R) -> Result<()> {
+        let key = row.unique_key();
         {
-            let mut seen_guard = self.seen.lock().unwrap();
-            if seen_guard.contains(&(safe_fname.to_string(), state, ts_micros)) {
+            let mut seen = self.seen.lock().unwrap();
+            if !seen.insert(key.clone()) {
                 return Ok(());
             }
-            // Mark it as seen immediately so we don’t try again on race.
-            seen_guard.insert((safe_fname.to_string(), state, ts_micros));
         }
 
-        // 3) Build the on-disk filename "<safe_fname>---<State>---<ts>.parquet"
-        let file_name = format!(
-            "{}---{}---{}.parquet",
-            safe_fname,
-            state.as_str(),
-            ts_micros
-        );
-        let final_path = self.history_dir.join(&file_name);
+        let date = row.partition_date();
+        let arrays = row.to_arrays();
+        let partition = format!("date={}", date.format("%Y%m%d"));
+        let dir = self.base_dir.join(&self.table).join(partition);
+        fs::create_dir_all(&dir)?;
 
-        // 4) Build the temporary filename "<safe_fname>---<State>---<ts>.parquet.tmp"
-        let tmp_file_name = format!(
-            "{}---{}---{}.parquet.tmp",
-            safe_fname,
-            state.as_str(),
-            ts_micros
-        );
-        let tmp_path = self.history_dir.join(&tmp_file_name);
+        let ts = Utc::now().timestamp_micros();
+        let fname = format!("{}---{}.parquet", key, ts);
+        let tmp = dir.join(format!("{}.tmp", fname));
+        let final_path = dir.join(&fname);
 
-        // 5) Define an Arrow schema that includes:
-        //    ["file_name":Utf8, "state":Utf8, "event_time":Timestamp(µs), "count":Int64]
-        let schema = Arc::new(ArrowSchema::new(vec![
-            Field::new("file_name", ArrowDataType::Utf8, false),
-            Field::new("state", ArrowDataType::Utf8, false),
+        let file = File::create(&tmp)?;
+        let mut writer = ArrowWriter::try_new(BufWriter::new(file), self.schema.clone(), None)?;
+        let batch = RecordBatch::try_new(self.schema.clone(), arrays)?;
+        writer.write(&batch)?;
+        writer.close()?;
+        fs::rename(&tmp, &final_path)?;
+        Ok(())
+    }
+
+    /// Check if a row exists by its dedupe key
+    pub fn get(&self, key: String) -> bool {
+        let seen = self.seen.lock().unwrap();
+        seen.contains(&key)
+    }
+
+    /// Vacuum each partition into one consolidated file
+    pub fn vacuum(&self) -> Result<()> {
+        let table_dir = self.base_dir.join(&self.table);
+        for part in fs::read_dir(&table_dir)? {
+            let part = part?;
+            if !part.file_type()?.is_dir() {
+                continue;
+            }
+            let dir = part.path();
+
+            let files = glob(&format!("{}/*.parquet", dir.display()))?
+                .filter_map(Result::ok)
+                .collect::<Vec<_>>();
+            if files.is_empty() {
+                continue;
+            }
+
+            let tmp = dir.join("consolidated.parquet.tmp");
+            let cons = dir.join("consolidated.parquet");
+            let file = File::create(&tmp)?;
+            let mut writer = ArrowWriter::try_new(BufWriter::new(file), self.schema.clone(), None)?;
+
+            for p in &files {
+                let f = File::open(p)?;
+                let mut reader = ParquetRecordBatchReaderBuilder::try_new(f)?
+                    .with_batch_size(1024)
+                    .build()?;
+                while let Some(batch) = reader.next().transpose()? {
+                    writer.write(&batch)?;
+                }
+            }
+            writer.close()?;
+            fs::rename(&tmp, &cons)?;
+
+            for p in files {
+                if let Some(name) = p.file_name().and_then(|n| n.to_str()) {
+                    if name != "consolidated.parquet" {
+                        fs::remove_file(p)?;
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+// ------------------------------------------------------------------------------------------------
+// Define row types for `downloaded` and `processed`, implementing HistoryRow
+// ------------------------------------------------------------------------------------------------
+
+pub struct DownloadedRow {
+    pub filename: String,
+    pub url: String,
+    pub size_bytes: i64,
+    pub download_start: DateTime<Utc>,
+    pub download_end: DateTime<Utc>,
+}
+
+impl HistoryRow for DownloadedRow {
+    const KEY_COLUMN: usize = 0;
+    const TIME_COLUMN: usize = 4;
+
+    fn partition_date(&self) -> NaiveDate {
+        // now trivial:
+        self.download_end.date_naive()
+    }
+
+    fn schema() -> ArrowSchema {
+        ArrowSchema::new(vec![
+            Field::new("filename", ArrowDataType::Utf8, false),
+            Field::new("url", ArrowDataType::Utf8, false),
+            Field::new("size_bytes", ArrowDataType::Int64, false),
             Field::new(
-                "event_time",
+                "download_start",
                 ArrowDataType::Timestamp(TimeUnit::Microsecond, None),
                 false,
             ),
-            Field::new("count", ArrowDataType::Int64, false),
-        ]));
+            Field::new(
+                "download_end",
+                ArrowDataType::Timestamp(TimeUnit::Microsecond, None),
+                false,
+            ),
+        ])
+    }
 
-        // 6) Create the Parquet file & ArrowWriter on the .tmp path
-        let tmp_file = File::create(&tmp_path)
-            .with_context(|| format!("could not create temporary file `{}`", tmp_path.display()))?;
-        let buf_writer = BufWriter::new(tmp_file);
-        let mut writer = ArrowWriter::try_new(buf_writer, schema.clone(), None)
-            .context("creating ArrowWriter for tiny Parquet")?;
+    fn to_arrays(&self) -> Vec<ArrayRef> {
+        vec![
+            Arc::new(StringArray::from(vec![self.filename.clone()])),
+            Arc::new(StringArray::from(vec![self.url.clone()])),
+            Arc::new(Int64Array::from(vec![self.size_bytes])),
+            Arc::new(TimestampMicrosecondArray::from(vec![self
+                .download_start
+                .timestamp_micros()])),
+            Arc::new(TimestampMicrosecondArray::from(vec![self
+                .download_end
+                .timestamp_micros()])),
+        ]
+    }
 
-        // 7) Build each column array (single-row):
-        let file_name_array = StringArray::from(vec![file_name.clone()]);
-        let state_array = StringArray::from(vec![state.as_str().to_string()]);
-        let event_time_array = TimestampMicrosecondArray::from(vec![ts_micros]);
-        let count_array = arrow::array::Int64Array::from(vec![count]);
-
-        // 8) Package into a RecordBatch
-        let batch = RecordBatch::try_new(
-            schema.clone(),
-            vec![
-                Arc::new(file_name_array),
-                Arc::new(state_array),
-                Arc::new(event_time_array),
-                Arc::new(count_array),
-            ],
+    fn unique_key(&self) -> String {
+        format!(
+            "{}--{}",
+            self.filename,
+            self.download_end.timestamp_micros()
         )
-        .context("building RecordBatch for tiny Parquet")?;
-
-        // 9) Write out and close
-        writer
-            .write(&batch)
-            .context("writing batch to tiny Parquet")?;
-        writer
-            .close()
-            .context("closing ArrowWriter for tiny Parquet")?;
-
-        // 10) Rename the .tmp file to its final .parquet filename
-        fs::rename(&tmp_path, &final_path).with_context(|| {
-            format!(
-                "failed to rename `{}` to `{}`",
-                tmp_path.display(),
-                final_path.display()
-            )
-        })?;
-
-        Ok(())
-    }
-
-    /// Returns `true` if `(file_name, state)` is already in the history.
-    pub fn get(&self, file_name: &str, state: &State) -> bool {
-        let guard = self.seen.lock().unwrap();
-        guard
-            .iter()
-            .any(|(fname, st, _)| fname == file_name && st == state)
-    }
-
-    /// “Vacuum” the entire `history_dir` by grouping every "*.parquet" file
-    /// (both tiny per‐row files _and_ any existing “consolidated” files) into
-    /// one output per (UTC‐date, state). After successfully writing the new
-    /// consolidated file, delete only the old tiny files (leave any old
-    /// consolidated files alone).
-    fn vacuum(&self) -> Result<()> {
-        // 1) Scan for all "*.parquet" in history_dir and group by (date, state).
-        let mut buckets: HashMap<(NaiveDate, State), Vec<PathBuf>> = HashMap::new();
-        let pattern = format!("{}/{}", self.history_dir.display(), "*.parquet");
-        for entry in glob(&pattern).context("invalid glob pattern for vacuum")? {
-            let path = match entry {
-                Ok(p) => p,
-                Err(e) => {
-                    eprintln!("warning: cannot read glob entry: {:?}", e);
-                    continue;
-                }
-            };
-            if !path.is_file() {
-                continue;
-            }
-
-            let file_name = match path.file_name().and_then(|f| f.to_str()) {
-                Some(n) => n,
-                None => continue,
-            };
-            let parts: Vec<&str> = file_name.split("---").collect();
-            if parts.len() != 3 {
-                // Not our expected naming convention
-                continue;
-            }
-
-            // Parse state
-            let state = match State::from_str(parts[1]) {
-                Some(s) => s,
-                None => continue,
-            };
-
-            // Determine the UTC‐date bucket key
-            let date = if parts[2] == "consolidated.parquet" {
-                // Filename was "<YYYYMMDD>---<State>---consolidated.parquet"
-                match NaiveDate::parse_from_str(parts[0], "%Y%m%d") {
-                    Ok(d) => d,
-                    Err(_) => continue,
-                }
-            } else if parts[2].ends_with(".parquet") {
-                // Filename was "<safe_fname>---<State>---<ts>.parquet"
-                let ts_str = &parts[2][..parts[2].len() - ".parquet".len()];
-                let ts_micros: i64 = match ts_str.parse() {
-                    Ok(v) => v,
-                    Err(_) => continue,
-                };
-                let seconds = ts_micros / 1_000_000;
-                let nanoseconds = ((ts_micros % 1_000_000) * 1_000) as u32;
-                let dt_utc = Utc
-                    .timestamp_opt(seconds, nanoseconds)
-                    .single()
-                    .expect("invalid timestamp");
-                dt_utc.date_naive()
-            } else {
-                continue;
-            };
-
-            buckets.entry((date, state)).or_default().push(path.clone());
-        }
-
-        // 2) For each bucket (date, state), merge everything into one consolidated file.
-        for ((date, state), paths) in &buckets {
-            if paths.is_empty() {
-                continue;
-            }
-
-            let date_str = date.format("%Y%m%d").to_string();
-            let consolidated_name =
-                format!("{}---{}---consolidated.parquet", date_str, state.as_str());
-            let consolidated_tmp = format!(
-                "{}---{}---consolidated.parquet.tmp",
-                date_str,
-                state.as_str()
-            );
-            let consolidated_path = self.history_dir.join(&consolidated_name);
-            let tmp_path = self.history_dir.join(&consolidated_tmp);
-
-            // Schema now includes a real timestamp type
-            let arrow_schema = Arc::new(ArrowSchema::new(vec![
-                Field::new("file_name", ArrowDataType::Utf8, false),
-                Field::new("state", ArrowDataType::Utf8, false),
-                Field::new(
-                    "event_time",
-                    ArrowDataType::Timestamp(TimeUnit::Microsecond, None),
-                    false,
-                ),
-                Field::new("count", ArrowDataType::Int64, false),
-            ]));
-
-            // (a) Create ArrowWriter targeting tmp_path
-            let tmp_file = File::create(&tmp_path)
-                .with_context(|| format!("could not create `{}`", tmp_path.display()))?;
-            let buf_writer = BufWriter::new(tmp_file);
-            let mut writer = ArrowWriter::try_new(buf_writer, arrow_schema.clone(), None)
-                .context("creating ArrowWriter for consolidated Parquet")?;
-
-            // (b) Read each file in `paths`, except the old consolidated (skip that), and dump its batches into the new writer.
-            for p in paths.iter() {
-                let file =
-                    File::open(p).with_context(|| format!("failed to open `{}`", p.display()))?;
-                let builder =
-                    ParquetRecordBatchReaderBuilder::try_new(file).with_context(|| {
-                        format!(
-                            "failed to create RecordBatchReaderBuilder for `{}`",
-                            p.display()
-                        )
-                    })?;
-                let mut batch_reader =
-                    builder.with_batch_size(1024).build().with_context(|| {
-                        format!("failed to build RecordBatchReader for `{}`", p.display())
-                    })?;
-
-                while let Some(batch) = batch_reader
-                    .next()
-                    .transpose()
-                    .with_context(|| format!("error reading RecordBatch from `{}`", p.display()))?
-                {
-                    writer.write(&batch).with_context(|| {
-                        format!("writing batch from `{}` to consolidated file", p.display())
-                    })?;
-                }
-            }
-
-            // (c) Close & finalize the new consolidated Parquet
-            writer
-                .close()
-                .context("closing ArrowWriter for consolidated Parquet")?;
-
-            // (d) Rename tmp → final
-            fs::rename(&tmp_path, &consolidated_path).with_context(|| {
-                format!(
-                    "renaming `{}` → `{}`",
-                    tmp_path.display(),
-                    consolidated_path.display()
-                )
-            })?;
-
-            // (e) Delete all tiny files in this bucket (skip the old consolidated)
-            for p in paths.iter() {
-                if let Some(fname) = p.file_name().and_then(|f| f.to_str()) {
-                    if fname == consolidated_name {
-                        continue;
-                    }
-                }
-                fs::remove_file(p)
-                    .with_context(|| format!("failed to delete file `{}`", p.display()))?;
-            }
-        }
-
-        Ok(())
-    }
-
-    /// Start a background thread that calls `self.vacuum()` every 30 seconds.
-    ///
-    /// You must call this with an `Arc<History>`. The returned `JoinHandle`
-    /// can be discarded if you never need to `join()` on it, or you can
-    /// keep it around if you want to shut it down cleanly later.
-    pub fn spawn_vacuum_loop(self: Arc<Self>) -> thread::JoinHandle<()> {
-        thread::spawn(move || {
-            loop {
-                // Sleep for 30 seconds between vacuums
-                thread::sleep(Duration::from_secs(30));
-
-                // Call vacuum(); report any errors but keep looping
-                if let Err(err) = self.vacuum() {
-                    eprintln!("History::vacuum() failed: {:?}", err);
-                }
-            }
-        })
     }
 }
+
+// And similarly for your ProcessedRow:
+
+pub struct ProcessedRow {
+    pub filename: String,
+    pub total_rows: i64,
+    pub size_bytes: i64,
+    pub processing_start: DateTime<Utc>,
+    pub processing_end: DateTime<Utc>,
+}
+
+impl HistoryRow for ProcessedRow {
+    const KEY_COLUMN: usize = 0;
+    const TIME_COLUMN: usize = 4;
+
+    fn partition_date(&self) -> NaiveDate {
+        self.processing_end.date_naive()
+    }
+
+    fn schema() -> ArrowSchema {
+        ArrowSchema::new(vec![
+            Field::new("filename", ArrowDataType::Utf8, false),
+            Field::new("total_rows", ArrowDataType::Int64, false),
+            Field::new("size_bytes", ArrowDataType::Int64, false),
+            Field::new(
+                "processing_start",
+                ArrowDataType::Timestamp(TimeUnit::Microsecond, None),
+                false,
+            ),
+            Field::new(
+                "processing_end",
+                ArrowDataType::Timestamp(TimeUnit::Microsecond, None),
+                false,
+            ),
+        ])
+    }
+
+    fn to_arrays(&self) -> Vec<ArrayRef> {
+        vec![
+            Arc::new(StringArray::from(vec![self.filename.clone()])),
+            Arc::new(Int64Array::from(vec![self.total_rows])),
+            Arc::new(Int64Array::from(vec![self.size_bytes])),
+            Arc::new(TimestampMicrosecondArray::from(vec![self
+                .processing_start
+                .timestamp_micros()])),
+            Arc::new(TimestampMicrosecondArray::from(vec![self
+                .processing_end
+                .timestamp_micros()])),
+        ]
+    }
+
+    fn unique_key(&self) -> String {
+        format!(
+            "{}--{}",
+            self.filename,
+            self.processing_end.timestamp_micros()
+        )
+    }
+}
+
+impl TableHistory<DownloadedRow> {
+    pub fn new_downloaded(base: impl Into<PathBuf>) -> Result<Arc<Self>> {
+        TableHistory::new(base, "downloaded")
+    }
+}
+impl TableHistory<ProcessedRow> {
+    pub fn new_processed(base: impl Into<PathBuf>) -> Result<Arc<Self>> {
+        TableHistory::new(base, "processed")
+    }
+}
+
+// Usage example:
+// let downloaded = TableHistory::<DownloadedRow>::new_downloaded("./history_dir")?;
+// let processed  = TableHistory::<ProcessedRow>::new_processed("./history_dir")?;
+// downloaded.add(&DownloadedRow { filename: "file.csv".into(), url: "http://...".into(), size_bytes: 123, download_start: Utc::now().timestamp_micros(), download_end: Utc::now().timestamp_micros() })?;
+// processed.add(&ProcessedRow { filename: "file.csv".into(), total_rows: 100, size_bytes: 456, processing_start: Utc::now().timestamp_micros(), processing_end: Utc::now().timestamp_micros() })?;
