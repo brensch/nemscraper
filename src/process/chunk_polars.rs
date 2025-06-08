@@ -8,7 +8,6 @@ use parquet::arrow::ArrowWriter;
 use parquet::basic::BrotliLevel;
 use parquet::basic::Compression;
 use parquet::file::properties::WriterProperties;
-use std::error::Error;
 use std::fs;
 use std::fs::File;
 use std::io::Seek;

@@ -1,22 +1,12 @@
-use anyhow::{Context, Result};
+use anyhow::Result;
 use arrow::{
-    array::{ArrayRef, Int64Array, StringArray, TimestampMicrosecondArray, UInt64Array},
+    array::{ArrayRef, StringArray, TimestampMicrosecondArray, UInt64Array},
     datatypes::{DataType as ArrowDataType, Field, Schema as ArrowSchema, TimeUnit},
-    record_batch::RecordBatch,
 };
 use chrono::{DateTime, NaiveDate, TimeZone, Utc};
-use glob::glob;
-use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
-use parquet::arrow::ArrowWriter;
 use std::{
-    collections::HashSet,
-    fs::{self, File},
-    io::BufWriter,
-    marker::PhantomData,
     path::PathBuf,
-    sync::{Arc, Mutex},
-    thread,
-    time::Duration,
+    sync::Arc,
 };
 
 use crate::history::table_history::{HistoryRow, TableHistory};

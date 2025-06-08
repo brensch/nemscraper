@@ -1,6 +1,5 @@
 use anyhow::{anyhow, Result};
 use std::path::Path;
-use tracing::error;
 
 use super::chunk_polars::csv_to_parquet;
 

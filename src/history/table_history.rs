@@ -1,10 +1,10 @@
 use anyhow::{Context, Result};
 use arrow::{
-    array::{ArrayRef, StringArray, TimestampMicrosecondArray, UInt64Array},
-    datatypes::{DataType as ArrowDataType, Field, Schema as ArrowSchema, TimeUnit},
+    array::{ArrayRef, StringArray},
+    datatypes::Schema as ArrowSchema,
     record_batch::RecordBatch,
 };
-use chrono::{DateTime, NaiveDate, Utc};
+use chrono::{NaiveDate, Utc};
 use glob::glob;
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use parquet::arrow::ArrowWriter;
