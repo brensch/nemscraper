@@ -14,7 +14,7 @@ use std::io::Seek;
 use std::io::{BufRead, BufReader, Cursor};
 use std::path::Path;
 use std::sync::Arc;
-use tracing::{debug, info, warn};
+use tracing::{debug, warn};
 
 /// 1) Trim whitespace + strip outer quotes if present.
 fn clean_str(raw: &str) -> String {
