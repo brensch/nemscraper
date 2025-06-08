@@ -1,11 +1,9 @@
 use anyhow::Result;
 use chrono::Utc;
-use history::state::State;
-use history::store::TableHistory;
+
 use nemscraper::{
     fetch::{self, urls::spawn_fetch_zip_urls},
-    history::store::HistoryRow,
-    process,
+    process::{self, split::RowsAndBytes},
 };
 use reqwest::Client;
 use std::time::Duration;
@@ -21,7 +19,9 @@ use tokio::{
 use tracing::{debug, error, info, warn};
 use tracing_subscriber::{fmt, EnvFilter};
 
-use crate::history::store::{DownloadedRow, ProcessedRow};
+use crate::history::{
+    downloaded::DownloadedRow, processed::ProcessedRow, table_history::TableHistory,
+};
 
 mod history;
 mod utils;
@@ -51,7 +51,11 @@ async fn main() -> Result<()> {
     // 3) history & lookup store
     // let history = Arc::new(History::new(history_dir)?);
     let downloaded = TableHistory::<DownloadedRow>::new_downloaded(history_dir.clone())?;
+    downloaded.vacuum().unwrap();
+    downloaded.start_vacuum_loop();
     let processed = TableHistory::<ProcessedRow>::new_processed(history_dir.clone())?;
+    processed.vacuum().unwrap();
+    processed.start_vacuum_loop();
     info!("Spawned history vacuum loop");
 
     // 4) channels
@@ -68,7 +72,7 @@ async fn main() -> Result<()> {
 
     // 5) spawn download workers
     spawn_download_workers(
-        2,
+        3,
         client.clone(),
         zips_dir.clone(),
         processor_tx.clone(),
@@ -85,9 +89,9 @@ async fn main() -> Result<()> {
         zips_dir
     );
 
-    // // 7) spawn URL fetcher
-    // spawn_fetch_zip_urls(client.clone(), url_tx.clone());
-    // info!("Spawned URL fetcher task (spawn_fetch_zip_urls)");
+    // 7) spawn URL fetcher
+    spawn_fetch_zip_urls(client.clone(), url_tx.clone());
+    info!("Spawned URL fetcher task (spawn_fetch_zip_urls)");
 
     // 8) spawn processor workers
     let num_cores = std::thread::available_parallelism()
@@ -177,21 +181,24 @@ async fn spawn_download_workers(
                     .to_string_lossy()
                     .to_string();
 
-                debug!(
+                info!(
                     "Download worker {} received URL='{}', derived name='{}'",
                     worker_id, url, name
                 );
 
                 // 3) skip if already downloaded or processed
                 if downloaded.get(name.clone()) {
-                    debug!(
+                    info!(
                         "Download worker {}: already in history (downloaded), skipping URL='{}'",
-                        worker_id, url
+                        worker_id, name
                     );
                     continue;
                 }
 
-                info!("Download worker {} downloading '{}'", worker_id, url);
+                info!(
+                    "Download worker {} downloading '{}' {}",
+                    worker_id, url, name
+                );
                 let start_time = Utc::now();
                 let path_result = fetch::zips::download_zip(&client, &url, &zips_dir).await;
 
@@ -214,7 +221,7 @@ async fn spawn_download_workers(
                                 worker_id, name, e
                             );
                         } else {
-                            debug!(
+                            info!(
                                 "Download worker {}: recorded Downloaded for '{}'",
                                 worker_id, name
                             );
@@ -340,7 +347,7 @@ async fn spawn_processor_workers(
 
                         // skip if already marked as processed in history
                         if processed.get(name.clone()) {
-                            debug!(
+                            info!(
                                 "Processor worker {}: '{}' already processed, skipping",
                                 worker_id, name
                             );
@@ -365,7 +372,7 @@ async fn spawn_processor_workers(
                             worker_id, name
                         );
 
-                        let split_res: Result<i64> = match join_handle.await {
+                        let split_res: Result<RowsAndBytes> = match join_handle.await {
                             Ok(inner_res) => {
                                 debug!(
                                     "Processor worker {}: split_block returned for '{}'",
@@ -385,15 +392,15 @@ async fn spawn_processor_workers(
                         let end_processing = Utc::now();
 
                         match split_res {
-                            Ok(row_count) => {
+                            Ok(rows_and_bytes) => {
                                 info!(
                                     "Processor worker {}: split succeeded for '{}' ({} rows)",
-                                    worker_id, name, row_count
+                                    worker_id, name, rows_and_bytes.rows
                                 );
                                 if let Err(e) = history_clone.add(&ProcessedRow {
                                     filename: name.clone(),
-                                    total_rows: row_count,
-                                    size_bytes: -1,
+                                    total_rows: rows_and_bytes.rows,
+                                    size_bytes: rows_and_bytes.bytes,
                                     processing_start: start_processing,
                                     processing_end: end_processing,
                                 }) {
@@ -404,7 +411,7 @@ async fn spawn_processor_workers(
                                     // Continue rather than return, so this worker stays alive
                                     continue;
                                 }
-                                debug!(
+                                info!(
                                     "Processor worker {}: recorded Processed for '{}'",
                                     worker_id, name
                                 );

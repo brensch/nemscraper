@@ -7,45 +7,58 @@ use zip::ZipArchive;
 
 use super::csv_batch_processor::CsvBatchProcessor;
 
+/// A simple accumulator for rows and bytes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RowsAndBytes {
+    pub rows: u64,
+    pub bytes: u64,
+}
+
+impl RowsAndBytes {
+    pub const ZERO: Self = RowsAndBytes { rows: 0, bytes: 0 };
+
+    /// Add another RowsAndBytes into `self`, saturating on overflow.
+    pub fn add(&mut self, other: RowsAndBytes) {
+        self.rows = self.rows.saturating_add(other.rows);
+        self.bytes = self.bytes.saturating_add(other.bytes);
+    }
+}
+
 /// Splits each CSV inside the ZIP into ~100 MiB chunks, breaking on every `I,` line
 /// (new schema), and returns total rows processed.
 #[instrument(level = "debug", skip(zip_path, out_dir), fields(zip = %zip_path.as_ref().display()))]
 pub fn split_zip_to_parquet<P: AsRef<Path>, Q: AsRef<Path>>(
     zip_path: P,
     out_dir: Q,
-) -> Result<i64> {
+) -> Result<RowsAndBytes> {
     const MAX_BATCH_BYTES: usize = 100 * 1024 * 1024; // 100 MiB
 
-    debug!("Opening ZIP file: {}", zip_path.as_ref().display());
     let file = File::open(&zip_path).with_context(|| format!("opening {:?}", zip_path.as_ref()))?;
     let mut archive = ZipArchive::new(file).context("constructing ZipArchive from File")?;
-    let total_entries = archive.len();
 
-    let mut total_rows: i64 = 0;
+    let mut totals = RowsAndBytes::ZERO;
 
-    for idx in 0..total_entries {
+    for idx in 0..archive.len() {
         let entry = archive.by_index(idx)?;
-        let file_name = entry.name().to_string();
+        let name = entry.name().to_string();
 
-        // Skip anything that isn’t a .csv
-        if !file_name.to_lowercase().ends_with(".csv") {
-            debug!("Skipping non-CSV entry: {}", file_name);
+        if !name.to_lowercase().ends_with(".csv") {
             continue;
         }
-        debug!("Processing CSV entry: {}", file_name);
 
-        // Wrap entry in BufReader to read line by line
         let reader = BufReader::new(entry);
-        let rows_in_this =
-            process_csv_entry(reader, &file_name, out_dir.as_ref(), MAX_BATCH_BYTES)?;
-        total_rows += rows_in_this;
+        // process_csv_entry now returns RowsAndBytes
+        let entry_counts = process_csv_entry(reader, &name, out_dir.as_ref(), MAX_BATCH_BYTES)
+            .with_context(|| format!("processing CSV entry {}", name))?;
+
+        totals.add(entry_counts);
     }
 
     debug!(
-        "Completed processing all entries in ZIP; total rows = {}",
-        total_rows
+        "Completed ZIP: total rows = {}, total bytes = {}",
+        totals.rows, totals.bytes
     );
-    Ok(total_rows)
+    Ok(totals)
 }
 
 /// Process a single CSV entry (streaming from `reader`), skipping its top `C` header,
@@ -55,7 +68,7 @@ fn process_csv_entry<R: BufRead>(
     file_name: &str,
     out_dir: &Path,
     max_batch_bytes: usize,
-) -> Result<i64> {
+) -> Result<RowsAndBytes> {
     // 1) Skip the very first “C” line (metadata header). If missing, warn and proceed.
     skip_top_c_header(&mut reader, file_name);
 
@@ -83,8 +96,11 @@ fn process_csv_entry<R: BufRead>(
     }
 
     // 4) Flush any remaining batch at EOF.
+
     batcher.flush_final(file_name, out_dir)?;
-    Ok(batcher.row_count())
+    let rows = batcher.row_count();
+    let bytes = batcher.parquet_bytes();
+    Ok(RowsAndBytes { rows, bytes })
 }
 
 /// Try to read exactly one line and check if it starts with a “C”. If not, warn and continue.

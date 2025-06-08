@@ -1,3 +1,4 @@
+use anyhow::{anyhow, Context, Result};
 use arrow::array::*;
 use arrow::csv::ReaderBuilder;
 use arrow::datatypes::*;
@@ -46,7 +47,7 @@ struct SchemaInfo {
 /// 4) Parse CSV header and create initial string schema
 fn parse_header_and_create_string_schema(
     data: &str,
-) -> Result<(Vec<String>, Schema), Box<dyn Error>> {
+) -> Result<(Vec<String>, Schema), anyhow::Error> {
     let cursor = Cursor::new(data.as_bytes());
     let mut reader = BufReader::new(cursor);
     let mut header_line = String::new();
@@ -68,7 +69,7 @@ fn parse_header_and_create_string_schema(
 fn analyze_batch_for_schema(
     batch: &RecordBatch,
     headers: &[String],
-) -> Result<SchemaInfo, Box<dyn Error>> {
+) -> Result<SchemaInfo, anyhow::Error> {
     let mut final_fields = Vec::new();
     let mut date_columns = Vec::new();
     let mut trim_columns = Vec::new();
@@ -143,7 +144,7 @@ fn analyze_batch_for_schema(
 fn apply_trimming(
     batch: &RecordBatch,
     trim_columns: &[String],
-) -> Result<RecordBatch, Box<dyn Error>> {
+) -> Result<RecordBatch, anyhow::Error> {
     if trim_columns.is_empty() {
         return Ok(batch.clone());
     }
@@ -176,7 +177,7 @@ fn apply_trimming(
 fn convert_to_final_types(
     batch: &RecordBatch,
     schema_info: &SchemaInfo,
-) -> Result<RecordBatch, Box<dyn Error>> {
+) -> Result<RecordBatch, anyhow::Error> {
     let mut new_fields = Vec::new();
     let mut new_columns = Vec::new();
 
@@ -304,37 +305,42 @@ fn extract_date_from_filename(filename: &str) -> Option<String> {
 
 /// 9) Main CSV→Parquet conversion using Arrow (memory efficient, single pass).
 /// Returns the exact number of bytes written into the Parquet file.
-pub fn csv_to_parquet(file_name: &str, data: &str, out_dir: &Path) -> Result<u64, Box<dyn Error>> {
+pub fn csv_to_parquet(file_name: &str, data: &str, out_dir: &Path) -> Result<u64> {
     debug!("Starting Arrow-based CSV to Parquet conversion");
 
     // Step A: Parse header and create initial string schema
-    let (headers, string_schema) = parse_header_and_create_string_schema(data)?;
+    let (headers, string_schema) =
+        parse_header_and_create_string_schema(data).context("parsing CSV header")?;
     debug!("Headers: {:?}", headers);
 
     // Step B: Read first batch with string schema to analyze
     let mut cursor = Cursor::new(data.as_bytes());
-    let mut reader = ReaderBuilder::new(Arc::new(string_schema.clone()))
+    let mut schema_reader = ReaderBuilder::new(Arc::new(string_schema.clone()))
         .with_header(true)
         .with_batch_size(1_000)
-        .build(&mut cursor)?;
-    let first_batch = reader.next().ok_or("No data found in CSV")??;
-    let schema_info = analyze_batch_for_schema(&first_batch, &headers)?;
+        .build(&mut cursor)
+        .context("creating CSV reader for schema inference")?;
+    let first_batch = schema_reader
+        .next()
+        .ok_or_else(|| anyhow!("No data found in CSV"))??;
+    let schema_info = analyze_batch_for_schema(&first_batch, &headers)
+        .context("analyzing schema from first batch")?;
     debug!("Final schema: {:?}", schema_info.schema);
     debug!("Table name: {}", schema_info.table_name);
 
     // Step C: Setup output directory and partition
     let partition_date = extract_date_from_filename(file_name).unwrap_or_else(|| {
         warn!(
-            "No date found in filename '{}', using default partition",
+            "No date found in filename '{}'; using default partition",
             file_name
         );
         "unknown-date".to_string()
     });
 
     let table_dir = out_dir.join(&schema_info.table_name);
-    fs::create_dir_all(&table_dir)?;
+    fs::create_dir_all(&table_dir).context("creating table directory")?;
     let partition_dir = table_dir.join(format!("date={}", partition_date));
-    fs::create_dir_all(&partition_dir)?;
+    fs::create_dir_all(&partition_dir).context("creating partition directory")?;
 
     // Step D: Setup Parquet writer with final schema
     let final_name = format!("{}.parquet", file_name);
@@ -342,18 +348,19 @@ pub fn csv_to_parquet(file_name: &str, data: &str, out_dir: &Path) -> Result<u64
     let final_path = partition_dir.join(&final_name);
     let tmp_path = partition_dir.join(&tmp_name);
 
-    // Open one file handle, clone it for the writer, so we can read back the final position:
-    let mut tmp_file = File::create(&tmp_path)?;
-    let writer_file = tmp_file.try_clone()?;
+    let mut tmp_file = File::create(&tmp_path).context("creating temporary Parquet file")?;
+    let writer_file = tmp_file
+        .try_clone()
+        .context("cloning file handle for Parquet writer")?;
     let props = WriterProperties::builder()
         .set_compression(Compression::BROTLI(BrotliLevel::try_new(5)?))
         .build();
-
     let mut writer = ArrowWriter::try_new(
         writer_file,
         Arc::new(schema_info.schema.clone()),
         Some(props),
-    )?;
+    )
+    .context("initializing Parquet writer")?;
 
     // Step E: Re-read full CSV and write each batch
     let mut cursor = Cursor::new(data.as_bytes());
@@ -364,26 +371,33 @@ pub fn csv_to_parquet(file_name: &str, data: &str, out_dir: &Path) -> Result<u64
             .collect();
         Schema::new(fields)
     };
-    let mut csv_reader = ReaderBuilder::new(Arc::new(string_schema_for_reading))
+    let csv_reader = ReaderBuilder::new(Arc::new(string_schema_for_reading))
         .with_header(true)
         .with_batch_size(8_192)
-        .build(&mut cursor)?;
+        .build(&mut cursor)
+        .context("creating CSV reader for data conversion")?;
 
     for batch_result in csv_reader {
-        let batch = batch_result?;
-        let trimmed = apply_trimming(&batch, &schema_info.trim_columns)?;
-        let final_batch = convert_to_final_types(&trimmed, &schema_info)?;
-        writer.write(&final_batch)?;
+        let batch = batch_result.context("reading CSV batch")?;
+        let trimmed = apply_trimming(&batch, &schema_info.trim_columns)
+            .context("applying trimming to batch")?;
+        let final_batch = convert_to_final_types(&trimmed, &schema_info)
+            .context("converting batch to final types")?;
+        writer
+            .write(&final_batch)
+            .context("writing batch to Parquet")?;
     }
 
     // Finish writing (flush metadata etc.)
-    writer.close()?;
+    writer.close().context("closing Parquet writer")?;
 
-    // Now get the total number of bytes actually written:
-    let parquet_bytes = tmp_file.stream_position()?;
+    // Capture byte-count without any extra filesystem walk
+    let parquet_bytes = tmp_file
+        .stream_position()
+        .context("getting Parquet file stream position")?;
 
     // Atomically rename into place
-    fs::rename(&tmp_path, &final_path)?;
+    fs::rename(&tmp_path, &final_path).context("renaming Parquet file into place")?;
 
     info!(
         "Wrote {} bytes of Parquet to {}",

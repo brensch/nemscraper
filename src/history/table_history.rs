@@ -1,10 +1,10 @@
 use anyhow::{Context, Result};
 use arrow::{
-    array::{ArrayRef, Int64Array, StringArray, TimestampMicrosecondArray},
+    array::{ArrayRef, StringArray, TimestampMicrosecondArray, UInt64Array},
     datatypes::{DataType as ArrowDataType, Field, Schema as ArrowSchema, TimeUnit},
     record_batch::RecordBatch,
 };
-use chrono::{DateTime, NaiveDate, TimeZone, Utc};
+use chrono::{DateTime, NaiveDate, Utc};
 use glob::glob;
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use parquet::arrow::ArrowWriter;
@@ -41,13 +41,13 @@ pub trait HistoryRow: Sized {
             .column(Self::KEY_COLUMN)
             .as_any()
             .downcast_ref::<StringArray>()
-            .expect("KEY_COLUMN type must be StringArray");
+            .expect("KEY_COLUMN must be StringArray");
         let key = arr.value(row);
         let ts_arr = batch
             .column(Self::TIME_COLUMN)
             .as_any()
             .downcast_ref::<TimestampMicrosecondArray>()
-            .expect("TIME_COLUMN type must be TimestampMicrosecondArray");
+            .expect("TIME_COLUMN must be TimestampMicrosecondArray");
         let ts = ts_arr.value(row);
         format!("{}--{}", key, ts)
     }
@@ -63,7 +63,7 @@ pub struct TableHistory<R: HistoryRow> {
 }
 
 impl<R: HistoryRow + Send + Sync + 'static> TableHistory<R> {
-    /// Create, scan existing data into `seen`, and spawn a background vacuum loop.
+    /// Create and scan existing data into `seen`. Does *not* start vacuum loop.
     pub fn new(base_dir: impl Into<PathBuf>, table: &str) -> Result<Arc<Self>> {
         let base_dir = base_dir.into();
         let table_dir = base_dir.join(table);
@@ -96,26 +96,24 @@ impl<R: HistoryRow + Send + Sync + 'static> TableHistory<R> {
             }
         }
 
-        let tbl = Arc::new(Self {
+        Ok(Arc::new(Self {
             base_dir,
             table: table.to_string(),
             schema,
             seen: Arc::new(Mutex::new(seen_set)),
             _marker: PhantomData,
+        }))
+    }
+
+    /// Spawn a background vacuum loop (every 30s).
+    pub fn start_vacuum_loop(self: &Arc<Self>) {
+        let tbl_clone = Arc::clone(self);
+        thread::spawn(move || loop {
+            thread::sleep(Duration::from_secs(30));
+            if let Err(e) = tbl_clone.vacuum() {
+                eprintln!("vacuum error: {:?}", e);
+            }
         });
-
-        // spawn vacuum loop: runs every 30s
-        {
-            let tbl_clone = Arc::clone(&tbl);
-            thread::spawn(move || loop {
-                thread::sleep(Duration::from_secs(30));
-                if let Err(e) = tbl_clone.vacuum() {
-                    eprintln!("vacuum error: {:?}", e);
-                }
-            });
-        }
-
-        Ok(tbl)
     }
 
     /// Add a new row of type R
@@ -172,7 +170,6 @@ impl<R: HistoryRow + Send + Sync + 'static> TableHistory<R> {
             }
 
             let tmp = dir.join("consolidated.parquet.tmp");
-            let cons = dir.join("consolidated.parquet");
             let file = File::create(&tmp)?;
             let mut writer = ArrowWriter::try_new(BufWriter::new(file), self.schema.clone(), None)?;
 
@@ -186,6 +183,7 @@ impl<R: HistoryRow + Send + Sync + 'static> TableHistory<R> {
                 }
             }
             writer.close()?;
+            let cons = dir.join("consolidated.parquet");
             fs::rename(&tmp, &cons)?;
 
             for p in files {
@@ -200,140 +198,150 @@ impl<R: HistoryRow + Send + Sync + 'static> TableHistory<R> {
     }
 }
 
-// ------------------------------------------------------------------------------------------------
-// Define row types for `downloaded` and `processed`, implementing HistoryRow
-// ------------------------------------------------------------------------------------------------
+// ----- Tests -----
+#[cfg(test)]
+mod tests {
+    use crate::history::processed::ProcessedRow;
 
-pub struct DownloadedRow {
-    pub filename: String,
-    pub url: String,
-    pub size_bytes: i64,
-    pub download_start: DateTime<Utc>,
-    pub download_end: DateTime<Utc>,
+    use super::*;
+    use chrono::{Duration, Utc};
+    use glob::glob;
+    use tempfile::tempdir;
+
+    #[test]
+    fn test_add_and_get() {
+        let tmp = tempdir().unwrap();
+        let hist = TableHistory::<ProcessedRow>::new_processed(tmp.path()).unwrap();
+        hist.start_vacuum_loop();
+
+        let now = Utc::now();
+        let row = ProcessedRow {
+            filename: "file1.csv".to_string(),
+            total_rows: 10,
+            size_bytes: 100,
+            processing_start: now,
+            processing_end: now,
+        };
+
+        assert!(!hist.get(row.unique_key()));
+        hist.add(&row).unwrap();
+        assert!(hist.get(row.unique_key()));
+
+        let date_str = now.date_naive().format("%Y%m%d").to_string();
+        let part_dir = tmp
+            .path()
+            .join("processed")
+            .join(format!("date={}", date_str));
+        let files: Vec<_> = glob(&format!("{}/*.parquet", part_dir.display()))
+            .unwrap()
+            .filter_map(Result::ok)
+            .collect();
+        assert_eq!(files.len(), 1);
+    }
+
+    #[test]
+    fn test_deduplication() {
+        let tmp = tempdir().unwrap();
+        let hist = TableHistory::<ProcessedRow>::new_processed(tmp.path()).unwrap();
+        hist.start_vacuum_loop();
+
+        let now = Utc::now();
+        let row = ProcessedRow {
+            filename: "file2.csv".to_string(),
+            total_rows: 20,
+            size_bytes: 200,
+            processing_start: now,
+            processing_end: now,
+        };
+
+        hist.add(&row).unwrap();
+        let date_str = now.date_naive().format("%Y%m%d").to_string();
+        let pattern = format!(
+            "{}/processed/date={}/**/*.parquet",
+            tmp.path().display(),
+            date_str
+        );
+        let count1 = glob(&pattern).unwrap().filter_map(Result::ok).count();
+        assert_eq!(count1, 1);
+
+        hist.add(&row).unwrap();
+        let count2 = glob(&pattern).unwrap().filter_map(Result::ok).count();
+        assert_eq!(count1, count2);
+    }
+
+    #[test]
+    fn test_vacuum_consolidates() {
+        let tmp = tempdir().unwrap();
+        let hist = TableHistory::<ProcessedRow>::new_processed(tmp.path()).unwrap();
+
+        let now = Utc::now();
+        let row1 = ProcessedRow {
+            filename: "file3.csv".to_string(),
+            total_rows: 30,
+            size_bytes: 300,
+            processing_start: now,
+            processing_end: now,
+        };
+        let later = now + Duration::microseconds(1);
+        let row2 = ProcessedRow {
+            filename: "file4.csv".to_string(),
+            total_rows: 40,
+            size_bytes: 400,
+            processing_start: now,
+            processing_end: later,
+        };
+
+        hist.add(&row1).unwrap();
+        hist.add(&row2).unwrap();
+
+        let date_str = now.date_naive().format("%Y%m%d").to_string();
+        let glob_pattern = format!(
+            "{}/processed/date={}/**/*.parquet",
+            tmp.path().display(),
+            date_str
+        );
+
+        // ensure two files before vacuum
+        let before = glob(&glob_pattern).unwrap().filter_map(Result::ok).count();
+        assert_eq!(before, 2);
+
+        hist.vacuum().unwrap();
+
+        // after vacuum, only consolidated.parquet remains
+        let after_paths: Vec<_> = glob(&glob_pattern)
+            .unwrap()
+            .filter_map(Result::ok)
+            .collect();
+        assert_eq!(after_paths.len(), 1);
+        assert_eq!(
+            after_paths[0].file_name().unwrap().to_string_lossy(),
+            "consolidated.parquet"
+        );
+    }
+
+    #[test]
+    fn test_persistence_across_restarts() {
+        let tmp = tempdir().unwrap();
+        // first instance: write one row
+        let key: String;
+        {
+            let hist = TableHistory::<ProcessedRow>::new_processed(tmp.path()).unwrap();
+            hist.start_vacuum_loop();
+            let now = Utc::now();
+            let row = ProcessedRow {
+                filename: "file5.csv".to_string(),
+                total_rows: 50,
+                size_bytes: 500,
+                processing_start: now,
+                processing_end: now,
+            };
+            key = row.unique_key();
+            hist.add(&row).unwrap();
+            assert!(hist.get(key.clone()));
+        }
+
+        // second instance: should pick up the existing file
+        let hist2 = TableHistory::<ProcessedRow>::new_processed(tmp.path()).unwrap();
+        assert!(hist2.get(key));
+    }
 }
-
-impl HistoryRow for DownloadedRow {
-    const KEY_COLUMN: usize = 0;
-    const TIME_COLUMN: usize = 4;
-
-    fn partition_date(&self) -> NaiveDate {
-        // now trivial:
-        self.download_end.date_naive()
-    }
-
-    fn schema() -> ArrowSchema {
-        ArrowSchema::new(vec![
-            Field::new("filename", ArrowDataType::Utf8, false),
-            Field::new("url", ArrowDataType::Utf8, false),
-            Field::new("size_bytes", ArrowDataType::Int64, false),
-            Field::new(
-                "download_start",
-                ArrowDataType::Timestamp(TimeUnit::Microsecond, None),
-                false,
-            ),
-            Field::new(
-                "download_end",
-                ArrowDataType::Timestamp(TimeUnit::Microsecond, None),
-                false,
-            ),
-        ])
-    }
-
-    fn to_arrays(&self) -> Vec<ArrayRef> {
-        vec![
-            Arc::new(StringArray::from(vec![self.filename.clone()])),
-            Arc::new(StringArray::from(vec![self.url.clone()])),
-            Arc::new(Int64Array::from(vec![self.size_bytes])),
-            Arc::new(TimestampMicrosecondArray::from(vec![self
-                .download_start
-                .timestamp_micros()])),
-            Arc::new(TimestampMicrosecondArray::from(vec![self
-                .download_end
-                .timestamp_micros()])),
-        ]
-    }
-
-    fn unique_key(&self) -> String {
-        format!(
-            "{}--{}",
-            self.filename,
-            self.download_end.timestamp_micros()
-        )
-    }
-}
-
-// And similarly for your ProcessedRow:
-
-pub struct ProcessedRow {
-    pub filename: String,
-    pub total_rows: i64,
-    pub size_bytes: i64,
-    pub processing_start: DateTime<Utc>,
-    pub processing_end: DateTime<Utc>,
-}
-
-impl HistoryRow for ProcessedRow {
-    const KEY_COLUMN: usize = 0;
-    const TIME_COLUMN: usize = 4;
-
-    fn partition_date(&self) -> NaiveDate {
-        self.processing_end.date_naive()
-    }
-
-    fn schema() -> ArrowSchema {
-        ArrowSchema::new(vec![
-            Field::new("filename", ArrowDataType::Utf8, false),
-            Field::new("total_rows", ArrowDataType::Int64, false),
-            Field::new("size_bytes", ArrowDataType::Int64, false),
-            Field::new(
-                "processing_start",
-                ArrowDataType::Timestamp(TimeUnit::Microsecond, None),
-                false,
-            ),
-            Field::new(
-                "processing_end",
-                ArrowDataType::Timestamp(TimeUnit::Microsecond, None),
-                false,
-            ),
-        ])
-    }
-
-    fn to_arrays(&self) -> Vec<ArrayRef> {
-        vec![
-            Arc::new(StringArray::from(vec![self.filename.clone()])),
-            Arc::new(Int64Array::from(vec![self.total_rows])),
-            Arc::new(Int64Array::from(vec![self.size_bytes])),
-            Arc::new(TimestampMicrosecondArray::from(vec![self
-                .processing_start
-                .timestamp_micros()])),
-            Arc::new(TimestampMicrosecondArray::from(vec![self
-                .processing_end
-                .timestamp_micros()])),
-        ]
-    }
-
-    fn unique_key(&self) -> String {
-        format!(
-            "{}--{}",
-            self.filename,
-            self.processing_end.timestamp_micros()
-        )
-    }
-}
-
-impl TableHistory<DownloadedRow> {
-    pub fn new_downloaded(base: impl Into<PathBuf>) -> Result<Arc<Self>> {
-        TableHistory::new(base, "downloaded")
-    }
-}
-impl TableHistory<ProcessedRow> {
-    pub fn new_processed(base: impl Into<PathBuf>) -> Result<Arc<Self>> {
-        TableHistory::new(base, "processed")
-    }
-}
-
-// Usage example:
-// let downloaded = TableHistory::<DownloadedRow>::new_downloaded("./history_dir")?;
-// let processed  = TableHistory::<ProcessedRow>::new_processed("./history_dir")?;
-// downloaded.add(&DownloadedRow { filename: "file.csv".into(), url: "http://...".into(), size_bytes: 123, download_start: Utc::now().timestamp_micros(), download_end: Utc::now().timestamp_micros() })?;
-// processed.add(&ProcessedRow { filename: "file.csv".into(), total_rows: 100, size_bytes: 456, processing_start: Utc::now().timestamp_micros(), processing_end: Utc::now().timestamp_micros() })?;

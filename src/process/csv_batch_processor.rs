@@ -11,7 +11,8 @@ pub struct CsvBatchProcessor {
     current_i_line: Option<String>,
     batch: String,
     batch_index: usize,
-    row_count: i64,
+    row_count: u64,
+    parquet_bytes: u64,
 }
 
 impl CsvBatchProcessor {
@@ -23,12 +24,17 @@ impl CsvBatchProcessor {
             batch: String::new(),
             batch_index: 0,
             row_count: 0,
+            parquet_bytes: 0,
         }
     }
 
     /// Returns how many rows have been counted so far.
-    pub fn row_count(&self) -> i64 {
+    pub fn row_count(&self) -> u64 {
         self.row_count
+    }
+
+    pub fn parquet_bytes(&self) -> u64 {
+        self.parquet_bytes
     }
 
     /// Feed in one line of CSV (excluding top‐header and excluding footer “C,”).
@@ -78,12 +84,8 @@ impl CsvBatchProcessor {
             return Err(anyhow!("Batch is empty"));
         }
         let batch_name = format!("{}-batch-{}", file_name, self.batch_index);
-        csv_to_parquet(&batch_name, self.batch.as_str(), out_dir).unwrap_or_else(|e| {
-            error!(
-                "csv_to_parquet error on {} batch {}: {:?}",
-                file_name, self.batch_index, e
-            )
-        });
+        let parquet_bytes = csv_to_parquet(&batch_name, self.batch.as_str(), out_dir)?;
+        self.parquet_bytes += parquet_bytes;
         self.batch_index += 1;
         self.batch.clear();
 
