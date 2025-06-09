@@ -123,3 +123,53 @@ fn skip_top_c_header<R: BufRead>(reader: &mut R, file_name: &str) {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use anyhow::Result;
+    use glob::glob;
+    use std::{fs, path::PathBuf};
+    use tempfile::tempdir;
+    use tracing::{info, Level};
+    use tracing_subscriber::{fmt, EnvFilter};
+
+    fn init_logging() {
+        // initialize tracing subscriber once at INFO level
+        let _ = fmt()
+            .with_env_filter(EnvFilter::new("debug"))
+            .with_target(false)
+            .try_init();
+    }
+
+    #[test]
+    fn integration_split_zip_to_parquet_real_file() -> Result<()> {
+        init_logging();
+
+        // 1) Path to a real ZIP file in your repo
+        let zip_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("./test_assets/PUBLIC_MTPASADUIDAVAILABILITY_202207201800_0000000367313233.zip");
+
+        // 2) Create a temp directory for output
+        let output_dir = tempdir()?;
+
+        // 3) Call the function under test
+        let RowsAndBytes { rows, bytes } = split_zip_to_parquet(&zip_path, output_dir.path())?;
+
+        // 4) Basic sanity checks
+        assert!(rows > 0, "Expected at least one row, got {}", rows);
+        assert!(bytes > 0, "Expected some bytes, got {}", bytes);
+
+        // 5) Recursively find all .parquet files under the output directory
+        let pattern = format!("{}/**/*.parquet", output_dir.path().display());
+        let parquet_files: Vec<_> = glob(&pattern)?.filter_map(Result::ok).collect();
+        info!("Parquet files generated: {:?}", parquet_files);
+        assert!(
+            !parquet_files.is_empty(),
+            "No .parquet files found in {:?}",
+            output_dir.path()
+        );
+
+        Ok(())
+    }
+}

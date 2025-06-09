@@ -65,24 +65,18 @@ impl<R: HistoryRow + Send + Sync + 'static> TableHistory<R> {
         let mut seen_set = HashSet::new();
 
         // Scan dedupe keys only
-        for part in fs::read_dir(&table_dir)? {
-            let part = part?;
-            if !part.file_type()?.is_dir() {
-                continue;
-            }
-            let part_dir = part.path();
-            for entry in glob(&format!("{}/*.parquet", part_dir.display()))? {
-                let path = entry?;
-                let file = File::open(&path)
-                    .with_context(|| format!("failed to open `{}`", path.display()))?;
-                let mut reader = ParquetRecordBatchReaderBuilder::try_new(file)?
-                    .with_batch_size(1024)
-                    .build()?;
-                while let Some(batch) = reader.next().transpose()? {
-                    for i in 0..batch.num_rows() {
-                        let key = R::extract_key(&batch, i);
-                        seen_set.insert(key);
-                    }
+        let pattern = format!("{}/**/*.parquet", table_dir.display());
+        for entry in glob(&pattern)? {
+            let path = entry?;
+            let file = File::open(&path)
+                .with_context(|| format!("failed to open `{}`", path.display()))?;
+            let mut reader = ParquetRecordBatchReaderBuilder::try_new(file)?
+                .with_batch_size(1024)
+                .build()?;
+            while let Some(batch) = reader.next().transpose()? {
+                for row_idx in 0..batch.num_rows() {
+                    let key = R::extract_key(&batch, row_idx);
+                    seen_set.insert(key);
                 }
             }
         }
@@ -109,13 +103,9 @@ impl<R: HistoryRow + Send + Sync + 'static> TableHistory<R> {
 
     /// Add a new row of type R
     pub fn add(&self, row: &R) -> Result<()> {
+        // key is only used for filename. we want to fire multiple if we've accidentally done
+        // multiple of something.
         let key = row.unique_key();
-        {
-            let mut seen = self.seen.lock().unwrap();
-            if !seen.insert(key.clone()) {
-                return Ok(());
-            }
-        }
 
         let date = row.partition_date();
         let arrays = row.to_arrays();

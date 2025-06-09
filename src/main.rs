@@ -55,7 +55,7 @@ async fn main() -> Result<()> {
 
     // --- Channels ---
     let (url_tx, url_rx) = mpsc::unbounded_channel::<String>();
-    let (proc_tx, proc_rx) = mpsc::unbounded_channel::<Result<PathBuf, String>>();
+    let (proc_tx, proc_rx) = mpsc::unbounded_channel::<PathBuf>();
 
     // --- Pipeline Stages ---
     spawn_fetch_zip_urls(state.http_client.clone(), url_tx);
@@ -89,7 +89,7 @@ fn setup_directories(root: &str) -> Result<(PathBuf, PathBuf, PathBuf)> {
 fn spawn_downloader_pool(
     state: Arc<AppState>,
     mut url_rx: mpsc::UnboundedReceiver<String>,
-    proc_tx: mpsc::UnboundedSender<Result<PathBuf, String>>,
+    proc_tx: mpsc::UnboundedSender<PathBuf>,
 ) {
     const NUM_DOWNLOADERS: usize = 3;
     tokio::spawn(async move {
@@ -124,14 +124,14 @@ async fn download_and_log(
     url: &str,
     worker_id: usize,
     state: Arc<AppState>,
-    proc_tx: mpsc::UnboundedSender<Result<PathBuf, String>>,
+    proc_tx: mpsc::UnboundedSender<PathBuf>,
 ) {
     let name = PathBuf::from(url)
         .file_name()
         .and_then(OsStr::to_str)
         .unwrap_or("unknown")
         .to_string();
-
+    // skip already downloaded files
     if state.downloaded_history.get(name.clone()) {
         return;
     }
@@ -154,20 +154,16 @@ async fn download_and_log(
             });
 
             info!(file_name = %name, size_bytes = result.size, worker_id = worker_id, "Download complete");
-            let _ = proc_tx.send(Ok(result.path));
+            let _ = proc_tx.send(result.path);
         }
         Err(e) => {
             error!(?url, error = %e, "Download failed");
-            let _ = proc_tx.send(Err(url.to_string()));
         }
     }
 }
 
 /// Spawns the pool of file processors.
-fn spawn_processor_pool(
-    state: Arc<AppState>,
-    mut proc_rx: mpsc::UnboundedReceiver<Result<PathBuf, String>>,
-) {
+fn spawn_processor_pool(state: Arc<AppState>, mut proc_rx: mpsc::UnboundedReceiver<PathBuf>) {
     let num_workers = std::thread::available_parallelism().map_or(1, |n| n.get());
 
     tokio::spawn(async move {
@@ -205,24 +201,19 @@ fn spawn_processor_pool(
 }
 
 /// Core logic for a single processing task (runs in a blocking thread).
-async fn process_and_log(msg: Result<PathBuf, String>, worker_id: usize, state: Arc<AppState>) {
-    let path = match msg {
-        Ok(p) => p,
-        Err(url) => {
-            error!(url, "Skipping processing due to upstream download error");
-            return;
-        }
-    };
-
+async fn process_and_log(path: PathBuf, worker_id: usize, state: Arc<AppState>) {
     let name = path
         .file_name()
         .map(|s| s.to_string_lossy().to_string())
         .unwrap_or_else(|| "unknown".into());
+    // skip already processed files
+    if state.processed_history.get(name.clone()) {
+        return;
+    }
 
     info!(file_name = %name, worker_id = worker_id, "Processing file");
     let start = Instant::now();
 
-    // Clone the state for the blocking task. This is the fix.
     let state_for_blocking = state.clone();
     // The actual CPU-bound work is spawned on a blocking thread
     let result = task::spawn_blocking(move || {
@@ -257,10 +248,7 @@ async fn process_and_log(msg: Result<PathBuf, String>, worker_id: usize, state: 
 }
 
 /// Spawns a task that periodically enqueues existing zip files.
-fn spawn_periodic_zip_enqueue(
-    zips_dir: PathBuf,
-    tx: mpsc::UnboundedSender<Result<PathBuf, String>>,
-) {
+fn spawn_periodic_zip_enqueue(zips_dir: PathBuf, tx: mpsc::UnboundedSender<PathBuf>) {
     tokio::spawn(async move {
         loop {
             info!("Enqueuing existing zip files...");
@@ -293,14 +281,11 @@ where
     Ok(store)
 }
 
-fn enqueue_zips(
-    zips_dir: &PathBuf,
-    tx: &mpsc::UnboundedSender<Result<PathBuf, String>>,
-) -> Result<()> {
+fn enqueue_zips(zips_dir: &PathBuf, tx: &mpsc::UnboundedSender<PathBuf>) -> Result<()> {
     for entry in fs::read_dir(zips_dir)? {
         let path = entry?.path();
         if path.extension() == Some(OsStr::new("zip")) {
-            let _ = tx.send(Ok(path));
+            let _ = tx.send(path);
         }
     }
     Ok(())

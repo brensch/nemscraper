@@ -538,40 +538,14 @@
             "fieldConfig": {
                 "defaults": {
                     "color": {
-                        "mode": "palette-classic"
+                        "mode": "thresholds"
                     },
                     "custom": {
-                        "axisBorderShow": false,
-                        "axisCenteredZero": false,
-                        "axisColorMode": "text",
-                        "axisLabel": "",
-                        "axisPlacement": "auto",
-                        "barAlignment": 0,
-                        "barWidthFactor": 0.6,
-                        "drawStyle": "line",
-                        "fillOpacity": 0,
-                        "gradientMode": "none",
-                        "hideFrom": {
-                            "legend": false,
-                            "tooltip": false,
-                            "viz": false
+                        "align": "auto",
+                        "cellOptions": {
+                            "type": "auto"
                         },
-                        "insertNulls": false,
-                        "lineInterpolation": "linear",
-                        "lineWidth": 1,
-                        "pointSize": 5,
-                        "scaleDistribution": {
-                            "type": "linear"
-                        },
-                        "showPoints": "auto",
-                        "spanNulls": false,
-                        "stacking": {
-                            "group": "A",
-                            "mode": "none"
-                        },
-                        "thresholdsStyle": {
-                            "mode": "off"
-                        }
+                        "inspect": false
                     },
                     "mappings": [],
                     "thresholds": {
@@ -587,27 +561,45 @@
                         ]
                     }
                 },
-                "overrides": []
+                "overrides": [
+                    {
+                        "matcher": {
+                            "id": "byName",
+                            "options": "Value"
+                        },
+                        "properties": [
+                            {
+                                "id": "unit",
+                                "value": "decbytes"
+                            }
+                        ]
+                    }
+                ]
             },
             "gridPos": {
                 "h": 8,
-                "w": 12,
+                "w": 8,
                 "x": 0,
                 "y": 13
             },
-            "id": 10,
+            "id": 15,
             "options": {
-                "legend": {
-                    "calcs": [],
-                    "displayMode": "list",
-                    "placement": "bottom",
-                    "showLegend": true
+                "cellHeight": "sm",
+                "footer": {
+                    "countRows": false,
+                    "fields": "",
+                    "reducer": [
+                        "sum"
+                    ],
+                    "show": false
                 },
-                "tooltip": {
-                    "hideZeros": false,
-                    "mode": "single",
-                    "sort": "none"
-                }
+                "showHeader": true,
+                "sortBy": [
+                    {
+                        "desc": true,
+                        "displayName": "Value"
+                    }
+                ]
             },
             "pluginVersion": "12.0.1",
             "targets": [
@@ -617,15 +609,17 @@
                         "uid": "PBFA97CFB590B2093"
                     },
                     "editorMode": "code",
-                    "expr": "100 * (\r\n  node_filesystem_size_bytes{fstype!~\"tmpfs|overlay|aufs|squashfs|devtmpfs\"}\r\n  -\r\n  node_filesystem_avail_bytes{fstype!~\"tmpfs|overlay|aufs|squashfs|devtmpfs\"}\r\n)\r\n/\r\nnode_filesystem_size_bytes{fstype!~\"tmpfs|overlay|aufs|squashfs|devtmpfs\"}\r\n",
-                    "instant": false,
+                    "exemplar": false,
+                    "expr": "max by (dir) (assets_directory_size_bytes)\r\n",
+                    "format": "table",
+                    "instant": true,
                     "legendFormat": "__auto",
-                    "range": true,
+                    "range": false,
                     "refId": "A"
                 }
             ],
-            "title": "File system utilisation (all mounts)",
-            "type": "timeseries"
+            "title": "Directory Sizes",
+            "type": "table"
         },
         {
             "datasource": {
@@ -689,8 +683,8 @@
             },
             "gridPos": {
                 "h": 8,
-                "w": 12,
-                "x": 12,
+                "w": 8,
+                "x": 8,
                 "y": 13
             },
             "id": 11,
@@ -723,6 +717,103 @@
                 }
             ],
             "title": "Asset Directory Size",
+            "type": "timeseries"
+        },
+        {
+            "datasource": {
+                "type": "prometheus",
+                "uid": "PBFA97CFB590B2093"
+            },
+            "fieldConfig": {
+                "defaults": {
+                    "color": {
+                        "mode": "palette-classic"
+                    },
+                    "custom": {
+                        "axisBorderShow": false,
+                        "axisCenteredZero": false,
+                        "axisColorMode": "text",
+                        "axisLabel": "",
+                        "axisPlacement": "auto",
+                        "barAlignment": 0,
+                        "barWidthFactor": 0.6,
+                        "drawStyle": "line",
+                        "fillOpacity": 0,
+                        "gradientMode": "none",
+                        "hideFrom": {
+                            "legend": false,
+                            "tooltip": false,
+                            "viz": false
+                        },
+                        "insertNulls": false,
+                        "lineInterpolation": "linear",
+                        "lineWidth": 1,
+                        "pointSize": 5,
+                        "scaleDistribution": {
+                            "type": "linear"
+                        },
+                        "showPoints": "auto",
+                        "spanNulls": false,
+                        "stacking": {
+                            "group": "A",
+                            "mode": "none"
+                        },
+                        "thresholdsStyle": {
+                            "mode": "off"
+                        }
+                    },
+                    "mappings": [],
+                    "thresholds": {
+                        "mode": "absolute",
+                        "steps": [
+                            {
+                                "color": "green"
+                            },
+                            {
+                                "color": "red",
+                                "value": 80
+                            }
+                        ]
+                    }
+                },
+                "overrides": []
+            },
+            "gridPos": {
+                "h": 8,
+                "w": 8,
+                "x": 16,
+                "y": 13
+            },
+            "id": 10,
+            "options": {
+                "legend": {
+                    "calcs": [],
+                    "displayMode": "list",
+                    "placement": "bottom",
+                    "showLegend": true
+                },
+                "tooltip": {
+                    "hideZeros": false,
+                    "mode": "single",
+                    "sort": "none"
+                }
+            },
+            "pluginVersion": "12.0.1",
+            "targets": [
+                {
+                    "datasource": {
+                        "type": "prometheus",
+                        "uid": "PBFA97CFB590B2093"
+                    },
+                    "editorMode": "code",
+                    "expr": "100 * (\r\n  node_filesystem_size_bytes{fstype!~\"tmpfs|overlay|aufs|squashfs|devtmpfs\"}\r\n  -\r\n  node_filesystem_avail_bytes{fstype!~\"tmpfs|overlay|aufs|squashfs|devtmpfs\"}\r\n)\r\n/\r\nnode_filesystem_size_bytes{fstype!~\"tmpfs|overlay|aufs|squashfs|devtmpfs\"}\r\n",
+                    "instant": false,
+                    "legendFormat": "__auto",
+                    "range": true,
+                    "refId": "A"
+                }
+            ],
+            "title": "File system utilisation (all mounts)",
             "type": "timeseries"
         },
         {
@@ -877,7 +968,7 @@
                 "overrides": []
             },
             "gridPos": {
-                "h": 8,
+                "h": 5,
                 "w": 24,
                 "x": 0,
                 "y": 32
@@ -984,7 +1075,7 @@
                 "h": 24,
                 "w": 24,
                 "x": 0,
-                "y": 40
+                "y": 37
             },
             "id": 14,
             "options": {
