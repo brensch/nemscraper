@@ -188,6 +188,7 @@ pub fn spawn_fetch_zip_urls(
             // Call the async fetch with retries
             match fetch_feed_links(client.clone(), feed_url.clone()).await {
                 Ok(links) => {
+                    info!(url = feed_url, count = links.len(), "fetched url links");
                     for zip_link in links {
                         let _ = url_tx.send(zip_link);
                     }
@@ -196,8 +197,6 @@ pub fn spawn_fetch_zip_urls(
                     eprintln!("Failed to fetch links from {}: {}", feed_url, e);
                 }
             }
-
-            info!(url = feed_url, "fetched url links");
 
             current_feed = (current_feed + 1) % owned_feeds.len();
 

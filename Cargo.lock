@@ -1567,6 +1567,7 @@ dependencies = [
  "arrow",
  "chrono",
  "futures",
+ "futures-util",
  "glob",
  "once_cell",
  "parquet",

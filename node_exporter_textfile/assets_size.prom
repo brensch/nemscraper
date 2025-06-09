@@ -1,5 +1,5 @@
 # HELP assets_directory_size_bytes Bytes used by each subdirectory under /assets
 # TYPE assets_directory_size_bytes gauge
-assets_directory_size_bytes{dir="history"} 23613316
-assets_directory_size_bytes{dir="parquet"} 15462322327
-assets_directory_size_bytes{dir="zips"} 32132273913
+assets_directory_size_bytes{dir="history"} 14941439
+assets_directory_size_bytes{dir="parquet"} 9048717364
+assets_directory_size_bytes{dir="zips"} 20790828763
