@@ -29,98 +29,6 @@
             "fieldConfig": {
                 "defaults": {
                     "color": {
-                        "mode": "palette-classic"
-                    },
-                    "custom": {
-                        "axisBorderShow": false,
-                        "axisCenteredZero": false,
-                        "axisColorMode": "text",
-                        "axisLabel": "",
-                        "axisPlacement": "auto",
-                        "barAlignment": 0,
-                        "barWidthFactor": 0.6,
-                        "drawStyle": "line",
-                        "fillOpacity": 0,
-                        "gradientMode": "none",
-                        "hideFrom": {
-                            "legend": false,
-                            "tooltip": false,
-                            "viz": false
-                        },
-                        "insertNulls": false,
-                        "lineInterpolation": "linear",
-                        "lineWidth": 1,
-                        "pointSize": 5,
-                        "scaleDistribution": {
-                            "type": "linear"
-                        },
-                        "showPoints": "auto",
-                        "spanNulls": false,
-                        "stacking": {
-                            "group": "A",
-                            "mode": "none"
-                        },
-                        "thresholdsStyle": {
-                            "mode": "off"
-                        }
-                    },
-                    "mappings": [],
-                    "thresholds": {
-                        "mode": "absolute",
-                        "steps": [
-                            {
-                                "color": "green"
-                            },
-                            {
-                                "color": "red",
-                                "value": 80
-                            }
-                        ]
-                    }
-                },
-                "overrides": []
-            },
-            "gridPos": {
-                "h": 8,
-                "w": 12,
-                "x": 0,
-                "y": 0
-            },
-            "id": 14,
-            "options": {
-                "legend": {
-                    "calcs": [],
-                    "displayMode": "list",
-                    "placement": "bottom",
-                    "showLegend": true
-                },
-                "tooltip": {
-                    "hideZeros": false,
-                    "mode": "single",
-                    "sort": "none"
-                }
-            },
-            "pluginVersion": "12.0.1",
-            "targets": [
-                {
-                    "datasource": {
-                        "type": "motherduck-duckdb-datasource",
-                        "uid": "P18CE15CC9D3BAB28"
-                    },
-                    "refId": "A"
-                }
-            ],
-            "title": "New panel",
-            "type": "timeseries"
-        },
-        {
-            "datasource": {
-                "type": "motherduck-duckdb-datasource",
-                "uid": "P18CE15CC9D3BAB28"
-            },
-            "fieldConfig": {
-                "defaults": {
-                    "color": {
                         "mode": "thresholds"
                     },
                     "mappings": [],
@@ -887,7 +795,7 @@
                     "editorMode": "code",
                     "format": 1,
                     "rawQuery": true,
-                    "rawSql": "WITH downloads AS (\r\n  SELECT\r\n    download_start AS start_time,\r\n    download_end   AS end_time,\r\n    thread,\r\n    filename\r\n  FROM read_parquet(\r\n    '/data/history/downloaded/date=*/**/*.parquet',\r\n    union_by_name => TRUE\r\n  )\r\n  WHERE $__timeFilter(download_end)\r\n  ORDER BY download_end DESC\r\n  LIMIT 1000\r\n)\r\nSELECT\r\n  start_time,\r\n  end_time,\r\n\r\n  MAX(filename) FILTER (WHERE thread = 0) AS thread_0,\r\n  MAX(filename) FILTER (WHERE thread = 1) AS thread_1,\r\n  MAX(filename) FILTER (WHERE thread = 2) AS thread_2\r\n\r\nFROM downloads\r\nGROUP BY start_time, end_time\r\nORDER BY start_time;\r\n",
+                    "rawSql": "WITH downloads AS (\r\n  SELECT\r\n    download_start AS start_time,\r\n    download_end   AS end_time,\r\n    thread,\r\n    filename\r\n  FROM read_parquet(\r\n    '/data/history/downloaded/date=*/**/*.parquet',\r\n    union_by_name => TRUE\r\n  )\r\n  WHERE $__timeFilter(download_end)\r\n  ORDER BY download_end DESC\r\n)\r\nSELECT\r\n  start_time,\r\n  end_time,\r\n\r\n  MAX(filename) FILTER (WHERE thread = 0) AS thread_0,\r\n  MAX(filename) FILTER (WHERE thread = 1) AS thread_1,\r\n  MAX(filename) FILTER (WHERE thread = 2) AS thread_2\r\n\r\nFROM downloads\r\nGROUP BY start_time, end_time\r\nORDER BY start_time;\r\n",
                     "refId": "A",
                     "sql": {
                         "columns": [
@@ -909,6 +817,101 @@
                 }
             ],
             "title": "Downloads per thread",
+            "type": "state-timeline"
+        },
+        {
+            "datasource": {
+                "type": "motherduck-duckdb-datasource",
+                "uid": "P18CE15CC9D3BAB28"
+            },
+            "fieldConfig": {
+                "defaults": {
+                    "color": {
+                        "mode": "thresholds"
+                    },
+                    "custom": {
+                        "axisPlacement": "auto",
+                        "fillOpacity": 70,
+                        "hideFrom": {
+                            "legend": false,
+                            "tooltip": false,
+                            "viz": false
+                        },
+                        "insertNulls": false,
+                        "lineWidth": 0,
+                        "spanNulls": false
+                    },
+                    "mappings": [],
+                    "thresholds": {
+                        "mode": "absolute",
+                        "steps": [
+                            {
+                                "color": "green"
+                            },
+                            {
+                                "color": "red",
+                                "value": 80
+                            }
+                        ]
+                    }
+                },
+                "overrides": []
+            },
+            "gridPos": {
+                "h": 24,
+                "w": 24,
+                "x": 0,
+                "y": 29
+            },
+            "id": 14,
+            "options": {
+                "alignValue": "left",
+                "legend": {
+                    "displayMode": "list",
+                    "placement": "bottom",
+                    "showLegend": true
+                },
+                "mergeValues": true,
+                "rowHeight": 0.9,
+                "showValue": "auto",
+                "tooltip": {
+                    "hideZeros": false,
+                    "mode": "single",
+                    "sort": "none"
+                }
+            },
+            "pluginVersion": "12.0.1",
+            "targets": [
+                {
+                    "datasource": {
+                        "type": "motherduck-duckdb-datasource",
+                        "uid": "P18CE15CC9D3BAB28"
+                    },
+                    "editorMode": "code",
+                    "format": 1,
+                    "rawQuery": true,
+                    "rawSql": "WITH proc AS (\r\n  SELECT\r\n    processing_start AS start_time,\r\n    processing_end   AS end_time,\r\n    thread,\r\n    filename\r\n  FROM read_parquet(\r\n    '/data/history/processed/date=*/**/*.parquet',\r\n    union_by_name => TRUE\r\n  )\r\n  WHERE $__timeFilter(processing_end)\r\n  ORDER BY processing_end DESC\r\n)\r\nSELECT\r\n  start_time,\r\n  end_time,\r\n\r\n  MAX(filename) FILTER (WHERE thread = 0)  AS thread_0,\r\n  MAX(filename) FILTER (WHERE thread = 1)  AS thread_1,\r\n  MAX(filename) FILTER (WHERE thread = 2)  AS thread_2,\r\n  MAX(filename) FILTER (WHERE thread = 3)  AS thread_3,\r\n  MAX(filename) FILTER (WHERE thread = 4)  AS thread_4,\r\n  MAX(filename) FILTER (WHERE thread = 5)  AS thread_5,\r\n  MAX(filename) FILTER (WHERE thread = 6)  AS thread_6,\r\n  MAX(filename) FILTER (WHERE thread = 7)  AS thread_7,\r\n  MAX(filename) FILTER (WHERE thread = 8)  AS thread_8,\r\n  MAX(filename) FILTER (WHERE thread = 9)  AS thread_9,\r\n  MAX(filename) FILTER (WHERE thread = 10) AS thread_10,\r\n  MAX(filename) FILTER (WHERE thread = 11) AS thread_11,\r\n  MAX(filename) FILTER (WHERE thread = 12) AS thread_12,\r\n  MAX(filename) FILTER (WHERE thread = 13) AS thread_13,\r\n  MAX(filename) FILTER (WHERE thread = 14) AS thread_14,\r\n  MAX(filename) FILTER (WHERE thread = 15) AS thread_15,\r\n  MAX(filename) FILTER (WHERE thread = 16) AS thread_16,\r\n  MAX(filename) FILTER (WHERE thread = 17) AS thread_17,\r\n  MAX(filename) FILTER (WHERE thread = 18) AS thread_18,\r\n  MAX(filename) FILTER (WHERE thread = 19) AS thread_19,\r\n  MAX(filename) FILTER (WHERE thread = 20) AS thread_20,\r\n  MAX(filename) FILTER (WHERE thread = 21) AS thread_21,\r\n  MAX(filename) FILTER (WHERE thread = 22) AS thread_22,\r\n  MAX(filename) FILTER (WHERE thread = 23) AS thread_23,\r\n  MAX(filename) FILTER (WHERE thread = 24) AS thread_24,\r\n  MAX(filename) FILTER (WHERE thread = 25) AS thread_25,\r\n  MAX(filename) FILTER (WHERE thread = 26) AS thread_26,\r\n  MAX(filename) FILTER (WHERE thread = 27) AS thread_27,\r\n  MAX(filename) FILTER (WHERE thread = 28) AS thread_28,\r\n  MAX(filename) FILTER (WHERE thread = 29) AS thread_29,\r\n  MAX(filename) FILTER (WHERE thread = 30) AS thread_30,\r\n  MAX(filename) FILTER (WHERE thread = 31) AS thread_31\r\n\r\nFROM proc\r\nGROUP BY start_time, end_time\r\nORDER BY start_time;\r\n",
+                    "refId": "A",
+                    "sql": {
+                        "columns": [
+                            {
+                                "parameters": [],
+                                "type": "function"
+                            }
+                        ],
+                        "groupBy": [
+                            {
+                                "property": {
+                                    "type": "string"
+                                },
+                                "type": "groupBy"
+                            }
+                        ],
+                        "limit": 50
+                    }
+                }
+            ],
+            "title": "Processed Files per core",
             "type": "state-timeline"
         },
         {
@@ -973,7 +976,7 @@
                 "h": 11,
                 "w": 24,
                 "x": 0,
-                "y": 29
+                "y": 53
             },
             "id": 12,
             "options": {
