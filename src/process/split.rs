@@ -172,4 +172,66 @@ mod tests {
 
         Ok(())
     }
+
+    #[test]
+    fn integration_split_big_zip() -> Result<()> {
+        init_logging();
+
+        // 1) Path to a real ZIP file in your repo
+        let zip_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("./test_assets/PUBLIC_NEXT_DAY_FPPMW_20250414_0000000459215330.zip");
+
+        // 2) Create a temp directory for output
+        let output_dir = tempdir()?;
+
+        // 3) Call the function under test
+        let RowsAndBytes { rows, bytes } = split_zip_to_parquet(&zip_path, output_dir.path())?;
+
+        // 4) Basic sanity checks
+        assert!(rows > 0, "Expected at least one row, got {}", rows);
+        assert!(bytes > 0, "Expected some bytes, got {}", bytes);
+
+        // 5) Recursively find all .parquet files under the output directory
+        let pattern = format!("{}/**/*.parquet", output_dir.path().display());
+        let parquet_files: Vec<_> = glob(&pattern)?.filter_map(Result::ok).collect();
+        info!("Parquet files generated: {:?}", parquet_files);
+        assert!(
+            !parquet_files.is_empty(),
+            "No .parquet files found in {:?}",
+            output_dir.path()
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn integration_split_gets6() -> Result<()> {
+        init_logging();
+
+        // 1) Path to a real ZIP file in your repo
+        let zip_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("./test_assets/PUBLIC_FPP_RUN_202506091945_0000000466987122.zip");
+
+        // 2) Create a temp directory for output
+        let output_dir = tempdir()?;
+
+        // 3) Call the function under test
+        let RowsAndBytes { rows, bytes } = split_zip_to_parquet(&zip_path, output_dir.path())?;
+
+        // 4) Basic sanity checks
+        assert!(rows > 0, "Expected at least one row, got {}", rows);
+        assert!(bytes > 0, "Expected some bytes, got {}", bytes);
+
+        // 5) Recursively find all .parquet files under the output directory
+        let pattern = format!("{}/**/*.parquet", output_dir.path().display());
+        let parquet_files: Vec<_> = glob(&pattern)?.filter_map(Result::ok).collect();
+        info!("Parquet files generated: {:?}", parquet_files);
+        assert!(
+            !parquet_files.is_empty(),
+            "No .parquet files found in {:?}",
+            output_dir.path()
+        );
+
+        Ok(())
+    }
 }
