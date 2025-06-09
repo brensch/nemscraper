@@ -91,7 +91,7 @@ fn spawn_downloader_pool(
     mut url_rx: mpsc::UnboundedReceiver<String>,
     proc_tx: mpsc::UnboundedSender<PathBuf>,
 ) {
-    const NUM_DOWNLOADERS: usize = 3;
+    const NUM_DOWNLOADERS: usize = 4;
     tokio::spawn(async move {
         let (worker_id_tx, mut worker_id_rx) = mpsc::channel(NUM_DOWNLOADERS);
 

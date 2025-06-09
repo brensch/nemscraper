@@ -39,7 +39,7 @@ fn main() -> Result<()> {
     // ----------------------------------------
     // 2) Find all Parquet files under assets/parquet/
     // ----------------------------------------
-    let parquet_pattern = "assets/parquet/*.parquet";
+    let parquet_pattern = "assets/parquet/**/*.parquet";
     let parquet_paths: Vec<PathBuf> = glob(parquet_pattern)
         .with_context(|| format!("Failed to read glob pattern '{}'", parquet_pattern))?
         .filter_map(|entry| match entry {

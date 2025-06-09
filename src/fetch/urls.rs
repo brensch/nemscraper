@@ -90,7 +90,7 @@ static ZIP_SELECTOR: Lazy<Selector> = Lazy::new(|| {
 });
 
 /// Maximum number of retries when fetching a feed page
-const MAX_RETRIES: u32 = 3;
+const MAX_RETRIES: u32 = 5;
 /// Delay between retries
 const RETRY_DELAY: Duration = Duration::from_secs(5);
 
@@ -172,8 +172,8 @@ pub fn spawn_fetch_zip_urls(
         let owned_feeds: Vec<String> = CURRENT_FEED_URLS.iter().map(|s| s.to_string()).collect();
         let num_feeds = owned_feeds.len() as u32;
 
-        // Each feed should be fetched once per 5 minutes
-        let frequency_seconds = 5 * 60; // 300
+        // Each feed should be fetched once per 60 seconds
+        let frequency_seconds = 60;
         let tick_secs = frequency_seconds / num_feeds; // e.g. 100s if 3 feeds
         let tick_duration = Duration::from_secs(tick_secs as u64);
 
