@@ -7,6 +7,7 @@ use scraper::{Html, Selector};
 use std::time::Duration;
 use tokio::sync::mpsc;
 use tokio::time::sleep;
+use tracing::info;
 use url::Url;
 
 static CURRENT_FEED_URLS: &[&str] = &[
@@ -180,10 +181,9 @@ pub fn spawn_fetch_zip_urls(
         let mut current_feed: usize = 0;
 
         loop {
-            // Wait until the next tick (asynchronously)
-            ticker.tick().await;
-
             let feed_url = owned_feeds[current_feed].clone();
+
+            info!(url = feed_url, "fetching url links");
 
             // Call the async fetch with retries
             match fetch_feed_links(client.clone(), feed_url.clone()).await {
@@ -197,7 +197,12 @@ pub fn spawn_fetch_zip_urls(
                 }
             }
 
+            info!(url = feed_url, "fetched url links");
+
             current_feed = (current_feed + 1) % owned_feeds.len();
+
+            // Wait until the next tick (asynchronously)
+            ticker.tick().await;
         }
     })
 }

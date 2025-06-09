@@ -1,5 +1,3 @@
-version: '3.7'
-
 services:
   grafana:
     image: grafana/grafana:12.0.1-ubuntu
@@ -8,7 +6,7 @@ services:
       - "3000:3000"
     user: "1000:1000"
     volumes:
-      - assets:/data
+      - ./assets:/data
       - ./grafana/plugins/motherduck-duckdb-datasource:/var/lib/grafana/plugins/motherduck-duckdb-datasource
       - ./grafana/dashboards:/etc/grafana/provisioned_dashboards
       - ./grafana/provisioning/dashboards:/etc/grafana/provisioning/dashboards
@@ -36,7 +34,7 @@ services:
       - /sys:/host/sys:ro
       - /:/rootfs:ro
       # Mount our dedicated “textfile” folder for metrics
-      - node_exporter_textfile:/var/lib/node_exporter/textfile_collector:ro
+      - ./node_exporter_textfile:/var/lib/node_exporter/textfile_collector:ro
     command:
       - "--path.procfs=/host/proc"
       - "--path.sysfs=/host/sys"
@@ -49,10 +47,8 @@ services:
       dockerfile: Dockerfile.assetsexporter
     restart: always
     volumes:
-      # Mount the host's ./assets folder (read/write) → /assets
-      - assets:/assets
-      # Mount the “textfile” directory so we can write .prom files there
-      - node_exporter_textfile:/textfile
+      - ./assets:/assets
+      - ./node_exporter_textfile:/textfile
 
   nemscraper:
     build:
@@ -61,22 +57,6 @@ services:
     working_dir: /usr/src/app
     user: "1000:1000"
     volumes:
-      - assets:/usr/src/app/assets
+      - ./assets:/usr/src/app/assets
     command: ["./target/release/nemscraper"]
 
-volumes:
-  assets:
-    driver: local
-    driver_opts:
-      # Bind the host’s ./assets folder into a named volume called “assets”
-      type: "none"
-      o: "bind"
-      device: "${PWD}/assets"
-
-  node_exporter_textfile:
-    driver: local
-    driver_opts:
-      # Bind a host folder ./node_exporter_textfile into this named volume
-      type: "none"
-      o: "bind"
-      device: "${PWD}/node_exporter_textfile"

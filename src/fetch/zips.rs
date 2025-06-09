@@ -15,7 +15,7 @@ pub struct DownloadResult {
 }
 
 /// Download the given ZIP URL and save it under `dest_dir` using the original filename.
-/// Streams directly to disk without loading the entire file into memory.
+/// Streams first into a `.tmp` file, then renames to `.zip` on success.
 /// Retries up to 3 times with exponential backoff on failure.
 /// Returns the final path *and* the total size in bytes.
 pub async fn download_zip(
@@ -26,13 +26,19 @@ pub async fn download_zip(
     let dest_dir = dest_dir.as_ref();
     let url = Url::parse(url_str)?;
 
+    // original filename, e.g. "foo.zip"
     let filename = url
         .path_segments()
         .and_then(|mut segments| segments.next_back())
         .filter(|name| !name.is_empty())
         .unwrap_or("download.zip");
 
+    // final destination: .../foo.zip
     let dest_path = dest_dir.join(filename);
+    // temporary download path: .../foo.zip.tmp
+    let tmp_path = dest_dir.join(format!("{}.tmp", filename));
+
+    // ensure our directory exists
     if let Some(parent) = dest_path.parent() {
         fs::create_dir_all(parent).await?;
     }
@@ -43,31 +49,34 @@ pub async fn download_zip(
     loop {
         attempt += 1;
 
-        match download_attempt(client, &url, &dest_path).await {
+        match download_attempt(client, &url, &tmp_path).await {
             Ok(()) => {
-                // after the file is fully written, read its metadata to get the size
+                // got the full download in foo.zip.tmp — now rename to foo.zip
+                fs::rename(&tmp_path, &dest_path)
+                    .await
+                    .with_context(|| format!("renaming {:?} to {:?}", tmp_path, dest_path))?;
+
+                // read metadata on the final file
                 let meta = fs::metadata(&dest_path)
                     .await
                     .with_context(|| format!("reading metadata for {:?}", dest_path))?;
+
                 return Ok(DownloadResult {
                     path: dest_path,
                     size: meta.len(),
                 });
             }
             Err(e) if attempt >= MAX_RETRIES => {
-                let _ = fs::remove_file(&dest_path).await;
+                // give up — clean up tmp file
+                let _ = fs::remove_file(&tmp_path).await;
                 return Err(e.context(format!(
                     "Failed to download {} after {} attempts",
                     url_str, MAX_RETRIES
                 )));
             }
             Err(e) => {
-                if let Some(req_err) = e.downcast_ref::<reqwest::Error>() {
-                    if req_err.status() == Some(reqwest::StatusCode::NOT_FOUND) {
-                        return Err(e.context(format!("got 404, bailing: {}", url_str)));
-                    }
-                }
-                let _ = fs::remove_file(&dest_path).await;
+                // transient error — clean up and retry with backoff
+                let _ = fs::remove_file(&tmp_path).await;
                 let delay = Duration::from_secs(1 << (attempt - 1));
                 tracing::warn!(
                     "Download attempt {}/{} failed for {}: {}. Retrying in {:?}…",

@@ -1,21 +1,32 @@
 use anyhow::Result;
+use chrono::Duration as ChronoDuration;
 use chrono::Utc;
 use reqwest::Client;
-use std::{ffi::OsStr, fs, path::PathBuf, sync::Arc, time::Duration};
+use std::{
+    ffi::OsStr,
+    fs,
+    path::PathBuf,
+    sync::Arc,
+    thread,
+    time::{Duration, Instant},
+};
 use tokio::{
-    sync::{mpsc, Mutex},
+    sync::{
+        mpsc::{self, UnboundedReceiver},
+        Mutex, Semaphore,
+    },
     task, time,
 };
 use tracing::{error, info};
-use tracing_subscriber::{fmt, EnvFilter};
+use tracing_subscriber::{fmt, EnvFilter}; // avoid collision with std::time::Duration
 
 use crate::history::{
     downloaded::DownloadedRow,
     processed::ProcessedRow,
     table_history::{HistoryRow, TableHistory},
 };
-use nemscraper::process::split::RowsAndBytes;
 use nemscraper::{fetch::urls::spawn_fetch_zip_urls, process};
+use nemscraper::{fetch::zips, process::split::RowsAndBytes};
 mod history;
 mod utils;
 
@@ -42,9 +53,9 @@ async fn main() -> Result<()> {
     info!("History stores inited");
 
     // channels
-    let (proc_tx, proc_rx) = mpsc::unbounded_channel::<Result<PathBuf, (String, String)>>();
+    let (proc_tx, proc_rx) = mpsc::unbounded_channel();
     let proc_rx = Arc::new(Mutex::new(proc_rx));
-    let (url_tx, url_rx) = mpsc::unbounded_channel::<String>();
+    let (url_tx, url_rx) = mpsc::unbounded_channel();
     let url_rx = Arc::new(Mutex::new(url_rx));
 
     // workers & tasks
@@ -53,7 +64,7 @@ async fn main() -> Result<()> {
         Client::new(),
         zips_dir.clone(),
         proc_tx.clone(),
-        url_rx.clone(),
+        url_rx,
         downloaded.clone(),
     )
     .await;
@@ -63,7 +74,7 @@ async fn main() -> Result<()> {
         std::thread::available_parallelism()
             .map(|n| n.get())
             .unwrap_or(1),
-        proc_rx.clone(),
+        proc_rx,
         processed.clone(),
         parquet_dir.clone(),
     )
@@ -95,63 +106,6 @@ where
     Ok(store)
 }
 
-async fn spawn_downloaders(
-    n: usize,
-    client: Client,
-    zips_dir: PathBuf,
-    proc_tx: mpsc::UnboundedSender<Result<PathBuf, (String, String)>>,
-    url_rx: Arc<Mutex<mpsc::UnboundedReceiver<String>>>,
-    history: Arc<TableHistory<DownloadedRow>>,
-) {
-    for id in 0..n {
-        let client = client.clone();
-        let zips_dir = zips_dir.clone();
-        let proc_tx = proc_tx.clone();
-        let url_rx = url_rx.clone();
-        let history = history.clone();
-
-        task::spawn(async move {
-            while let Some(url) = { url_rx.lock().await.recv().await } {
-                let name = PathBuf::from(&url)
-                    .file_name()
-                    .and_then(OsStr::to_str)
-                    .unwrap_or("unknown")
-                    .to_string();
-                if history.get(name.clone()) {
-                    continue;
-                }
-
-                match nemscraper::fetch::zips::download_zip(&client, &url, &zips_dir).await {
-                    Ok(download_result) => {
-                        let now = Utc::now();
-                        let _ = history.add(&DownloadedRow {
-                            filename: name.clone(),
-                            url: url.clone(),
-                            size_bytes: download_result.size,
-                            download_start: now,
-                            download_end: now,
-                            thread: id as u32,
-                        });
-                        let _ = proc_tx.send(Ok(download_result.path));
-                        info!(
-                            file_name = name.clone(),
-                            size_bytes = download_result.size,
-                            url = url,
-                            downloader_id = id,
-                            "Downloaded file"
-                        );
-                    }
-                    Err(e) => {
-                        error!("Download failed {}: {}", url, e);
-                        let _ = proc_tx.send(Err((url.clone(), e.to_string())));
-                    }
-                }
-            }
-            info!("Downloader {} exiting", id);
-        });
-    }
-}
-
 fn spawn_existing_zip_check(
     zips_dir: PathBuf,
     proc_tx: mpsc::UnboundedSender<Result<PathBuf, (String, String)>>,
@@ -178,6 +132,74 @@ fn enqueue_zips(
     }
     Ok(())
 }
+async fn spawn_downloaders(
+    n: usize,
+    client: Client,
+    zips_dir: PathBuf,
+    proc_tx: mpsc::UnboundedSender<Result<PathBuf, (String, String)>>,
+    url_rx: Arc<Mutex<mpsc::UnboundedReceiver<String>>>,
+    history: Arc<TableHistory<DownloadedRow>>,
+) {
+    for id in 0..n {
+        let client = client.clone();
+        let zips_dir = zips_dir.clone();
+        let proc_tx = proc_tx.clone();
+        let url_rx = url_rx.clone();
+        let history = history.clone();
+
+        task::spawn(async move {
+            loop {
+                // lock only to get one URL, then drop immediately
+                let maybe_url = {
+                    let mut rx = url_rx.lock().await;
+                    rx.recv().await
+                };
+                let url = match maybe_url {
+                    Some(u) => u,
+                    None => break, // channel closed
+                };
+
+                let name = PathBuf::from(&url)
+                    .file_name()
+                    .and_then(OsStr::to_str)
+                    .unwrap_or("unknown")
+                    .to_string();
+
+                if history.get(name.clone()) {
+                    continue;
+                }
+                let start = Instant::now();
+                match zips::download_zip(&client, &url, &zips_dir).await {
+                    Ok(download_result) => {
+                        let elapsed = start.elapsed();
+                        let end = Utc::now();
+                        let start = end - ChronoDuration::microseconds(elapsed.as_micros() as i64);
+                        let _ = history.add(&DownloadedRow {
+                            filename: name.clone(),
+                            url: url.clone(),
+                            size_bytes: download_result.size,
+                            download_start: start,
+                            download_end: end,
+                            thread: id as u32,
+                        });
+                        let _ = proc_tx.send(Ok(download_result.path));
+                        info!(
+                            file_name = name,
+                            size_bytes = download_result.size,
+                            thread = id,
+                            "Downloaded file"
+                        );
+                    }
+                    Err(e) => {
+                        error!("Download failed {}: {}", url, e);
+                        let _ = proc_tx.send(Err((url.clone(), e.to_string())));
+                    }
+                }
+            }
+            info!("Downloader {} exiting", id);
+        });
+    }
+}
 
 async fn spawn_processors(
     n: usize,
@@ -191,7 +213,17 @@ async fn spawn_processors(
         let parquet_dir = parquet_dir.clone();
 
         task::spawn(async move {
-            while let Some(msg) = { rx.lock().await.recv().await } {
+            loop {
+                // lock only to receive one message
+                let maybe_msg = {
+                    let mut guard = rx.lock().await;
+                    guard.recv().await
+                };
+                let msg = match maybe_msg {
+                    Some(m) => m,
+                    None => break, // channel closed
+                };
+
                 match msg {
                     Ok(path) => {
                         let name = path
@@ -199,42 +231,59 @@ async fn spawn_processors(
                             .and_then(OsStr::to_str)
                             .unwrap_or("unknown")
                             .to_string();
+
                         if history.get(name.clone()) {
                             continue;
                         }
+                        info!(
+                            file_name = name.clone(),
+                            processor_id = id,
+                            "Started processing file"
+                        );
 
-                        let start = Utc::now();
-                        let handle = task::spawn_blocking({
-                            let p = path.clone();
-                            let d = parquet_dir.clone();
-                            move || process::split::split_zip_to_parquet(&p, &d)
+                        let start = Instant::now();
+                        let p = path.clone();
+                        let d = parquet_dir.clone();
+                        let h = history.clone();
+
+                        // capture tid inside blocking closure
+                        let join_handle = task::spawn_blocking(move || {
+                            let res = process::split::split_zip_to_parquet(&p, &d);
+                            res
                         });
 
-                        match handle.await {
-                            Ok(Ok(RowsAndBytes { rows, bytes })) => {
-                                let now = Utc::now();
-                                let _ = history.add(&ProcessedRow {
+                        match join_handle.await {
+                            Ok((Ok(RowsAndBytes { rows, bytes }))) => {
+                                let elapsed = start.elapsed();
+                                let end = Utc::now();
+                                let start =
+                                    end - ChronoDuration::microseconds(elapsed.as_micros() as i64);
+                                let _ = h.add(&ProcessedRow {
                                     filename: name.clone(),
                                     total_rows: rows,
                                     size_bytes: bytes,
                                     processing_start: start,
-                                    processing_end: now,
-                                    thread: id as u32, // will never get more than u32 threads. unless...
+                                    processing_end: end,
+                                    thread: id as u32,
                                 });
                                 info!(
                                     file_name = name,
                                     total_rows = rows,
                                     size_bytes = bytes,
-                                    processor_id = id,
+                                    thread = id,
                                     "Processed file"
-                                )
+                                );
                             }
-                            Ok(Err(e)) => error!("Processing {} error: {}", name, e),
-                            Err(join_err) => error!("Processor {} panicked: {}", name, join_err),
+                            Ok(Err(e)) => {
+                                error!("Processing {} (thread {}) failed: {}", name, id, e);
+                            }
+                            Err(join_err) => {
+                                error!("Processor {} panicked: {:?}", id, join_err);
+                            }
                         }
                     }
                     Err((url, e)) => {
-                        error!("Upstream download error for {}: {}", url, e)
+                        error!("Upstream download error for {}: {}", url, e);
                     }
                 }
             }

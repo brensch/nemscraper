@@ -1,6 +1,6 @@
 use anyhow::Result;
 use arrow::{
-    array::{ArrayRef, StringArray, TimestampMicrosecondArray, UInt64Array},
+    array::{ArrayRef, StringArray, TimestampMicrosecondArray, UInt32Array, UInt64Array},
     datatypes::{DataType as ArrowDataType, Field, Schema as ArrowSchema, TimeUnit},
 };
 use chrono::{DateTime, NaiveDate, TimeZone, Utc};
@@ -54,6 +54,7 @@ impl HistoryRow for DownloadedRow {
             Arc::new(TimestampMicrosecondArray::from(vec![self
                 .download_end
                 .timestamp_micros()])),
+            Arc::new(UInt32Array::from(vec![self.thread])),
         ]
     }
 
