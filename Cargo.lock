@@ -1592,6 +1592,8 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "arrow",
+ "arrow-csv",
+ "arrow-schema",
  "async_zip",
  "chrono",
  "futures",

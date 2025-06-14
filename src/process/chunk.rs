@@ -1,8 +1,13 @@
 use anyhow::{anyhow, Context, Result};
-use arrow::array::*;
+use arrow::array::Array;
+use arrow::array::{
+    ArrayRef, Float64Builder, StringArray, TimestampMillisecondArray, TimestampMillisecondBuilder,
+};
+
 use arrow::csv::ReaderBuilder;
 use arrow::datatypes::*;
 use arrow::record_batch::RecordBatch;
+use chrono::FixedOffset;
 use chrono::{NaiveDateTime, TimeZone};
 use parquet::arrow::ArrowWriter;
 use parquet::basic::BrotliLevel;
@@ -330,27 +335,6 @@ pub fn csv_to_parquet(file_name: &str, data: &str, out_dir: &Path) -> Result<u64
     csv_to_parquet_streaming(reader, file_name, out_dir)
 }
 
-/// 4) Parse CSV header and create initial string schema
-fn parse_header_and_create_string_schema(
-    data: &str,
-) -> Result<(Vec<String>, Schema), anyhow::Error> {
-    let cursor = Cursor::new(data.as_bytes());
-    let mut reader = BufReader::new(cursor);
-    let mut header_line = String::new();
-    reader.read_line(&mut header_line)?;
-
-    // Parse CSV header (simple comma splitting for now)
-    let headers: Vec<String> = header_line.trim().split(',').map(clean_str).collect();
-
-    // Create schema with all string fields
-    let fields: Vec<Field> = headers
-        .iter()
-        .map(|name| Field::new(name, DataType::Utf8, true))
-        .collect();
-
-    Ok((headers, Schema::new(fields)))
-}
-
 /// 5) Analyze first batch to detect schema, dates, and trimming needs
 fn analyze_batch_for_schema(
     batch: &RecordBatch,
@@ -460,80 +444,64 @@ fn apply_trimming(
 }
 
 /// 7) Convert columns to their final types (dates, numbers, etc.)
-fn convert_to_final_types(
-    batch: &RecordBatch,
-    schema_info: &SchemaInfo,
-) -> Result<RecordBatch, anyhow::Error> {
-    let mut new_fields = Vec::new();
-    let mut new_columns = Vec::new();
+fn convert_to_final_types(batch: &RecordBatch, schema_info: &SchemaInfo) -> Result<RecordBatch> {
+    // 1. Precompute the +10:00 offset once
+    let tz_offset = FixedOffset::east_opt(10 * 3600).expect("valid +10:00 offset");
 
-    for (col_idx, field) in batch.schema().fields().iter().enumerate() {
-        let array = batch.column(col_idx);
-        let target_field = &schema_info.schema.fields()[col_idx];
+    // 2. Prepare output fields and columns
+    let mut out_cols: Vec<ArrayRef> = Vec::with_capacity(batch.num_columns());
 
-        if schema_info.date_columns.contains(field.name()) {
-            // Convert date column
-            if let Some(string_array) = array.as_any().downcast_ref::<StringArray>() {
-                // Parse naive datetimes first
-                let naive_timestamps: Vec<Option<i64>> = string_array
-                    .iter()
-                    .map(|opt_str| {
-                        opt_str.and_then(|s| {
-                            let cleaned = clean_str(s);
-                            NaiveDateTime::parse_from_str(&cleaned, "%Y/%m/%d %H:%M:%S")
-                                .ok()
-                                .map(|dt| {
-                                    // Treat the naive datetime as being in +10:00 timezone
-                                    // and convert to UTC timestamp
-                                    let offset = chrono::FixedOffset::east_opt(10 * 3600).unwrap();
-                                    offset
-                                        .from_local_datetime(&dt)
-                                        .single()
-                                        .map(|dt_tz| dt_tz.timestamp_millis())
-                                        .unwrap_or(0)
-                                })
+    for (array, target_field) in batch.columns().iter().zip(schema_info.schema.fields()) {
+        match (
+            array.as_any().downcast_ref::<StringArray>(),
+            target_field.data_type(),
+        ) {
+            // 3a. Date conversion path
+            (Some(sarr), DataType::Timestamp(TimeUnit::Millisecond, _))
+                if schema_info.date_columns.contains(target_field.name()) =>
+            {
+                let mut builder = TimestampMillisecondBuilder::new();
+                for opt_str in sarr.iter() {
+                    // parse → offset → millis, or None
+                    let ts = opt_str
+                        .and_then(|s| {
+                            NaiveDateTime::parse_from_str(&clean_str(s), "%Y/%m/%d %H:%M:%S").ok()
                         })
-                    })
-                    .collect();
+                        .and_then(|dt| {
+                            tz_offset
+                                .from_local_datetime(&dt)
+                                .single()
+                                .map(|dt_tz| dt_tz.timestamp_millis())
+                        });
+                    builder.append_option(ts);
+                }
 
-                // Create timezone-aware timestamp array
-                let timestamps =
-                    TimestampMillisecondArray::from(naive_timestamps).with_timezone("+10:00");
-
-                new_fields.push((**target_field).clone()); // Use target field with correct timestamp type
-                new_columns.push(Arc::new(timestamps) as ArrayRef);
-            } else {
-                new_fields.push((**target_field).clone());
-                new_columns.push(array.clone());
+                let arr = builder.finish().with_timezone("+10:00");
+                out_cols.push(Arc::new(arr) as ArrayRef);
             }
-        } else if target_field.data_type() == &DataType::Float64 {
-            // Convert numeric column
-            if let Some(string_array) = array.as_any().downcast_ref::<StringArray>() {
-                let floats: Float64Array = string_array
-                    .iter()
-                    .map(|opt_str| {
-                        opt_str.and_then(|s| {
-                            let cleaned = clean_str(s);
-                            cleaned.parse::<f64>().ok()
-                        })
-                    })
-                    .collect();
 
-                new_fields.push((**target_field).clone()); // Use target field with Float64 type
-                new_columns.push(Arc::new(floats) as ArrayRef);
-            } else {
-                new_fields.push((**target_field).clone());
-                new_columns.push(array.clone());
+            // 3b. Float64 conversion path
+            (Some(sarr), DataType::Float64) => {
+                let mut builder = Float64Builder::new();
+
+                for opt_str in sarr.iter() {
+                    let v = opt_str.and_then(|s| clean_str(s).parse::<f64>().ok());
+                    builder.append_option(v);
+                }
+
+                out_cols.push(Arc::new(builder.finish()) as ArrayRef);
             }
-        } else {
-            // Keep as string
-            new_fields.push((**target_field).clone());
-            new_columns.push(array.clone());
+
+            // 3c. Everything else, leave untouched
+            _ => {
+                out_cols.push(array.clone());
+            }
         }
     }
 
-    let new_schema = Arc::new(Schema::new(new_fields));
-    Ok(RecordBatch::try_new(new_schema, new_columns)?)
+    // 4. Reuse the target schema directly
+    let out_schema = Arc::new(schema_info.schema.clone());
+    RecordBatch::try_new(out_schema, out_cols).map_err(Into::into)
 }
 
 /// 8) Extract date from filename for partitioning.
