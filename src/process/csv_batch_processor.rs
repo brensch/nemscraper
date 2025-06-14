@@ -1,7 +1,7 @@
 use anyhow::{anyhow, Result};
 use std::path::Path;
 
-use super::chunk_polars::csv_to_parquet;
+use super::chunk::csv_to_parquet;
 
 /// Holds the mutable state needed to group lines into batches
 /// (always beginning with the latest “I,” header), flush when size or new schema arrives.

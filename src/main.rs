@@ -216,35 +216,35 @@ async fn process_and_log(path: PathBuf, worker_id: usize, state: Arc<AppState>) 
 
     let state_for_blocking = state.clone();
     // The actual CPU-bound work is spawned on a blocking thread
-    let result = task::spawn_blocking(move || {
-        process::split::split_zip_to_parquet(&path, &state_for_blocking.parquet_dir)
-    })
-    .await;
+    // let result = task::spawn_blocking(move || {
+    //     process::split::stream_zip_to_parquet(&path, &state_for_blocking.parquet_dir)
+    // })
+    // .await;
 
-    match result {
-        Ok(Ok(RowsAndBytes { rows, bytes })) => {
-            let end = Utc::now();
-            let start_ts = end - ChronoDuration::microseconds(start.elapsed().as_micros() as i64);
+    // match result {
+    //     Ok(Ok(RowsAndBytes { rows, bytes })) => {
+    //         let end = Utc::now();
+    //         let start_ts = end - ChronoDuration::microseconds(start.elapsed().as_micros() as i64);
 
-            // The original `state` is still valid here because we only moved a clone.
-            let _ = state.processed_history.add(&ProcessedRow {
-                filename: name.clone(),
-                total_rows: rows,
-                size_bytes: bytes,
-                processing_start: start_ts,
-                processing_end: end,
-                thread: worker_id as u32,
-            });
+    //         // The original `state` is still valid here because we only moved a clone.
+    //         let _ = state.processed_history.add(&ProcessedRow {
+    //             filename: name.clone(),
+    //             total_rows: rows,
+    //             size_bytes: bytes,
+    //             processing_start: start_ts,
+    //             processing_end: end,
+    //             thread: worker_id as u32,
+    //         });
 
-            info!(file_name = %name, total_rows = rows, size_bytes = bytes, worker_id = worker_id, "Processing complete");
-        }
-        Ok(Err(e)) => {
-            error!(file_name = %name, worker_id = worker_id, error = %e, "Processing failed")
-        }
-        Err(e) => {
-            error!(file_name = %name, worker_id = worker_id, error = %e, "Processor task panicked")
-        }
-    }
+    //         info!(file_name = %name, total_rows = rows, size_bytes = bytes, worker_id = worker_id, "Processing complete");
+    //     }
+    //     Ok(Err(e)) => {
+    //         error!(file_name = %name, worker_id = worker_id, error = %e, "Processing failed")
+    //     }
+    //     Err(e) => {
+    //         error!(file_name = %name, worker_id = worker_id, error = %e, "Processor task panicked")
+    //     }
+    // }
 }
 
 /// Spawns a task that periodically enqueues existing zip files.

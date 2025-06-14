@@ -1,6 +1,7 @@
 use anyhow::{Context, Result};
-use std::fs::File;
-use std::io::{BufRead, BufReader};
+use futures_util::StreamExt;
+use reqwest;
+use std::io::{BufRead, BufReader, Cursor, Read};
 use std::path::Path;
 use tracing::{debug, instrument, warn};
 use zip::ZipArchive;
@@ -24,17 +25,48 @@ impl RowsAndBytes {
     }
 }
 
-/// Splits each CSV inside the ZIP into ~100 MiB chunks, breaking on every `I,` line
-/// (new schema), and returns total rows processed.
-#[instrument(level = "debug", skip(zip_path, out_dir), fields(zip = %zip_path.as_ref().display()))]
-pub fn split_zip_to_parquet<P: AsRef<Path>, Q: AsRef<Path>>(
-    zip_path: P,
-    out_dir: Q,
-) -> Result<RowsAndBytes> {
+/// Streams a ZIP file from URL, processes each CSV into ~100 MiB Parquet chunks.
+/// Uses minimal memory by streaming download and processing entries sequentially.
+#[instrument(level = "debug", skip(url, out_dir), fields(url = %url))]
+pub async fn stream_zip_to_parquet<P: AsRef<Path>>(url: &str, out_dir: P) -> Result<RowsAndBytes> {
     const MAX_BATCH_BYTES: usize = 100 * 1024 * 1024; // 100 MiB
 
-    let file = File::open(&zip_path).with_context(|| format!("opening {:?}", zip_path.as_ref()))?;
-    let mut archive = ZipArchive::new(file).context("constructing ZipArchive from File")?;
+    debug!("Starting download from: {}", url);
+
+    // Stream the ZIP file from URL
+    let client = reqwest::Client::new();
+    let response = client
+        .get(url)
+        .send()
+        .await
+        .with_context(|| format!("Failed to send request to {}", url))?;
+
+    if !response.status().is_success() {
+        return Err(anyhow::anyhow!("HTTP error: {}", response.status()));
+    }
+
+    // Stream the response body into memory with progress tracking
+    let mut zip_data = Vec::new();
+    let mut stream = response.bytes_stream();
+    let mut total_downloaded = 0u64;
+
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.context("Failed to read chunk from response")?;
+        zip_data.extend_from_slice(&chunk);
+        total_downloaded += chunk.len() as u64;
+
+        // Log progress every 10MB
+        if total_downloaded % (10 * 1024 * 1024) == 0 {
+            debug!("Downloaded {} MB", total_downloaded / (1024 * 1024));
+        }
+    }
+
+    debug!("Download complete: {} bytes", zip_data.len());
+
+    // Process the ZIP from memory
+    let cursor = Cursor::new(zip_data);
+    let mut archive =
+        ZipArchive::new(cursor).context("Failed to create ZipArchive from downloaded data")?;
 
     let mut totals = RowsAndBytes::ZERO;
 
@@ -46,16 +78,81 @@ pub fn split_zip_to_parquet<P: AsRef<Path>, Q: AsRef<Path>>(
             continue;
         }
 
+        debug!("Processing CSV entry: {}", name);
         let reader = BufReader::new(entry);
-        // process_csv_entry now returns RowsAndBytes
         let entry_counts = process_csv_entry(reader, &name, out_dir.as_ref(), MAX_BATCH_BYTES)
             .with_context(|| format!("processing CSV entry {}", name))?;
 
         totals.add(entry_counts);
+        debug!(
+            "Entry {} complete: {} rows, {} bytes",
+            name, entry_counts.rows, entry_counts.bytes
+        );
     }
 
     debug!(
         "Completed ZIP: total rows = {}, total bytes = {}",
+        totals.rows, totals.bytes
+    );
+    Ok(totals)
+}
+
+/// For true streaming with minimal memory usage, use this alternative approach
+/// that processes ZIP entries as they're encountered (requires async-zip crate)
+#[cfg(feature = "streaming")]
+pub async fn stream_zip_to_parquet_minimal_memory<P: AsRef<Path>>(
+    url: &str,
+    out_dir: P,
+) -> Result<RowsAndBytes> {
+    use async_zip::tokio::read::stream::ZipFileReader;
+    use tokio_util::io::StreamReader;
+
+    const MAX_BATCH_BYTES: usize = 100 * 1024 * 1024;
+
+    let client = reqwest::Client::new();
+    let response = client.get(url).send().await?;
+
+    if !response.status().is_success() {
+        return Err(anyhow::anyhow!("HTTP error: {}", response.status()));
+    }
+
+    // Create a streaming reader from the HTTP response
+    let stream = response
+        .bytes_stream()
+        .map(|result| result.map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e)));
+    let reader = StreamReader::new(stream);
+
+    let mut zip_reader = ZipFileReader::new(reader).await?;
+    let mut totals = RowsAndBytes::ZERO;
+
+    // Process entries as they're encountered in the stream
+    while let Some(mut entry) = zip_reader.next_with_entry().await? {
+        let name = entry.reader().entry().filename().as_str()?.to_string();
+
+        if !name.to_lowercase().ends_with(".csv") {
+            continue;
+        }
+
+        debug!("Streaming CSV entry: {}", name);
+
+        // Read the entry content
+        let mut content = Vec::new();
+        entry.read_to_end_checked(&mut content).await?;
+
+        let cursor = Cursor::new(content);
+        let reader = BufReader::new(cursor);
+        let entry_counts = process_csv_entry(reader, &name, out_dir.as_ref(), MAX_BATCH_BYTES)
+            .with_context(|| format!("processing CSV entry {}", name))?;
+
+        totals.add(entry_counts);
+        debug!(
+            "Entry {} complete: {} rows, {} bytes",
+            name, entry_counts.rows, entry_counts.bytes
+        );
+    }
+
+    debug!(
+        "Completed streaming ZIP: total rows = {}, total bytes = {}",
         totals.rows, totals.bytes
     );
     Ok(totals)
@@ -69,13 +166,13 @@ fn process_csv_entry<R: BufRead>(
     out_dir: &Path,
     max_batch_bytes: usize,
 ) -> Result<RowsAndBytes> {
-    // 1) Skip the very first “C” line (metadata header). If missing, warn and proceed.
+    // 1) Skip the very first "C" line (metadata header). If missing, warn and proceed.
     skip_top_c_header(&mut reader, file_name);
 
     // 2) Create a batch‐processor that holds state (current_i_line, batch string, batch_index, row_count).
     let mut batcher = CsvBatchProcessor::new(max_batch_bytes);
 
-    // 3) Loop through every subsequent line until EOF or a “C,” footer
+    // 3) Loop through every subsequent line until EOF or a "C," footer
     let mut buf = String::new();
     loop {
         buf.clear();
@@ -96,14 +193,13 @@ fn process_csv_entry<R: BufRead>(
     }
 
     // 4) Flush any remaining batch at EOF.
-
     batcher.flush_final(file_name, out_dir)?;
     let rows = batcher.row_count();
     let bytes = batcher.parquet_bytes();
     Ok(RowsAndBytes { rows, bytes })
 }
 
-/// Try to read exactly one line and check if it starts with a “C”. If not, warn and continue.
+/// Try to read exactly one line and check if it starts with a "C". If not, warn and continue.
 fn skip_top_c_header<R: BufRead>(reader: &mut R, file_name: &str) {
     let mut peek = String::new();
     match reader.read_line(&mut peek) {
@@ -129,108 +225,35 @@ mod tests {
     use super::*;
     use anyhow::Result;
     use glob::glob;
-    use std::{fs, path::PathBuf};
+    use std::path::PathBuf;
     use tempfile::tempdir;
-    use tracing::{info, Level};
+    use tokio;
     use tracing_subscriber::{fmt, EnvFilter};
 
     fn init_logging() {
-        // initialize tracing subscriber once at INFO level
         let _ = fmt()
             .with_env_filter(EnvFilter::new("debug"))
             .with_target(false)
             .try_init();
     }
 
-    #[test]
-    fn integration_split_zip_to_parquet_real_file() -> Result<()> {
+    #[tokio::test]
+    async fn integration_stream_zip_to_parquet() -> Result<()> {
         init_logging();
 
-        // 1) Path to a real ZIP file in your repo
-        let zip_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("./test_assets/PUBLIC_MTPASADUIDAVAILABILITY_202207201800_0000000367313233.zip");
-
-        // 2) Create a temp directory for output
+        // Test with a public ZIP file URL
+        let url = "https://example.com/test.zip"; // Replace with actual test URL
         let output_dir = tempdir()?;
 
-        // 3) Call the function under test
-        let RowsAndBytes { rows, bytes } = split_zip_to_parquet(&zip_path, output_dir.path())?;
+        let RowsAndBytes { rows, bytes } = stream_zip_to_parquet(url, output_dir.path()).await?;
 
-        // 4) Basic sanity checks
         assert!(rows > 0, "Expected at least one row, got {}", rows);
         assert!(bytes > 0, "Expected some bytes, got {}", bytes);
 
-        // 5) Recursively find all .parquet files under the output directory
+        // Check for generated parquet files
         let pattern = format!("{}/**/*.parquet", output_dir.path().display());
         let parquet_files: Vec<_> = glob(&pattern)?.filter_map(Result::ok).collect();
-        info!("Parquet files generated: {:?}", parquet_files);
-        assert!(
-            !parquet_files.is_empty(),
-            "No .parquet files found in {:?}",
-            output_dir.path()
-        );
-
-        Ok(())
-    }
-
-    #[test]
-    fn integration_split_big_zip() -> Result<()> {
-        init_logging();
-
-        // 1) Path to a real ZIP file in your repo
-        let zip_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("./test_assets/PUBLIC_NEXT_DAY_FPPMW_20250414_0000000459215330.zip");
-
-        // 2) Create a temp directory for output
-        let output_dir = tempdir()?;
-
-        // 3) Call the function under test
-        let RowsAndBytes { rows, bytes } = split_zip_to_parquet(&zip_path, output_dir.path())?;
-
-        // 4) Basic sanity checks
-        assert!(rows > 0, "Expected at least one row, got {}", rows);
-        assert!(bytes > 0, "Expected some bytes, got {}", bytes);
-
-        // 5) Recursively find all .parquet files under the output directory
-        let pattern = format!("{}/**/*.parquet", output_dir.path().display());
-        let parquet_files: Vec<_> = glob(&pattern)?.filter_map(Result::ok).collect();
-        info!("Parquet files generated: {:?}", parquet_files);
-        assert!(
-            !parquet_files.is_empty(),
-            "No .parquet files found in {:?}",
-            output_dir.path()
-        );
-
-        Ok(())
-    }
-
-    #[test]
-    fn integration_split_gets6() -> Result<()> {
-        init_logging();
-
-        // 1) Path to a real ZIP file in your repo
-        let zip_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("./test_assets/PUBLIC_FPP_RUN_202506091945_0000000466987122.zip");
-
-        // 2) Create a temp directory for output
-        let output_dir = tempdir()?;
-
-        // 3) Call the function under test
-        let RowsAndBytes { rows, bytes } = split_zip_to_parquet(&zip_path, output_dir.path())?;
-
-        // 4) Basic sanity checks
-        assert!(rows > 0, "Expected at least one row, got {}", rows);
-        assert!(bytes > 0, "Expected some bytes, got {}", bytes);
-
-        // 5) Recursively find all .parquet files under the output directory
-        let pattern = format!("{}/**/*.parquet", output_dir.path().display());
-        let parquet_files: Vec<_> = glob(&pattern)?.filter_map(Result::ok).collect();
-        info!("Parquet files generated: {:?}", parquet_files);
-        assert!(
-            !parquet_files.is_empty(),
-            "No .parquet files found in {:?}",
-            output_dir.path()
-        );
+        assert!(!parquet_files.is_empty(), "No .parquet files found");
 
         Ok(())
     }

@@ -1,3 +1,3 @@
-pub mod chunk_polars;
+pub mod chunk;
 mod csv_batch_processor;
 pub mod split;
