@@ -277,9 +277,6 @@ impl UnifiedCsvProcessor {
         let mut reader = ReaderBuilder::new(Arc::new(schema))
             .with_header(true)
             .with_batch_size(self.max_data_rows)
-            .with_quote(b'"')
-            .with_escape(b'"')
-            .with_delimiter(b',')
             .build(cursor)
             .context("creating CSV reader")?;
 
