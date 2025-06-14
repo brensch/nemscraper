@@ -1,12 +1,12 @@
 use anyhow::{Context, Result};
 use futures_util::StreamExt;
 use reqwest;
-use std::io::{BufRead, BufReader, Cursor, Read};
+use std::io::{BufRead, BufReader, Cursor};
 use std::path::Path;
 use tracing::{debug, instrument, warn};
 use zip::ZipArchive;
 
-use super::csv_batch_processor::CsvBatchProcessor;
+use super::csv_batch_processor::OptimizedCsvBatchProcessor;
 
 /// A simple accumulator for rows and bytes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -26,12 +26,12 @@ impl RowsAndBytes {
 }
 
 /// Streams a ZIP file from URL, processes each CSV into ~100 MiB Parquet chunks.
-/// Uses minimal memory by streaming download and processing entries sequentially.
+/// Uses optimized processing with direct Arrow array construction.
 #[instrument(level = "debug", skip(url, out_dir), fields(url = %url))]
 pub async fn stream_zip_to_parquet<P: AsRef<Path>>(url: &str, out_dir: P) -> Result<RowsAndBytes> {
     const MAX_BATCH_BYTES: usize = 100 * 1024 * 1024; // 100 MiB
 
-    debug!("Starting download from: {}", url);
+    debug!("Starting optimized download from: {}", url);
 
     // Stream the ZIP file from URL
     let client = reqwest::Client::new();
@@ -78,10 +78,11 @@ pub async fn stream_zip_to_parquet<P: AsRef<Path>>(url: &str, out_dir: P) -> Res
             continue;
         }
 
-        debug!("Processing CSV entry: {}", name);
+        debug!("Processing CSV entry with optimized processor: {}", name);
         let reader = BufReader::new(entry);
-        let entry_counts = process_csv_entry(reader, &name, out_dir.as_ref(), MAX_BATCH_BYTES)
-            .with_context(|| format!("processing CSV entry {}", name))?;
+        let entry_counts =
+            process_csv_entry_optimized(reader, &name, out_dir.as_ref(), MAX_BATCH_BYTES)
+                .with_context(|| format!("processing CSV entry {}", name))?;
 
         totals.add(entry_counts);
         debug!(
@@ -91,15 +92,15 @@ pub async fn stream_zip_to_parquet<P: AsRef<Path>>(url: &str, out_dir: P) -> Res
     }
 
     debug!(
-        "Completed ZIP: total rows = {}, total bytes = {}",
+        "Completed optimized ZIP processing: total rows = {}, total bytes = {}",
         totals.rows, totals.bytes
     );
     Ok(totals)
 }
 
-/// Process a single CSV entry (streaming from `reader`), skipping its top `C` header,
-/// then iterating line by line until EOF or a footer `C,`. Returns rows counted.
-fn process_csv_entry<R: BufRead>(
+/// Process a single CSV entry using the optimized processor
+/// Handles I-lines (schema changes) and D-lines (data) efficiently
+fn process_csv_entry_optimized<R: BufRead>(
     mut reader: R,
     file_name: &str,
     out_dir: &Path,
@@ -108,11 +109,13 @@ fn process_csv_entry<R: BufRead>(
     // 1) Skip the very first "C" line (metadata header). If missing, warn and proceed.
     skip_top_c_header(&mut reader, file_name);
 
-    // 2) Create a batch‐processor that holds state (current_i_line, batch string, batch_index, row_count).
-    let mut batcher = CsvBatchProcessor::new(max_batch_bytes);
+    // 2) Create an optimized batch processor that builds Arrow arrays directly
+    let mut batcher = OptimizedCsvBatchProcessor::new(max_batch_bytes);
 
     // 3) Loop through every subsequent line until EOF or a "C," footer
     let mut buf = String::new();
+    let mut lines_processed = 0u64;
+
     loop {
         buf.clear();
         let bytes_read = reader.read_line(&mut buf)?;
@@ -124,17 +127,30 @@ fn process_csv_entry<R: BufRead>(
         let trimmed = buf.trim_start();
         if trimmed.starts_with("C,") {
             // footer reached → stop reading further
+            debug!("Found footer C-line after {} lines", lines_processed);
             break;
         }
 
-        // Feed this line into the processor (it will flush or append as needed)
+        // Feed this line into the optimized processor
         batcher.feed_line(&buf, file_name, out_dir)?;
+        lines_processed += 1;
+
+        // Log progress for large files
+        if lines_processed % 100_000 == 0 {
+            debug!("Processed {} lines in {}", lines_processed, file_name);
+        }
     }
 
     // 4) Flush any remaining batch at EOF.
     batcher.flush_final(file_name, out_dir)?;
+
     let rows = batcher.row_count();
     let bytes = batcher.parquet_bytes();
+
+    debug!(
+        "Optimized processing complete for {}: {} rows, {} bytes",
+        file_name, rows, bytes
+    );
     Ok(RowsAndBytes { rows, bytes })
 }
 
@@ -148,6 +164,8 @@ fn skip_top_c_header<R: BufRead>(reader: &mut R, file_name: &str) {
                     "Expected a top C-line in {} but got {:?}. Continuing anyway.",
                     file_name, peek
                 );
+            } else {
+                debug!("Found expected C-line header in {}", file_name);
             }
         }
         Err(e) => {
@@ -157,6 +175,14 @@ fn skip_top_c_header<R: BufRead>(reader: &mut R, file_name: &str) {
             );
         }
     }
+}
+
+/// Legacy compatibility function - delegates to optimized version
+pub async fn stream_zip_to_parquet_legacy<P: AsRef<Path>>(
+    url: &str,
+    out_dir: P,
+) -> Result<RowsAndBytes> {
+    stream_zip_to_parquet(url, out_dir).await
 }
 
 #[cfg(test)]
@@ -177,7 +203,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn integration_stream_zip_to_parquet() -> Result<()> {
+    async fn integration_optimized_stream_zip_to_parquet() -> Result<()> {
         init_logging();
 
         // Test with a public ZIP file URL
@@ -194,6 +220,26 @@ mod tests {
         let parquet_files: Vec<_> = glob(&pattern)?.filter_map(Result::ok).collect();
         assert!(!parquet_files.is_empty(), "No .parquet files found");
 
+        debug!("Generated {} parquet files", parquet_files.len());
+        for file in parquet_files.iter().take(5) {
+            debug!("Generated file: {}", file.display());
+        }
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_schema_change_handling() -> Result<()> {
+        init_logging();
+
+        // This test would verify that I-lines are handled correctly
+        // In a real test, you'd create a test CSV with multiple I-lines
+        // and verify that separate parquet files are created for each schema
+
+        debug!("Schema change handling test - implement with real test data");
         Ok(())
     }
 }
+
+// Export for benchmarking
+// pub use OptimizedCsvBatchProcessor as BenchmarkProcessor;

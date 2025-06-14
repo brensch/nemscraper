@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use std::time::Instant;
 
 use anyhow::Result;
-use nemscraper::process::split::stream_zip_to_parquet;
+use nemscraper::process3::split::stream_zip_to_parquet;
 use tracing::Level;
 use tracing_subscriber::{self, EnvFilter};
 
