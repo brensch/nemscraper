@@ -1,6 +1,6 @@
 use anyhow::Result;
 use chrono::Local;
-use nemscraper::process::split::stream_zip_to_parquet;
+use nemscraper::process2::split::stream_zip_to_parquet;
 use pprof::ProfilerGuard;
 use std::{
     env,

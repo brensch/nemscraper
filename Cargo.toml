@@ -57,3 +57,6 @@ futures-lite = "2.0"
 arrow-csv = "55.1.0"
 arrow-schema = "55.1.0"
 pprof = { version = "0.15", features = ["flamegraph", "prost-codec"] }
+clap = { version = "4.0", features = ["derive"] }
+walkdir = "2.3"
+encoding_rs = "0.8"
