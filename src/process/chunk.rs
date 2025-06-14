@@ -1,54 +1,32 @@
 use anyhow::{anyhow, Context, Result};
-use arrow::array::Array;
-use arrow::array::{
-    ArrayRef, Float64Builder, StringArray, TimestampMillisecondArray, TimestampMillisecondBuilder,
+use arrow::{
+    csv::ReaderBuilder,
+    datatypes::{DataType, Field, Schema},
+    record_batch::RecordBatch,
+};
+use parquet::{
+    arrow::ArrowWriter,
+    basic::{BrotliLevel, Compression},
+    file::properties::WriterProperties,
+};
+use std::{
+    fs,
+    fs::File,
+    io::{BufRead, BufReader, Cursor},
+    path::Path,
+    sync::Arc,
+    time::Instant,
 };
 
-use arrow::csv::ReaderBuilder;
-use arrow::datatypes::*;
-use arrow::record_batch::RecordBatch;
-use chrono::FixedOffset;
-use chrono::{NaiveDateTime, TimeZone};
-use parquet::arrow::ArrowWriter;
-use parquet::basic::BrotliLevel;
-use parquet::basic::Compression;
-use parquet::file::properties::WriterProperties;
-use std::fs;
-use std::fs::File;
-use std::io::Seek;
-use std::io::{BufRead, BufReader, Cursor};
-use std::path::Path;
-use std::sync::Arc;
+use crate::process::{
+    convert::convert_to_final_types,
+    schema::{analyze_batch_for_schema, SchemaInfo},
+    trimming::apply_trimming,
+    utils::{clean_str, extract_date_from_filename},
+};
 use tracing::{debug, warn};
 
-/// 1) Trim whitespace + strip outer quotes if present.
-fn clean_str(raw: &str) -> String {
-    let trimmed = raw.trim();
-    if trimmed.starts_with('"') && trimmed.ends_with('"') && trimmed.len() >= 2 {
-        trimmed[1..trimmed.len() - 1].to_string()
-    } else {
-        trimmed.to_string()
-    }
-}
-
-/// 2) Infer Arrow dtype from a cleaned string, treating ANY parseable number as Float64.
-fn infer_arrow_dtype_from_str(s: &str) -> DataType {
-    if s.parse::<f64>().is_ok() {
-        DataType::Float64
-    } else {
-        DataType::Utf8
-    }
-}
-
-/// Schema inference and trimming detection
-struct SchemaInfo {
-    schema: Schema,
-    date_columns: Vec<String>,
-    trim_columns: Vec<String>,
-    table_name: String,
-}
-
-/// Streaming CSV batch accumulator
+/// Streams CSV data in-memory into Parquet files in batches, with timing diagnostics.
 pub struct StreamingCsvProcessor {
     max_batch_rows: usize,
     headers: Option<Vec<String>>,
@@ -84,19 +62,9 @@ impl StreamingCsvProcessor {
         self.parquet_bytes
     }
 
-    /// Initialize the processor with header and schema info
     pub fn initialize(&mut self, file_name: &str, header_line: &str, out_dir: &Path) -> Result<()> {
-        // Parse headers
         let headers: Vec<String> = header_line.trim().split(',').map(clean_str).collect();
 
-        // Build table name from headers 1,2,3
-        let table_name = if headers.len() >= 4 {
-            format!("{}---{}---{}", headers[1], headers[2], headers[3])
-        } else {
-            "default_table".to_string()
-        };
-
-        // Setup output directory and partition
         let partition_date = extract_date_from_filename(file_name).unwrap_or_else(|| {
             warn!(
                 "No date found in filename '{}'; using default partition",
@@ -105,6 +73,13 @@ impl StreamingCsvProcessor {
             "unknown-date".to_string()
         });
 
+        // derive table name
+        let table_name = if headers.len() >= 4 {
+            format!("{}---{}---{}", headers[1], headers[2], headers[3])
+        } else {
+            "default_table".to_string()
+        };
+
         let table_dir = out_dir.join(&table_name);
         fs::create_dir_all(&table_dir).context("creating table directory")?;
         let partition_dir = table_dir.join(format!("date={}", partition_date));
@@ -112,31 +87,27 @@ impl StreamingCsvProcessor {
 
         let final_name = format!("{}.parquet", file_name);
         let tmp_name = format!("{}.tmp", final_name);
-        let final_path = partition_dir.join(&final_name);
         let tmp_path = partition_dir.join(&tmp_name);
 
         self.headers = Some(headers);
         self.output_path = Some(tmp_path);
 
-        debug!("Initialized streaming processor for table: {}", table_name);
+        debug!("Initialized processor for table: {}", table_name);
         Ok(())
     }
 
-    /// Feed a data row (not header) to the processor
     pub fn feed_row(&mut self, line: &str) -> Result<()> {
         self.current_batch_lines.push(line.to_string());
         self.row_count += 1;
 
-        // If we've accumulated enough rows, process the batch
         if self.current_batch_lines.len() >= self.max_batch_rows {
             self.flush_current_batch()?;
         }
-
         Ok(())
     }
 
-    /// Process the current batch of lines
     fn flush_current_batch(&mut self) -> Result<()> {
+        let t0 = Instant::now();
         if self.current_batch_lines.is_empty() {
             return Ok(());
         }
@@ -146,413 +117,174 @@ impl StreamingCsvProcessor {
             .as_ref()
             .ok_or_else(|| anyhow!("Headers not initialized"))?;
 
-        // Create CSV content with header + current batch
-        let mut csv_content = headers.join(",") + "\n";
-        for line in &self.current_batch_lines {
-            csv_content.push_str(line);
-            if !line.ends_with('\n') {
-                csv_content.push('\n');
+        // build CSV in-memory
+        let mut csv = headers.join(",");
+        csv.push('\n');
+        for ln in &self.current_batch_lines {
+            csv.push_str(ln);
+            if !ln.ends_with('\n') {
+                csv.push('\n');
             }
         }
+        let t1 = Instant::now();
+        debug!("build CSV content took {:?}", t1 - t0);
 
-        // If this is the first batch, infer schema
+        // schema inference + writer on first batch
         if self.schema_info.is_none() {
-            let schema_info = self.infer_schema_from_batch(&csv_content, headers)?;
+            let t_schema = Instant::now();
+            let schema_info = self.infer_schema_from_batch(&csv, headers)?;
             self.schema_info = Some(schema_info);
             self.setup_parquet_writer()?;
+            debug!(
+                "schema inference + writer setup took {:?}",
+                Instant::now() - t_schema
+            );
         }
 
-        // Convert to Arrow batch and write
-        let batch = self.convert_csv_to_arrow_batch(&csv_content)?;
-
-        if let Some(ref mut writer) = self.writer {
-            writer.write(&batch).context("writing batch to Parquet")?;
-        }
-
+        // convert CSV → Arrow batch
+        let t_conv = Instant::now();
+        let batch = self.convert_csv_to_arrow_batch(&csv)?;
         debug!(
-            "Processed batch {} with {} rows",
-            self.batch_index,
-            self.current_batch_lines.len()
+            "convert_csv_to_arrow_batch took {:?}",
+            Instant::now() - t_conv
         );
+
+        // write to Parquet
+        let t_write = Instant::now();
+        if let Some(w) = self.writer.as_mut() {
+            w.write(&batch).context("writing batch to Parquet")?;
+        }
+        debug!("parquet write took {:?}", Instant::now() - t_write);
+        debug!("flush_current_batch total took {:?}", Instant::now() - t0);
 
         self.batch_index += 1;
         self.current_batch_lines.clear();
         Ok(())
     }
 
-    /// Infer schema from the first batch
-    fn infer_schema_from_batch(&self, csv_content: &str, headers: &[String]) -> Result<SchemaInfo> {
-        // Create initial string schema
-        let string_fields: Vec<Field> = headers
+    fn infer_schema_from_batch(&self, csv: &str, headers: &[String]) -> Result<SchemaInfo> {
+        // initial string schema
+        let fields: Vec<Field> = headers
             .iter()
-            .map(|name| Field::new(name, DataType::Utf8, true))
+            .map(|n| Field::new(n, DataType::Utf8, true))
             .collect();
-        let string_schema = Schema::new(string_fields);
+        let string_schema = Schema::new(fields);
 
-        // Read first batch to analyze types
-        let cursor = Cursor::new(csv_content.as_bytes());
-        let mut schema_reader = ReaderBuilder::new(Arc::new(string_schema))
+        let cursor = Cursor::new(csv.as_bytes());
+        let mut rdr = ReaderBuilder::new(Arc::new(string_schema))
             .with_header(true)
             .with_batch_size(1_000)
             .build(cursor)
             .context("creating CSV reader for schema inference")?;
 
-        let first_batch = schema_reader
-            .next()
-            .ok_or_else(|| anyhow!("No data found in CSV"))??;
-
-        analyze_batch_for_schema(&first_batch, headers)
+        let first = rdr.next().ok_or_else(|| anyhow!("No data in CSV"))??;
+        analyze_batch_for_schema(&first, headers)
     }
 
-    /// Setup the Parquet writer once we have schema info
     fn setup_parquet_writer(&mut self) -> Result<()> {
-        let schema_info = self
+        let si = self
             .schema_info
             .as_ref()
             .ok_or_else(|| anyhow!("Schema info not available"))?;
-        let output_path = self
+        let out_path = self
             .output_path
             .as_ref()
             .ok_or_else(|| anyhow!("Output path not set"))?;
 
-        let tmp_file = File::create(output_path).context("creating temporary Parquet file")?;
+        let tmp = File::create(out_path).context("creating temp Parquet file")?;
         let props = WriterProperties::builder()
-            // .set_compression(Compression::BROTLI(BrotliLevel::try_new(5)?))
-            .set_compression(Compression::SNAPPY)
+            .set_compression(Compression::BROTLI(BrotliLevel::try_new(5)?))
             .build();
 
-        let writer =
-            ArrowWriter::try_new(tmp_file, Arc::new(schema_info.schema.clone()), Some(props))
-                .context("initializing Parquet writer")?;
-
+        let writer = ArrowWriter::try_new(tmp, Arc::new(si.schema.clone()), Some(props))
+            .context("initializing Parquet writer")?;
         self.writer = Some(writer);
         Ok(())
     }
 
-    /// Convert CSV content to Arrow RecordBatch
-    fn convert_csv_to_arrow_batch(&self, csv_content: &str) -> Result<RecordBatch> {
+    fn convert_csv_to_arrow_batch(&self, csv: &str) -> Result<RecordBatch> {
         let headers = self.headers.as_ref().unwrap();
-        let schema_info = self.schema_info.as_ref().unwrap();
-
-        // Read as strings first
-        let string_fields: Vec<Field> = headers
+        // build string schema for this batch
+        let fields: Vec<Field> = headers
             .iter()
-            .map(|name| Field::new(name, DataType::Utf8, true))
+            .map(|n| Field::new(n, DataType::Utf8, true))
             .collect();
-        let string_schema = Schema::new(string_fields);
+        let schema = Schema::new(fields);
 
-        let cursor = Cursor::new(csv_content.as_bytes());
-        let mut csv_reader = ReaderBuilder::new(Arc::new(string_schema))
+        let cursor = Cursor::new(csv.as_bytes());
+        let mut rdr = ReaderBuilder::new(Arc::new(schema))
             .with_header(true)
             .with_batch_size(self.max_batch_rows)
             .build(cursor)
             .context("creating CSV reader for batch conversion")?;
 
-        let batch = csv_reader
-            .next()
-            .ok_or_else(|| anyhow!("No data in batch"))??;
-
-        // Apply trimming and type conversion
-        let trimmed = apply_trimming(&batch, &schema_info.trim_columns)?;
-        convert_to_final_types(&trimmed, schema_info)
+        let batch = rdr.next().ok_or_else(|| anyhow!("No data in batch"))??;
+        let trimmed = apply_trimming(&batch, &self.schema_info.as_ref().unwrap().trim_columns)?;
+        convert_to_final_types(&trimmed, self.schema_info.as_ref().unwrap())
     }
 
-    /// Finalize processing - flush remaining batch and close writer
+    /// Flush remaining data, close writer, and rename file
     pub fn finalize(&mut self) -> Result<u64> {
-        // Flush any remaining rows
         if !self.current_batch_lines.is_empty() {
             self.flush_current_batch()?;
         }
-
-        // Close the writer and get file size
-        if let Some(writer) = self.writer.take() {
-            writer.close().context("closing Parquet writer")?;
+        if let Some(mut w) = self.writer.take() {
+            w.close().context("closing Parquet writer")?;
         }
 
-        let output_path = self
+        let out_path = self
             .output_path
             .as_ref()
             .ok_or_else(|| anyhow!("Output path not set"))?;
+        let meta = fs::metadata(out_path).context("getting file metadata")?;
+        let bytes = meta.len();
+        self.parquet_bytes = bytes;
 
-        // Get file size
-        let metadata = fs::metadata(output_path).context("getting file metadata")?;
-        let parquet_bytes = metadata.len();
-        self.parquet_bytes = parquet_bytes;
-
-        // Rename to final location
-        let final_path = output_path.with_extension("parquet");
-        fs::rename(output_path, &final_path).context("renaming Parquet file into place")?;
+        let final_path = out_path.with_extension("parquet");
+        fs::rename(out_path, &final_path).context("renaming Parquet file")?;
 
         debug!(
-            "Finalized Parquet file: {} bytes written to {}",
-            parquet_bytes,
+            "Finalized Parquet file: {} bytes to {}",
+            bytes,
             final_path.display()
         );
-        Ok(parquet_bytes)
+        Ok(bytes)
     }
 }
 
-/// Stream-processing version of csv_to_parquet that reads line by line
+/// Top-level helper: stream a CSV string → Parquet streaming
 pub fn csv_to_parquet_streaming<R: BufRead>(
     mut reader: R,
     file_name: &str,
     out_dir: &Path,
 ) -> Result<u64> {
     const MAX_BATCH_ROWS: usize = 18_192;
+    let mut proc = StreamingCsvProcessor::new(MAX_BATCH_ROWS);
 
-    let mut processor = StreamingCsvProcessor::new(MAX_BATCH_ROWS);
+    // header
+    let mut hdr = String::new();
+    reader.read_line(&mut hdr)?;
+    proc.initialize(file_name, &hdr, out_dir)?;
 
-    // Read header line
-    let mut header_line = String::new();
-    reader.read_line(&mut header_line)?;
-
-    processor.initialize(file_name, &header_line, out_dir)?;
-
-    // Process data lines
     let mut line = String::new();
     loop {
         line.clear();
-        let bytes_read = reader.read_line(&mut line)?;
-        if bytes_read == 0 {
-            break; // EOF
+        let n = reader.read_line(&mut line)?;
+        if n == 0 {
+            break;
         }
-
-        // Skip empty lines
         if line.trim().is_empty() {
             continue;
         }
-
-        processor.feed_row(&line)?;
+        proc.feed_row(&line)?;
     }
 
-    processor.finalize()
+    proc.finalize()
 }
 
-/// Original function signature maintained for compatibility, but now streams the data
+/// Legacy compatibility: full CSV string → Parquet
 pub fn csv_to_parquet(file_name: &str, data: &str, out_dir: &Path) -> Result<u64> {
     let cursor = Cursor::new(data.as_bytes());
-    let reader = BufReader::new(cursor);
-    csv_to_parquet_streaming(reader, file_name, out_dir)
-}
-
-/// 5) Analyze first batch to detect schema, dates, and trimming needs
-fn analyze_batch_for_schema(
-    batch: &RecordBatch,
-    headers: &[String],
-) -> Result<SchemaInfo, anyhow::Error> {
-    let mut final_fields = Vec::new();
-    let mut date_columns = Vec::new();
-    let mut trim_columns = Vec::new();
-
-    // Build table name from headers 1,2,3
-    let table_name = if headers.len() >= 4 {
-        format!("{}---{}---{}", headers[1], headers[2], headers[3])
-    } else {
-        "default_table".to_string()
-    };
-
-    // Analyze each column
-    for (col_idx, header) in headers.iter().enumerate() {
-        let array = batch.column(col_idx);
-
-        if let Some(string_array) = array.as_any().downcast_ref::<StringArray>() {
-            let mut needs_trimming = false;
-            let mut is_date_column = false;
-            let mut inferred_type = DataType::Utf8;
-
-            // Check first non-null value
-            if let Some(first_val) = string_array.iter().find_map(|v| v) {
-                let cleaned = clean_str(first_val);
-
-                // Check if trimming changed the value
-                if cleaned != first_val {
-                    needs_trimming = true;
-                }
-
-                // Check if it's a date column
-                if NaiveDateTime::parse_from_str(&cleaned, "%Y/%m/%d %H:%M:%S").is_ok() {
-                    is_date_column = true;
-                } else {
-                    // Try to infer numeric type
-                    inferred_type = infer_arrow_dtype_from_str(&cleaned);
-                }
-            }
-
-            if needs_trimming {
-                trim_columns.push(header.clone());
-            }
-
-            if is_date_column {
-                date_columns.push(header.clone());
-                // Date columns get timestamp type in final schema
-                final_fields.push(Field::new(
-                    header,
-                    DataType::Timestamp(TimeUnit::Millisecond, Some("+10:00".into())),
-                    true,
-                ));
-            } else {
-                final_fields.push(Field::new(header, inferred_type, true));
-            }
-        } else {
-            // Shouldn't happen since we read everything as strings initially
-            final_fields.push(Field::new(header, DataType::Utf8, true));
-        }
-    }
-
-    debug!("Date columns detected: {:?}", date_columns);
-    debug!("Trim columns detected: {:?}", trim_columns);
-
-    Ok(SchemaInfo {
-        schema: Schema::new(final_fields),
-        date_columns,
-        trim_columns,
-        table_name,
-    })
-}
-
-/// 6) Apply string trimming to specified columns in a RecordBatch.
-fn apply_trimming(
-    batch: &RecordBatch,
-    trim_columns: &[String],
-) -> Result<RecordBatch, anyhow::Error> {
-    if trim_columns.is_empty() {
-        return Ok(batch.clone());
-    }
-
-    let mut new_columns = Vec::with_capacity(batch.num_columns());
-
-    for (col_idx, field) in batch.schema().fields().iter().enumerate() {
-        let array = batch.column(col_idx);
-
-        if trim_columns.contains(field.name()) {
-            // Apply trimming to this column
-            if let Some(string_array) = array.as_any().downcast_ref::<StringArray>() {
-                let trimmed: StringArray = string_array
-                    .iter()
-                    .map(|opt_str| opt_str.map(clean_str))
-                    .collect();
-                new_columns.push(Arc::new(trimmed) as ArrayRef);
-            } else {
-                new_columns.push(array.clone());
-            }
-        } else {
-            new_columns.push(array.clone());
-        }
-    }
-
-    Ok(RecordBatch::try_new(batch.schema(), new_columns)?)
-}
-
-/// 7) Convert columns to their final types (dates, numbers, etc.)
-fn convert_to_final_types(batch: &RecordBatch, schema_info: &SchemaInfo) -> Result<RecordBatch> {
-    // 1. Precompute the +10:00 offset once
-    let tz_offset = FixedOffset::east_opt(10 * 3600).expect("valid +10:00 offset");
-
-    // 2. Prepare output fields and columns
-    let mut out_cols: Vec<ArrayRef> = Vec::with_capacity(batch.num_columns());
-
-    for (array, target_field) in batch.columns().iter().zip(schema_info.schema.fields()) {
-        match (
-            array.as_any().downcast_ref::<StringArray>(),
-            target_field.data_type(),
-        ) {
-            // 3a. Date conversion path
-            (Some(sarr), DataType::Timestamp(TimeUnit::Millisecond, _))
-                if schema_info.date_columns.contains(target_field.name()) =>
-            {
-                let mut builder = TimestampMillisecondBuilder::new();
-                for opt_str in sarr.iter() {
-                    // parse → offset → millis, or None
-                    let ts = opt_str
-                        .and_then(|s| {
-                            NaiveDateTime::parse_from_str(&clean_str(s), "%Y/%m/%d %H:%M:%S").ok()
-                        })
-                        .and_then(|dt| {
-                            tz_offset
-                                .from_local_datetime(&dt)
-                                .single()
-                                .map(|dt_tz| dt_tz.timestamp_millis())
-                        });
-                    builder.append_option(ts);
-                }
-
-                let arr = builder.finish().with_timezone("+10:00");
-                out_cols.push(Arc::new(arr) as ArrayRef);
-            }
-
-            // 3b. Float64 conversion path
-            (Some(sarr), DataType::Float64) => {
-                let mut builder = Float64Builder::new();
-
-                for opt_str in sarr.iter() {
-                    let v = opt_str.and_then(|s| clean_str(s).parse::<f64>().ok());
-                    builder.append_option(v);
-                }
-
-                out_cols.push(Arc::new(builder.finish()) as ArrayRef);
-            }
-
-            // 3c. Everything else, leave untouched
-            _ => {
-                out_cols.push(array.clone());
-            }
-        }
-    }
-
-    // 4. Reuse the target schema directly
-    let out_schema = Arc::new(schema_info.schema.clone());
-    RecordBatch::try_new(out_schema, out_cols).map_err(Into::into)
-}
-
-/// 8) Extract date from filename for partitioning.
-fn extract_date_from_filename(filename: &str) -> Option<String> {
-    // Look for YYYYMMDD pattern (8 consecutive digits)
-    let chars: Vec<char> = filename.chars().collect();
-    for i in 0..chars.len().saturating_sub(7) {
-        if chars[i..i + 8].iter().all(|c| c.is_ascii_digit()) {
-            let date_str: String = chars[i..i + 8].iter().collect();
-            if let (Ok(year), Ok(month), Ok(day)) = (
-                date_str[0..4].parse::<u32>(),
-                date_str[4..6].parse::<u32>(),
-                date_str[6..8].parse::<u32>(),
-            ) {
-                if (2000..=2030).contains(&year)
-                    && (1..=12).contains(&month)
-                    && (1..=31).contains(&day)
-                {
-                    return Some(format!(
-                        "{}-{}-{}",
-                        &date_str[0..4],
-                        &date_str[4..6],
-                        &date_str[6..8]
-                    ));
-                }
-            }
-        }
-    }
-
-    // Look for YYYY-MM-DD or YYYY_MM_DD pattern
-    for i in 0..chars.len().saturating_sub(9) {
-        if chars.len() >= i + 10 {
-            let potential_date: String = chars[i..i + 10].iter().collect();
-            if potential_date.contains('-') || potential_date.contains('_') {
-                let parts: Vec<&str> = potential_date.split(&['-', '_'][..]).collect();
-                if parts.len() == 3 {
-                    if let (Ok(year), Ok(month), Ok(day)) = (
-                        parts[0].parse::<u32>(),
-                        parts[1].parse::<u32>(),
-                        parts[2].parse::<u32>(),
-                    ) {
-                        if (2000..=2030).contains(&year)
-                            && (1..=12).contains(&month)
-                            && (1..=31).contains(&day)
-                        {
-                            return Some(format!("{:04}-{:02}-{:02}", year, month, day));
-                        }
-                    }
-                }
-            }
-        }
-    }
-    None
+    let buf = BufReader::new(cursor);
+    csv_to_parquet_streaming(buf, file_name, out_dir)
 }

@@ -56,3 +56,4 @@ tokio-util = "0.7.15"
 futures-lite = "2.0"
 arrow-csv = "55.1.0"
 arrow-schema = "55.1.0"
+pprof = { version = "0.15", features = ["flamegraph", "prost-codec"] }

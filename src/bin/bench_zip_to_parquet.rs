@@ -1,9 +1,12 @@
-use std::env;
+use std::io::Write;
 use std::path::PathBuf;
 use std::time::Instant;
+use std::{env, fs::File};
 
 use anyhow::Result;
 use nemscraper::process::split::stream_zip_to_parquet;
+use pprof::protos::Message;
+use pprof::ProfilerGuard;
 use tracing::Level;
 use tracing_subscriber::{self, EnvFilter};
 
@@ -17,6 +20,9 @@ fn print_usage_and_exit(program: &str) -> ! {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // sample at 100Hz
+    let guard = ProfilerGuard::new(100).unwrap();
+
     // Initialize a basic tracing subscriber so that the `#[instrument]` on split_zip_to_parquet logs work.
     tracing_subscriber::fmt()
         .with_env_filter(EnvFilter::from_default_env().add_directive(Level::DEBUG.into()))
@@ -65,6 +71,14 @@ async fn main() -> Result<()> {
             eprintln!("❌ Error processing `{}`: {:#?}", input_path_or_url, e);
             std::process::exit(1);
         }
+    }
+
+    // build the report
+    // 1) still generate the SVG
+    if let Ok(report) = guard.report().build() {
+        let mut svg = File::create("flamegraph.svg")?;
+        report.flamegraph(&mut svg)?;
+        println!("Wrote flamegraph.svg");
     }
 
     Ok(())

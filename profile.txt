@@ -1,0 +1,107 @@
+File: bench_zip_to_parquet
+Type: cpu
+Time: Jun 14, 2025 at 1:54am (PDT)
+Duration: 6.96s, Total samples = 4.43s (63.66%)
+Showing nodes accounting for 4.18s, 94.36% of 4.43s total
+Dropped 74 nodes (cum <= 0.02s)
+      flat  flat%   sum%        cum   cum%
+     0.39s  8.80%  8.80%      0.41s  9.26%  arrow_array::builder::generic_bytes_builder::GenericByteBuilder<T>::append_value
+     0.36s  8.13% 16.93%      0.36s  8.13%  csv_core::reader::Reader::read_record
+     0.32s  7.22% 24.15%      0.32s  7.22%  cfree
+     0.24s  5.42% 29.57%      1.34s 30.25%  parquet::column::writer::GenericColumnWriter<E>::write_batch_internal
+     0.22s  4.97% 34.54%      0.65s 14.67%  <arrow_array::array::byte_array::GenericByteArray<T> as core::iter::traits::collect::FromIterator<core::option::Option<Ptr>>>::from_iter
+     0.21s  4.74% 39.28%      0.21s  4.74%  parquet::util::interner::Interner<S>::intern
+     0.19s  4.29% 43.57%      1.10s 24.83%  nemscraper::process::convert::convert_to_final_types
+     0.18s  4.06% 47.63%      0.35s  7.90%  core::num::dec2flt::<impl core::str::traits::FromStr for f64>::from_str
+     0.17s  3.84% 51.47%      0.17s  3.84%  core::num::dec2flt::parse::parse_number
+     0.17s  3.84% 55.30%      0.17s  3.84%  parquet::column::writer::compare_greater
+     0.15s  3.39% 58.69%      0.15s  3.39%  malloc
+     0.14s  3.16% 61.85%      0.50s 11.29%  parquet::column::writer::encoder::ColumnValueEncoderImpl<T>::write_slice
+     0.13s  2.93% 64.79%      0.19s  4.29%  <brotli::enc::backward_references::AdvHasher<Specialization,Alloc> as brotli::enc::backward_references::AnyHasher>::FindLongestMatch
+     0.10s  2.26% 67.04%      0.12s  2.71%  <parquet::arrow::arrow_writer::byte_array::ByteArrayEncoder as parquet::column::writer::encoder::ColumnValueEncoder>::write_gather
+     0.10s  2.26% 69.30%      0.10s  2.26%  __libc_realloc
+     0.08s  1.81% 71.11%      0.50s 11.29%  arrow_csv::reader::records::RecordDecoder::decode
+     0.07s  1.58% 72.69%      0.07s  1.58%  zlib_rs::inflate::inflate_fast_help_avx2
+     0.06s  1.35% 74.04%      0.07s  1.58%  arrow_csv::reader::records::RecordDecoder::flush
+     0.06s  1.35% 75.40%      0.06s  1.35%  brotli::enc::encode::hasher_setup
+     0.06s  1.35% 76.75%      0.06s  1.35%  brotli::enc::entropy_encode::BrotliCreateHuffmanTree
+     0.06s  1.35% 78.10%      0.06s  1.35%  core::slice::memchr::memchr_aligned
+     0.06s  1.35% 79.46%      4.22s 95.26%  nemscraper::process::csv_batch_processor::CsvBatchProcessor::feed_line
+     0.06s  1.35% 80.81%      0.20s  4.51%  nemscraper::process::utils::clean_str
+     0.05s  1.13% 81.94%      0.10s  2.26%  __rustc::__rdl_realloc
+     0.05s  1.13% 83.07%      3.84s 86.68%  nemscraper::process::chunk::StreamingCsvProcessor::flush_current_batch
+     0.05s  1.13% 84.20%      0.05s  1.13%  parquet::encodings::levels::LevelEncoder::put
+     0.05s  1.13% 85.33%      0.05s  1.13%  posix_memalign
+     0.04s   0.9% 86.23%      0.04s   0.9%  core::str::<impl str>::trim_matches
+     0.04s   0.9% 87.13%      0.22s  4.97%  std::io::append_to_string
+     0.03s  0.68% 87.81%      0.03s  0.68%  brotli::enc::entropy_encode::BrotliOptimizeHuffmanCountsForRle
+     0.03s  0.68% 88.49%      0.03s  0.68%  brotli::enc::entropy_encode::BrotliWriteHuffmanTree
+     0.03s  0.68% 89.16%      0.03s  0.68%  brotli::enc::metablock::BrotliBuildMetaBlockGreedyInternal
+     0.03s  0.68% 89.84%      0.03s  0.68%  brotli::enc::static_dict::FindMatchLengthWithLimit
+     0.03s  0.68% 90.52%      0.04s   0.9%  crc32fast::specialized::pclmulqdq::reduce128
+     0.03s  0.68% 91.20%      0.06s  1.35%  nemscraper::process::date_parser::parse_timestamp_millis
+     0.03s  0.68% 91.87%      0.03s  0.68%  write
+     0.02s  0.45% 92.33%      0.55s 12.42%  <parquet::column::writer::encoder::ColumnValueEncoderImpl<T> as parquet::column::writer::encoder::ColumnValueEncoder>::write_gather
+     0.02s  0.45% 92.78%      0.21s  4.74%  brotli::enc::backward_references::BrotliCreateBackwardReferences
+     0.02s  0.45% 93.23%      0.05s  1.13%  nemscraper::process::chunk::StreamingCsvProcessor::feed_row
+     0.01s  0.23% 93.45%      0.66s 14.90%  <alloc::vec::Vec<T> as alloc::vec::spec_from_iter::SpecFromIter<T,I>>::from_iter
+     0.01s  0.23% 93.68%      0.51s 11.51%  <parquet::compression::brotli_codec::BrotliCodec as parquet::compression::Codec>::compress
+     0.01s  0.23% 93.91%      1.23s 27.77%  arrow_csv::reader::BufReader<R>::read
+     0.01s  0.23% 94.13%      0.16s  3.61%  brotli::enc::brotli_bit_stream::store_meta_block
+     0.01s  0.23% 94.36%      0.04s   0.9%  parquet::encodings::encoding::dict_encoder::DictEncoder<T>::write_indices
+         0     0% 94.36%      0.20s  4.51%  <alloc::vec::into_iter::IntoIter<T,A> as core::iter::traits::iterator::Iterator>::try_fold
+         0     0% 94.36%      0.65s 14.67%  <core::iter::adapters::map::Map<I,F> as core::iter::traits::iterator::Iterator>::try_fold
+         0     0% 94.36%      0.07s  1.58%  <flate2::ffi::c::Inflate as flate2::ffi::InflateBackend>::decompress
+         0     0% 94.36%      0.07s  1.58%  <flate2::mem::Decompress as flate2::zio::Ops>::run
+         0     0% 94.36%      0.04s   0.9%  <parquet::column::writer::encoder::ColumnValueEncoderImpl<T> as parquet::column::writer::encoder::ColumnValueEncoder>::flush_data_page
+         0     0% 94.36%      0.04s   0.9%  <tokio::runtime::blocking::task::BlockingTask<T> as core::future::future::Future>::poll
+         0     0% 94.36%      4.39s 99.10%  <tracing::instrument::Instrumented<T> as core::future::future::Future>::poll
+         0     0% 94.36%      0.11s  2.48%  <zip::read::ZipFile<R> as std::io::Read>::read
+         0     0% 94.36%      4.39s 99.10%  __libc_start_main
+         0     0% 94.36%      4.39s 99.10%  _start
+         0     0% 94.36%      0.10s  2.26%  alloc::raw_vec::RawVecInner<A>::reserve::do_reserve_and_handle
+         0     0% 94.36%      0.10s  2.26%  alloc::raw_vec::finish_grow
+         0     0% 94.36%      0.20s  4.51%  alloc::vec::in_place_collect::from_iter_in_place
+         0     0% 94.36%      0.10s  2.26%  arrow_buffer::buffer::mutable::MutableBuffer::reallocate
+         0     0% 94.36%      0.50s 11.29%  arrow_csv::reader::Decoder::decode
+         0     0% 94.36%      0.72s 16.25%  arrow_csv::reader::Decoder::flush
+         0     0% 94.36%      4.39s 99.10%  bench_zip_to_parquet::main
+         0     0% 94.36%      0.12s  2.71%  brotli::enc::brotli_bit_stream::BlockEncoder<Alloc>::build_and_store_entropy_codes
+         0     0% 94.36%      0.04s   0.9%  brotli::enc::brotli_bit_stream::BrotliStoreHuffmanTree
+         0     0% 94.36%      0.12s  2.71%  brotli::enc::brotli_bit_stream::BuildAndStoreHuffmanTree
+         0     0% 94.36%      0.03s  0.68%  brotli::enc::metablock::BrotliOptimizeHistograms
+         0     0% 94.36%      0.39s  8.80%  brotli::enc::writer::CompressorWriterCustomIo<ErrType,W,BufferType,Alloc>::flush_or_close
+         0     0% 94.36%      0.85s 19.19%  core::iter::adapters::try_process
+         0     0% 94.36%      0.04s   0.9%  core::ops::function::FnOnce::call_once{{vtable.shim}}
+         0     0% 94.36%      0.04s   0.9%  crc32fast::Hasher::update
+         0     0% 94.36%      0.04s   0.9%  crc32fast::specialized::pclmulqdq::calculate
+         0     0% 94.36%      0.07s  1.58%  flate2::zio::read
+         0     0% 94.36%      4.39s 99.10%  main
+         0     0% 94.36%      0.35s  7.90%  nemscraper::process::chunk::StreamingCsvProcessor::finalize
+         0     0% 94.36%      4.16s 93.91%  nemscraper::process::chunk::csv_to_parquet
+         0     0% 94.36%      4.16s 93.91%  nemscraper::process::csv_batch_processor::CsvBatchProcessor::flush_batch
+         0     0% 94.36%      4.39s 99.10%  nemscraper::process::split::process_csv_entry
+         0     0% 94.36%      0.20s  4.51%  parquet::arrow::arrow_writer::ArrowColumnWriter::close
+         0     0% 94.36%      1.34s 30.25%  parquet::arrow::arrow_writer::ArrowColumnWriter::write
+         0     0% 94.36%      0.20s  4.51%  parquet::arrow::arrow_writer::ArrowRowGroupWriter::close
+         0     0% 94.36%      1.35s 30.47%  parquet::arrow::arrow_writer::ArrowRowGroupWriter::write
+         0     0% 94.36%      0.21s  4.74%  parquet::arrow::arrow_writer::ArrowWriter<W>::flush
+         0     0% 94.36%      1.36s 30.70%  parquet::arrow::arrow_writer::ArrowWriter<W>::write
+         0     0% 94.36%      0.08s  1.81%  parquet::arrow::arrow_writer::write_primitive
+         0     0% 94.36%      0.18s  4.06%  parquet::column::writer::ColumnWriter::close
+         0     0% 94.36%      0.43s  9.71%  parquet::column::writer::GenericColumnWriter<E>::add_data_page
+         0     0% 94.36%      0.19s  4.29%  parquet::column::writer::GenericColumnWriter<E>::write_dictionary_page
+         0     0% 94.36%      4.39s 99.10%  std::rt::lang_start::{{closure}}
+         0     0% 94.36%      4.39s 99.10%  std::rt::lang_start_internal
+         0     0% 94.36%      4.43s   100%  std::sys::backtrace::__rust_begin_short_backtrace
+         0     0% 94.36%      0.04s   0.9%  std::sys::pal::unix::thread::Thread::new::thread_start
+         0     0% 94.36%      0.04s   0.9%  tokio::runtime::blocking::pool::Inner::run
+         0     0% 94.36%      4.43s   100%  tokio::runtime::context::runtime::enter_runtime
+         0     0% 94.36%      0.04s   0.9%  tokio::runtime::context::scoped::Scoped<T>::set
+         0     0% 94.36%      4.39s 99.10%  tokio::runtime::park::CachedParkThread::block_on
+         0     0% 94.36%      0.04s   0.9%  tokio::runtime::scheduler::multi_thread::worker::Context::run
+         0     0% 94.36%      0.03s  0.68%  tokio::runtime::scheduler::multi_thread::worker::Context::run_task
+         0     0% 94.36%      0.04s   0.9%  tokio::runtime::scheduler::multi_thread::worker::run
+         0     0% 94.36%      0.04s   0.9%  tokio::runtime::task::core::Core<T,S>::poll
+         0     0% 94.36%      0.04s   0.9%  tokio::runtime::task::harness::Harness<T,S>::poll
+         0     0% 94.36%      0.07s  1.58%  zlib_rs::inflate::inflate
