@@ -194,6 +194,7 @@ impl StreamingCsvProcessor {
         let tmp = File::create(out_path).context("creating temp Parquet file")?;
         let props = WriterProperties::builder()
             .set_compression(Compression::BROTLI(BrotliLevel::try_new(5)?))
+            // .set_compression(Compression::SNAPPY)
             .build();
 
         let writer = ArrowWriter::try_new(tmp, Arc::new(si.schema.clone()), Some(props))
@@ -258,7 +259,7 @@ pub fn csv_to_parquet_streaming<R: BufRead>(
     file_name: &str,
     out_dir: &Path,
 ) -> Result<u64> {
-    const MAX_BATCH_ROWS: usize = 18_192;
+    const MAX_BATCH_ROWS: usize = 8_192;
     let mut proc = StreamingCsvProcessor::new(MAX_BATCH_ROWS);
 
     // header
