@@ -1,12 +1,13 @@
 use anyhow::{Context, Result};
 use futures_util::StreamExt;
 use reqwest;
-use std::io::{BufRead, BufReader, Cursor, Read};
+use std::io::{BufRead, BufReader, Cursor};
 use std::path::Path;
 use tracing::{debug, instrument, warn};
 use zip::ZipArchive;
 
-use super::csv_batch_processor::CsvBatchProcessor;
+// Import the unified processor
+use super::csv_processor::process_csv_entry_unified;
 
 /// A simple accumulator for rows and bytes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -25,12 +26,11 @@ impl RowsAndBytes {
     }
 }
 
-/// Streams a ZIP file from URL, processes each CSV into ~100 MiB Parquet chunks.
+/// Streams a ZIP file from URL, processes each CSV into chunks by D-row count.
 /// Uses minimal memory by streaming download and processing entries sequentially.
 #[instrument(level = "debug", skip(url, out_dir), fields(url = %url))]
 pub async fn stream_zip_to_parquet<P: AsRef<Path>>(url: &str, out_dir: P) -> Result<RowsAndBytes> {
-    const MAX_BATCH_BYTES: usize = 100 * 1024 * 1024; // 100 MiB
-
+    let max_data_rows_per_chunk = 1_000_000;
     debug!("Starting download from: {}", url);
 
     // Stream the ZIP file from URL
@@ -80,10 +80,14 @@ pub async fn stream_zip_to_parquet<P: AsRef<Path>>(url: &str, out_dir: P) -> Res
 
         debug!("Processing CSV entry: {}", name);
         let reader = BufReader::new(entry);
-        let entry_counts = process_csv_entry(reader, &name, out_dir.as_ref(), MAX_BATCH_BYTES)
-            .with_context(|| format!("processing CSV entry {}", name))?;
 
+        let (rows, bytes) =
+            process_csv_entry_unified(reader, &name, out_dir.as_ref(), max_data_rows_per_chunk)
+                .with_context(|| format!("processing CSV entry {}", name))?;
+
+        let entry_counts = RowsAndBytes { rows, bytes };
         totals.add(entry_counts);
+
         debug!(
             "Entry {} complete: {} rows, {} bytes",
             name, entry_counts.rows, entry_counts.bytes
@@ -97,74 +101,11 @@ pub async fn stream_zip_to_parquet<P: AsRef<Path>>(url: &str, out_dir: P) -> Res
     Ok(totals)
 }
 
-/// Process a single CSV entry (streaming from `reader`), skipping its top `C` header,
-/// then iterating line by line until EOF or a footer `C,`. Returns rows counted.
-fn process_csv_entry<R: BufRead>(
-    mut reader: R,
-    file_name: &str,
-    out_dir: &Path,
-    max_batch_bytes: usize,
-) -> Result<RowsAndBytes> {
-    // 1) Skip the very first "C" line (metadata header). If missing, warn and proceed.
-    skip_top_c_header(&mut reader, file_name);
-
-    // 2) Create a batch‐processor that holds state (current_i_line, batch string, batch_index, row_count).
-    let mut batcher = CsvBatchProcessor::new(max_batch_bytes);
-
-    // 3) Loop through every subsequent line until EOF or a "C," footer
-    let mut buf = String::new();
-    loop {
-        buf.clear();
-        let bytes_read = reader.read_line(&mut buf)?;
-        if bytes_read == 0 {
-            // EOF
-            break;
-        }
-
-        let trimmed = buf.trim_start();
-        if trimmed.starts_with("C,") {
-            // footer reached → stop reading further
-            break;
-        }
-
-        // Feed this line into the processor (it will flush or append as needed)
-        batcher.feed_line(&buf, file_name, out_dir)?;
-    }
-
-    // 4) Flush any remaining batch at EOF.
-    batcher.flush_final(file_name, out_dir)?;
-    let rows = batcher.row_count();
-    let bytes = batcher.parquet_bytes();
-    Ok(RowsAndBytes { rows, bytes })
-}
-
-/// Try to read exactly one line and check if it starts with a "C". If not, warn and continue.
-fn skip_top_c_header<R: BufRead>(reader: &mut R, file_name: &str) {
-    let mut peek = String::new();
-    match reader.read_line(&mut peek) {
-        Ok(n) => {
-            if n == 0 || !peek.trim_start().starts_with('C') {
-                warn!(
-                    "Expected a top C-line in {} but got {:?}. Continuing anyway.",
-                    file_name, peek
-                );
-            }
-        }
-        Err(e) => {
-            warn!(
-                "Unable to read top C-line in {}: {:?}. Continuing anyway.",
-                file_name, e
-            );
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use anyhow::Result;
     use glob::glob;
-    use std::path::PathBuf;
     use tempfile::tempdir;
     use tokio;
     use tracing_subscriber::{fmt, EnvFilter};
@@ -183,6 +124,7 @@ mod tests {
         // Test with a public ZIP file URL
         let url = "https://example.com/test.zip"; // Replace with actual test URL
         let output_dir = tempdir()?;
+        let max_rows_per_chunk = 10_000; // 10k D-rows per chunk
 
         let RowsAndBytes { rows, bytes } = stream_zip_to_parquet(url, output_dir.path()).await?;
 
