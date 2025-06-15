@@ -1,6 +1,6 @@
 use anyhow::Result;
 use chrono::Local;
-use nemscraper::process::split::stream_zip_to_parquet;
+use nemscraper::process::split::stream_zip_to_parquet_gcs;
 use pprof::ProfilerGuard;
 use std::{
     env,
@@ -36,14 +36,14 @@ async fn main() -> Result<()> {
 
     // Time the run
     let start = Instant::now();
-    let res = stream_zip_to_parquet(&input, &out_dir).await;
+    let res = stream_zip_to_parquet_gcs(&input, "aemo_data", None).await;
     let elapsed = start.elapsed().as_secs_f64();
 
     match res {
         Ok(metrics) => {
             println!(
                 "✅ Processed {} rows → {} bytes in {:.3}s",
-                metrics.rows, metrics.bytes, elapsed
+                metrics.0.rows, metrics.0.bytes, elapsed
             );
         }
         Err(e) => {

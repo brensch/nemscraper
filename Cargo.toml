@@ -56,7 +56,24 @@ tokio-util = "0.7.15"
 futures-lite = "2.0"
 arrow-csv = "55.1.0"
 arrow-schema = "55.1.0"
+arrow-arith = "55.1.0"
 pprof = { version = "0.15", features = ["flamegraph", "prost-codec"] }
 clap = { version = "4.0", features = ["derive"] }
 walkdir = "2.3"
 encoding_rs = "0.8"
+warp = "0.3.7"
+rustls = { version = "0.23", features = ["aws_lc_rs"] }
+
+# ========== Yoshidan Google Cloud Rust Clients ==========
+# note official google package is janked due to arrow Date clash.
+google-cloud-auth = { package = "gcloud-auth", version = "1.0.0" }
+google-cloud-storage = { package = "gcloud-storage", version = "1.0.0" }
+google-cloud-bigquery = { package = "gcloud-bigquery", version = "1.0.0" }
+
+# ========== Official Google Cloud Rust Clients ==========
+# google-cloud-auth = "0.20.0"    # auth helper (ADC, retries, timeouts)
+# google-cloud-storage = "0.24.0" # GCS client
+# google-cloud-bigquery = "0.15.0" # BigQuery client
+
+# [patch.crates-io]
+# arrow-arith = { git = "https://github.com/apache/arrow-rs.git", tag = "55.1.0", package = "arrow-arith" }

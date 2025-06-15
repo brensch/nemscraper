@@ -25,3 +25,36 @@ largest    | BROTLI       | 7     | 549416093       | 72331
 largest    | ZSTD         | 1     | 742352382       | 23886     
 largest    | ZSTD         | 10    | 582382671       | 67637     
 largest    | ZSTD         | 15    | 581370235       | 286124    
+
+
+## provision gcp client for viewing
+
+```
+# 1. Make sure you’re operating on the right project
+gcloud config set project selfforecasting
+
+# 2. Enable the BigQuery API (if not already)
+gcloud services enable bigquery.googleapis.com
+
+# 3. Create a dedicated service account for Grafana
+gcloud iam service-accounts create grafana-bq \
+  --display-name="Grafana BigQuery Client"
+
+# 4. Grant it permissions to run queries and read data
+gcloud projects add-iam-policy-binding selfforecasting \
+  --member="serviceAccount:grafana-bq@selfforecasting.iam.gserviceaccount.com" \
+  --role="roles/bigquery.jobUser"
+
+gcloud projects add-iam-policy-binding selfforecasting \
+  --member="serviceAccount:grafana-bq@selfforecasting.iam.gserviceaccount.com" \
+  --role="roles/bigquery.dataViewer"
+
+# note this is only for aemo_data
+gcloud storage buckets add-iam-policy-binding gs://aemo_data \
+  --member="serviceAccount:grafana-bq@selfforecasting.iam.gserviceaccount.com" \
+  --role="roles/storage.objectViewer"
+
+# 5. Create a JSON key for that service account
+gcloud iam service-accounts keys create grafana-bq-key.json \
+  --iam-account=grafana-bq@selfforecasting.iam.gserviceaccount.com
+```

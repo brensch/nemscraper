@@ -1,13 +1,12 @@
+use super::gcs_processor::process_csv_entry_gcs;
 use anyhow::{Context, Result};
 use futures_util::StreamExt;
 use reqwest;
+use std::io::Read;
 use std::io::{BufRead, BufReader, Cursor};
-use std::path::Path;
+use tokio::io::{AsyncBufReadExt, BufReader as AsyncBufReader};
 use tracing::{debug, instrument, warn};
 use zip::ZipArchive;
-
-// Import the unified processor
-use super::csv_processor::process_csv_entry_unified;
 
 /// A simple accumulator for rows and bytes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -25,11 +24,14 @@ impl RowsAndBytes {
         self.bytes = self.bytes.saturating_add(other.bytes);
     }
 }
-
-/// Streams a ZIP file from URL, processes each CSV into chunks by D-row count.
+/// Streams a ZIP file from URL, processes each CSV into chunks and uploads to GCS.
 /// Uses minimal memory by streaming download and processing entries sequentially.
-#[instrument(level = "debug", skip(url, out_dir), fields(url = %url))]
-pub async fn stream_zip_to_parquet<P: AsRef<Path>>(url: &str, out_dir: P) -> Result<RowsAndBytes> {
+#[instrument(level = "debug", skip(url, gcs_bucket), fields(url = %url, bucket = %gcs_bucket))]
+pub async fn stream_zip_to_parquet_gcs(
+    url: &str,
+    gcs_bucket: &str,
+    gcs_prefix: Option<&str>,
+) -> Result<(RowsAndBytes, Vec<String>)> {
     let max_data_rows_per_chunk = 1_000_000;
     debug!("Starting download from: {}", url);
 
@@ -69,6 +71,7 @@ pub async fn stream_zip_to_parquet<P: AsRef<Path>>(url: &str, out_dir: P) -> Res
         ZipArchive::new(cursor).context("Failed to create ZipArchive from downloaded data")?;
 
     let mut totals = RowsAndBytes::ZERO;
+    let mut all_gcs_objects = Vec::new();
 
     for idx in 0..archive.len() {
         let entry = archive.by_index(idx)?;
@@ -79,63 +82,46 @@ pub async fn stream_zip_to_parquet<P: AsRef<Path>>(url: &str, out_dir: P) -> Res
         }
 
         debug!("Processing CSV entry: {}", name);
-        let reader = BufReader::new(entry);
 
-        let (rows, bytes) =
-            process_csv_entry_unified(reader, &name, out_dir.as_ref(), max_data_rows_per_chunk)
-                .with_context(|| format!("processing CSV entry {}", name))?;
+        // Convert sync reader to async reader
+        let data = {
+            let mut buf = Vec::new();
+            let mut reader = BufReader::new(entry);
+            reader.read_to_end(&mut buf)?;
+            buf
+        };
 
-        let entry_counts = RowsAndBytes { rows, bytes };
-        totals.add(entry_counts);
+        let cursor = Cursor::new(data);
+        let async_reader = AsyncBufReader::new(cursor);
+
+        let (metrics, gcs_objects) = process_csv_entry_gcs(
+            async_reader,
+            &name,
+            gcs_bucket,
+            gcs_prefix,
+            max_data_rows_per_chunk,
+        )
+        .await
+        .with_context(|| format!("processing CSV entry {}", name))?;
+
+        totals.add(metrics);
+        all_gcs_objects.extend(gcs_objects);
 
         debug!(
-            "Entry {} complete: {} rows, {} bytes",
-            name, entry_counts.rows, entry_counts.bytes
+            "Entry {} complete: {} rows, {} bytes, {} GCS objects created",
+            name,
+            metrics.rows,
+            metrics.bytes,
+            all_gcs_objects.len()
         );
     }
 
     debug!(
-        "Completed ZIP: total rows = {}, total bytes = {}",
-        totals.rows, totals.bytes
+        "Completed ZIP: total rows = {}, total bytes = {}, total GCS objects = {}",
+        totals.rows,
+        totals.bytes,
+        all_gcs_objects.len()
     );
-    Ok(totals)
-}
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use anyhow::Result;
-    use glob::glob;
-    use tempfile::tempdir;
-    use tokio;
-    use tracing_subscriber::{fmt, EnvFilter};
-
-    fn init_logging() {
-        let _ = fmt()
-            .with_env_filter(EnvFilter::new("debug"))
-            .with_target(false)
-            .try_init();
-    }
-
-    #[tokio::test]
-    async fn integration_stream_zip_to_parquet() -> Result<()> {
-        init_logging();
-
-        // Test with a public ZIP file URL
-        let url = "https://example.com/test.zip"; // Replace with actual test URL
-        let output_dir = tempdir()?;
-        let max_rows_per_chunk = 10_000; // 10k D-rows per chunk
-
-        let RowsAndBytes { rows, bytes } = stream_zip_to_parquet(url, output_dir.path()).await?;
-
-        assert!(rows > 0, "Expected at least one row, got {}", rows);
-        assert!(bytes > 0, "Expected some bytes, got {}", bytes);
-
-        // Check for generated parquet files
-        let pattern = format!("{}/**/*.parquet", output_dir.path().display());
-        let parquet_files: Vec<_> = glob(&pattern)?.filter_map(Result::ok).collect();
-        assert!(!parquet_files.is_empty(), "No .parquet files found");
-
-        Ok(())
-    }
+    Ok((totals, all_gcs_objects))
 }
