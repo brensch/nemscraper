@@ -66,14 +66,15 @@ rustls = { version = "0.23", features = ["aws_lc_rs"] }
 
 # ========== Yoshidan Google Cloud Rust Clients ==========
 # note official google package is janked due to arrow Date clash.
-google-cloud-auth = { package = "gcloud-auth", version = "1.0.0" }
-google-cloud-storage = { package = "gcloud-storage", version = "1.0.0" }
+# google-cloud-auth = { package = "gcloud-auth", version = "1.0.0" }
+# google-cloud-storage = { package = "gcloud-storage", version = "1.0.0" }
 google-cloud-bigquery = { package = "gcloud-bigquery", version = "1.0.0" }
 bytes = "1.10.1"
 
 # ========== Official Google Cloud Rust Clients ==========
-# google-cloud-auth = "0.20.0"    # auth helper (ADC, retries, timeouts)
-# google-cloud-storage = "0.24.0" # GCS client
+google-cloud-auth = "0.20.0"    # auth helper (ADC, retries, timeouts)
+google-cloud-storage = "0.24.0" # GCS client
+# note the official bigquery client has issues with arrow Date types
 # google-cloud-bigquery = "0.15.0" # BigQuery client
 
 # [patch.crates-io]

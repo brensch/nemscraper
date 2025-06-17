@@ -103,7 +103,7 @@ pub async fn stream_zip_to_parquet_gcs(
             let mut totals = RowsAndBytes::ZERO;
             let mut objects = Vec::new();
             let handle = tokio::runtime::Handle::current();
-            let max_rows = 512_000;
+            let max_rows = 256_000;
 
             for idx in 0..archive.len() {
                 let mut entry = archive
