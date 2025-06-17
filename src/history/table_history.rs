@@ -124,6 +124,9 @@ impl<R: HistoryRow + Send + Sync + 'static> TableHistory<R> {
         writer.write(&batch)?;
         writer.close()?;
         fs::rename(&tmp, &final_path)?;
+        // now update the in-memory seen set
+        let mut seen = self.seen.lock().unwrap();
+        seen.insert(key);
         Ok(())
     }
 
