@@ -3,6 +3,7 @@ use arrow::array::*;
 use arrow::csv::ReaderBuilder;
 use arrow::datatypes::*;
 use arrow::record_batch::RecordBatch;
+use chrono::{FixedOffset, NaiveDate};
 use chrono::{NaiveDateTime, TimeZone};
 use parquet::arrow::ArrowWriter;
 use parquet::basic::BrotliLevel;
@@ -172,7 +173,46 @@ fn apply_trimming(
     Ok(RecordBatch::try_new(batch.schema(), new_columns)?)
 }
 
-/// 7) Convert columns to their final types (dates, numbers, etc.)
+/// Convert a string array to a timezone-aware timestamp array
+fn convert_date_column(array: &ArrayRef, target_field: &Field) -> (Field, ArrayRef) {
+    if let Some(string_array) = array.as_any().downcast_ref::<StringArray>() {
+        let timestamps: Vec<Option<i64>> = string_array
+            .iter()
+            .map(|opt_str| {
+                opt_str.and_then(|s| {
+                    let cleaned = clean_str(s);
+                    parse_timestamp_millis(&cleaned)
+                })
+            })
+            .collect();
+
+        let timestamp_array = TimestampMillisecondArray::from(timestamps).with_timezone("+10:00");
+        (target_field.clone(), Arc::new(timestamp_array) as ArrayRef)
+    } else {
+        (target_field.clone(), array.clone())
+    }
+}
+
+/// Convert a string array to a float64 array
+fn convert_numeric_column(array: &ArrayRef, target_field: &Field) -> (Field, ArrayRef) {
+    if let Some(string_array) = array.as_any().downcast_ref::<StringArray>() {
+        let floats: Float64Array = string_array
+            .iter()
+            .map(|opt_str| {
+                opt_str.and_then(|s| {
+                    let cleaned = clean_str(s);
+                    cleaned.parse::<f64>().ok()
+                })
+            })
+            .collect();
+
+        (target_field.clone(), Arc::new(floats) as ArrayRef)
+    } else {
+        (target_field.clone(), array.clone())
+    }
+}
+
+/// Convert columns to their final types (dates, numbers, etc.)
 fn convert_to_final_types(
     batch: &RecordBatch,
     schema_info: &SchemaInfo,
@@ -184,71 +224,22 @@ fn convert_to_final_types(
         let array = batch.column(col_idx);
         let target_field = &schema_info.schema.fields()[col_idx];
 
-        if schema_info.date_columns.contains(field.name()) {
-            // Convert date column
-            if let Some(string_array) = array.as_any().downcast_ref::<StringArray>() {
-                // Parse naive datetimes first
-                let naive_timestamps: Vec<Option<i64>> = string_array
-                    .iter()
-                    .map(|opt_str| {
-                        opt_str.and_then(|s| {
-                            let cleaned = clean_str(s);
-                            NaiveDateTime::parse_from_str(&cleaned, "%Y/%m/%d %H:%M:%S")
-                                .ok()
-                                .map(|dt| {
-                                    // Treat the naive datetime as being in +10:00 timezone
-                                    // and convert to UTC timestamp
-                                    let offset = chrono::FixedOffset::east_opt(10 * 3600).unwrap();
-                                    offset
-                                        .from_local_datetime(&dt)
-                                        .single()
-                                        .map(|dt_tz| dt_tz.timestamp_millis())
-                                        .unwrap_or(0)
-                                })
-                        })
-                    })
-                    .collect();
-
-                // Create timezone-aware timestamp array
-                let timestamps =
-                    TimestampMillisecondArray::from(naive_timestamps).with_timezone("+10:00");
-
-                new_fields.push((**target_field).clone()); // Use target field with correct timestamp type
-                new_columns.push(Arc::new(timestamps) as ArrayRef);
-            } else {
-                new_fields.push((**target_field).clone());
-                new_columns.push(array.clone());
-            }
+        let (converted_field, converted_column) = if schema_info.date_columns.contains(field.name())
+        {
+            convert_date_column(array, target_field)
         } else if target_field.data_type() == &DataType::Float64 {
-            // Convert numeric column
-            if let Some(string_array) = array.as_any().downcast_ref::<StringArray>() {
-                let floats: Float64Array = string_array
-                    .iter()
-                    .map(|opt_str| {
-                        opt_str.and_then(|s| {
-                            let cleaned = clean_str(s);
-                            cleaned.parse::<f64>().ok()
-                        })
-                    })
-                    .collect();
-
-                new_fields.push((**target_field).clone()); // Use target field with Float64 type
-                new_columns.push(Arc::new(floats) as ArrayRef);
-            } else {
-                new_fields.push((**target_field).clone());
-                new_columns.push(array.clone());
-            }
+            convert_numeric_column(array, target_field)
         } else {
-            // Keep as string
-            new_fields.push((**target_field).clone());
-            new_columns.push(array.clone());
-        }
+            ((**target_field).clone(), array.clone())
+        };
+
+        new_fields.push(converted_field);
+        new_columns.push(converted_column);
     }
 
     let new_schema = Arc::new(Schema::new(new_fields));
     Ok(RecordBatch::try_new(new_schema, new_columns)?)
 }
-
 /// 8) Extract date from filename for partitioning.
 fn extract_date_from_filename(filename: &str) -> Option<String> {
     // Look for YYYYMMDD pattern (8 consecutive digits)
@@ -405,4 +396,26 @@ pub fn csv_to_parquet(file_name: &str, data: &str, out_dir: &Path) -> Result<u64
     );
 
     Ok(parquet_bytes)
+}
+
+/// Fast parse of `"YYYY/MM/DD HH:MM:SS"` → millis UTC
+pub fn parse_timestamp_millis(s: &str) -> Option<i64> {
+    let s = s.trim();
+    // minimal length + separators check
+    if s.len() < 19 || &s[4..5] != "/" || &s[7..8] != "/" || &s[10..11] != " " {
+        return None;
+    }
+    let year: i32 = s[0..4].parse().ok()?;
+    let month: u32 = s[5..7].parse().ok()?;
+    let day: u32 = s[8..10].parse().ok()?;
+    let hour: u32 = s[11..13].parse().ok()?;
+    let min: u32 = s[14..16].parse().ok()?;
+    let sec: u32 = s[17..19].parse().ok()?;
+
+    let naive = NaiveDate::from_ymd_opt(year, month, day)?.and_hms_opt(hour, min, sec)?;
+    let offset = FixedOffset::east_opt(10 * 3600).unwrap();
+    offset
+        .from_local_datetime(&naive)
+        .single()
+        .map(|dt| dt.timestamp_millis())
 }
