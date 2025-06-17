@@ -33,7 +33,6 @@ services:
       - /proc:/host/proc:ro
       - /sys:/host/sys:ro
       - /:/rootfs:ro
-      # Mount our dedicated “textfile” folder for metrics
       - ./node_exporter_textfile:/var/lib/node_exporter/textfile_collector:ro
     command:
       - "--path.procfs=/host/proc"
@@ -49,6 +48,21 @@ services:
     volumes:
       - ./assets:/assets
       - ./node_exporter_textfile:/textfile
+
+  file-uploader:
+    build:
+      context: .
+      dockerfile: Dockerfile.uploader
+    working_dir: /usr/src/app
+    user: "1000:1000"
+    environment:
+        GOOGLE_APPLICATION_CREDENTIALS: /usr/src/app/secrets/gcs.json
+    volumes:
+      - ./secrets/uploader-sa.json:/usr/src/app/secrets/gcs.json:ro
+      - ./assets:/usr/src/app/assets
+    command:
+      - "--repo-path=assets/parquet/"
+      - "--bucket=aemo_data"
 
   nemscraper:
     build:

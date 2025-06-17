@@ -27,6 +27,11 @@ FROM debian:bookworm-slim
 
 WORKDIR /usr/src/app
 
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends \
+      ca-certificates \
+ && rm -rf /var/lib/apt/lists/*
+
 # Copy the compiled binary from the builder stage
 COPY --from=builder /usr/src/app/target/release/upload_files /usr/src/app/upload_files
 
