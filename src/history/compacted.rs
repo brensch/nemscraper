@@ -1,7 +1,7 @@
 use anyhow::{Context, Result};
 use arrow::array::ArrayRef;
 use arrow::record_batch::RecordBatch;
-use chrono::{DateTime, NaiveDate, Utc};
+use chrono::{DateTime, Datelike, NaiveDate, Utc};
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use parquet::{arrow::ArrowWriter, file::properties::WriterProperties};
 use std::{
@@ -28,7 +28,7 @@ impl HistoryRow for InputCompactionRow {
     const KEY_COLUMN: usize = 0; // unique by input_file
 
     fn partition_date(&self) -> NaiveDate {
-        self.partition
+        self.compaction_end.date_naive()
     }
 
     fn schema() -> arrow::datatypes::Schema {
@@ -38,6 +38,7 @@ impl HistoryRow for InputCompactionRow {
         };
         ArrowSchema::new(vec![
             Field::new("input_file", ArrowDataType::Utf8, false),
+            Field::new("partition", ArrowDataType::Date32, false),
             Field::new(
                 "compaction_start",
                 ArrowDataType::Timestamp(TimeUnit::Microsecond, None),
@@ -56,6 +57,9 @@ impl HistoryRow for InputCompactionRow {
         use arrow::array::{StringArray, TimestampMicrosecondArray, UInt32Array};
         vec![
             Arc::new(StringArray::from(vec![self.input_file.clone()])),
+            Arc::new(arrow::array::Date32Array::from(vec![
+                self.partition.num_days_from_ce() as i32,
+            ])),
             Arc::new(TimestampMicrosecondArray::from(vec![self
                 .compaction_start
                 .timestamp_micros()])),
@@ -68,5 +72,11 @@ impl HistoryRow for InputCompactionRow {
 
     fn unique_key(&self) -> String {
         self.input_file.clone()
+    }
+}
+
+impl TableHistory<InputCompactionRow> {
+    pub fn new_compacted(base: impl Into<PathBuf>) -> Result<Arc<Self>> {
+        TableHistory::new(base, "compacted")
     }
 }

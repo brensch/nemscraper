@@ -1,0 +1,42 @@
+# Stage 1: build the Rust binary
+FROM rust:1.87 AS builder
+
+# Create app directory
+WORKDIR /usr/src/app
+
+# Copy only Cargo.toml and Cargo.lock first to leverage caching
+COPY Cargo.toml Cargo.lock ./
+
+# Create a dummy src to allow cargo to fetch dependencies before copying actual code
+# This speeds up rebuilds when dependencies haven't changed.
+RUN mkdir src
+RUN echo "fn main() { println!(\"dummy build\"); }" > src/main.rs
+
+# Build a dummy release so that dependencies are cached
+RUN cargo build --release
+RUN rm -f src/main.rs
+
+# Now overwrite with the real source code
+COPY src ./src
+
+# Build the actual release binary
+RUN cargo build --release
+
+# Stage 2: create a minimal runtime image
+FROM debian:bookworm-slim
+
+WORKDIR /usr/src/app
+
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends \
+      ca-certificates \
+ && rm -rf /var/lib/apt/lists/*
+
+# Copy the compiled binary from the builder stage
+COPY --from=builder /usr/src/app/target/release/upload_files /usr/src/app/compactor
+
+# Ensure binary is executable
+RUN chmod +x /usr/src/app/compactor
+
+# By default, just run the compactor binary
+ENTRYPOINT ["./compactor"]

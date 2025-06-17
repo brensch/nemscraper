@@ -64,6 +64,22 @@ services:
       - "--repo-path=assets/parquet/"
       - "--bucket=aemo_data"
 
+
+  file-compactor:
+    build:
+      context: .
+      dockerfile: Dockerfile.uploader
+    working_dir: /usr/src/app
+    user: "1000:1000"
+    environment:
+        GOOGLE_APPLICATION_CREDENTIALS: /usr/src/app/secrets/gcs.json
+    volumes:
+      - ./assets:/usr/src/app/assets
+    command:
+      - "./assets/parquet"
+      - "./assets/compacted"
+      - "./assets/history"
+
   nemscraper:
     build:
       context: .

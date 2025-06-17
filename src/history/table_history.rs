@@ -72,7 +72,8 @@ impl<R: HistoryRow + Send + Sync + 'static> TableHistory<R> {
                 .with_context(|| format!("failed to open `{}`", path.display()))?;
             let mut reader = ParquetRecordBatchReaderBuilder::try_new(file)?
                 .with_batch_size(1024)
-                .build()?;
+                .build()
+                .with_context(|| "failed to build Parquet reader")?;
             while let Some(batch) = reader.next().transpose()? {
                 for row_idx in 0..batch.num_rows() {
                     let key = R::extract_key(&batch, row_idx);
@@ -111,15 +112,17 @@ impl<R: HistoryRow + Send + Sync + 'static> TableHistory<R> {
         let arrays = row.to_arrays();
         let partition = format!("date={}", date.format("%Y%m%d"));
         let dir = self.base_dir.join(&self.table).join(partition);
-        fs::create_dir_all(&dir)?;
+        fs::create_dir_all(&dir).context("failed to create partition directory")?;
 
         let ts = Utc::now().timestamp_micros();
         let fname = format!("{}---{}.parquet", key, ts);
         let tmp = dir.join(format!("{}.tmp", fname));
         let final_path = dir.join(&fname);
 
-        let file = File::create(&tmp)?;
-        let mut writer = ArrowWriter::try_new(BufWriter::new(file), self.schema.clone(), None)?;
+        let file = File::create(&tmp)
+            .with_context(|| format!("failed to create temporary file `{}`", tmp.display()))?;
+        let mut writer = ArrowWriter::try_new(BufWriter::new(file), self.schema.clone(), None)
+            .with_context(|| format!("failed to create ArrowWriter for `{}`", tmp.display()))?;
         let batch = RecordBatch::try_new(self.schema.clone(), arrays)?;
         writer.write(&batch)?;
         writer.close()?;
