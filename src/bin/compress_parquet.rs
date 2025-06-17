@@ -121,7 +121,7 @@ fn main() -> Result<()> {
                         File::open(path).expect("open part file"),
                     )
                     .expect("build batch reader")
-                    .with_batch_size(2048)
+                    .with_batch_size(4096)
                     .build()
                     .expect("finalize reader");
 

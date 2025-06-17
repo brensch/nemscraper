@@ -1,0 +1,29 @@
+# 1) Builder stage: compile Rust in release mode
+FROM rust:1.87 AS builder
+WORKDIR /app
+
+# Cache dependencies
+COPY Cargo.toml Cargo.lock ./
+RUN mkdir src \
+    && echo 'fn main(){}' > src/main.rs \
+    && cargo build --release
+
+# Copy source and rebuild actual binary
+COPY . .
+RUN rm ./target/release/deps/api_processor* || true
+RUN cargo build --release
+
+# 2) Runtime stage: minimal Linux+CA certs
+FROM debian:bookworm-slim
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends \
+        ca-certificates && \
+    rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+COPY --from=builder /app/target/release/api_processor /usr/local/bin/api_processor
+
+# Use the PORT from Cloud Run
+ENV RUST_LOG=info
+EXPOSE 8080
+ENTRYPOINT ["/usr/local/bin/api_processor"]
