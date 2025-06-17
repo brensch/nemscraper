@@ -33,7 +33,7 @@ RUN apt-get update \
  && rm -rf /var/lib/apt/lists/*
 
 # Copy the compiled binary from the builder stage
-COPY --from=builder /usr/src/app/target/release/upload_files /usr/src/app/compactor
+COPY --from=builder /usr/src/app/target/release/compactor /usr/src/app/compactor
 
 # Ensure binary is executable
 RUN chmod +x /usr/src/app/compactor
