@@ -1022,123 +1022,6 @@
                         "mode": "thresholds"
                     },
                     "custom": {
-                        "align": "auto",
-                        "cellOptions": {
-                            "type": "auto"
-                        },
-                        "inspect": false
-                    },
-                    "mappings": [],
-                    "thresholds": {
-                        "mode": "absolute",
-                        "steps": [
-                            {
-                                "color": "green"
-                            },
-                            {
-                                "color": "red",
-                                "value": 80
-                            }
-                        ]
-                    }
-                },
-                "overrides": [
-                    {
-                        "matcher": {
-                            "id": "byName",
-                            "options": "download_size_bytes"
-                        },
-                        "properties": [
-                            {
-                                "id": "unit",
-                                "value": "decbytes"
-                            }
-                        ]
-                    },
-                    {
-                        "matcher": {
-                            "id": "byName",
-                            "options": "processed_size_bytes"
-                        },
-                        "properties": [
-                            {
-                                "id": "unit",
-                                "value": "decbytes"
-                            }
-                        ]
-                    }
-                ]
-            },
-            "gridPos": {
-                "h": 11,
-                "w": 24,
-                "x": 0,
-                "y": 23
-            },
-            "id": 12,
-            "options": {
-                "cellHeight": "sm",
-                "footer": {
-                    "countRows": false,
-                    "fields": "",
-                    "reducer": [
-                        "sum"
-                    ],
-                    "show": false
-                },
-                "showHeader": true,
-                "sortBy": [
-                    {
-                        "desc": true,
-                        "displayName": "downloading_duration_seconds"
-                    }
-                ]
-            },
-            "pluginVersion": "12.0.1",
-            "targets": [
-                {
-                    "datasource": {
-                        "type": "motherduck-duckdb-datasource",
-                        "uid": "P18CE15CC9D3BAB28"
-                    },
-                    "editorMode": "code",
-                    "format": 1,
-                    "rawQuery": true,
-                    "rawSql": "SELECT\r\n  p.filename,\r\n  d.url,\r\n  d.download_start,\r\n  d.download_end,\r\n  p.processing_start,\r\n  p.processing_end,\r\n  d.size_bytes     AS download_size_bytes,\r\n  p.size_bytes     AS processed_size_bytes,\r\n  p.total_rows,\r\n  (DATEDIFF('microsecond', p.processing_start, p.processing_end) / 1e6) AS processing_duration_seconds,\r\n  (DATEDIFF('microsecond', d.download_start, d.download_end) / 1e6) AS downloading_duration_seconds\r\nFROM\r\n  read_parquet(\r\n    '/data/history/processed/date=*/**/*.parquet',\r\n    union_by_name => TRUE\r\n  ) AS p\r\nLEFT JOIN\r\n  read_parquet(\r\n    '/data/history/downloaded/date=*/**/*.parquet',\r\n    union_by_name => TRUE\r\n  ) AS d\r\n  ON p.filename = d.filename\r\nORDER BY\r\n  p.processing_end DESC;\r\n",
-                    "refId": "A",
-                    "sql": {
-                        "columns": [
-                            {
-                                "parameters": [],
-                                "type": "function"
-                            }
-                        ],
-                        "groupBy": [
-                            {
-                                "property": {
-                                    "type": "string"
-                                },
-                                "type": "groupBy"
-                            }
-                        ],
-                        "limit": 50
-                    }
-                }
-            ],
-            "title": "Processed",
-            "type": "table"
-        },
-        {
-            "datasource": {
-                "type": "motherduck-duckdb-datasource",
-                "uid": "P18CE15CC9D3BAB28"
-            },
-            "fieldConfig": {
-                "defaults": {
-                    "color": {
-                        "mode": "thresholds"
-                    },
-                    "custom": {
                         "axisPlacement": "auto",
                         "fillOpacity": 70,
                         "hideFrom": {
@@ -1166,7 +1049,7 @@
                 "h": 5,
                 "w": 24,
                 "x": 0,
-                "y": 34
+                "y": 23
             },
             "id": 13,
             "options": {
@@ -1270,7 +1153,7 @@
                 "h": 24,
                 "w": 24,
                 "x": 0,
-                "y": 39
+                "y": 28
             },
             "id": 14,
             "options": {
@@ -1339,5 +1222,5 @@
     "timezone": "browser",
     "title": "File Stats",
     "uid": "a78f110c-caac-4f47-96d3-5772ce7d2120",
-    "version": 1
+    "version": 2
 }
