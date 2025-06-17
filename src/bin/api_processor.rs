@@ -1,12 +1,8 @@
 use anyhow::Result;
-use chrono::Local;
 use nemscraper::process::split::stream_zip_to_parquet_gcs;
-use pprof::ProfilerGuard;
 use serde::{Deserialize, Serialize};
 use std::{
     env,
-    fs::{self, File},
-    path::PathBuf,
     time::Instant,
 };
 use tracing::{info, warn, Level};
