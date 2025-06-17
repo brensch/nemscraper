@@ -67,3 +67,4 @@ google-cloud-storage = "0.24.0" # GCS client
 
 notify = "5.1.0"                                  # file-system watcher
 clap = { version = "4.2", features = ["derive"] } # CLI parsing
+walkdir = "2.5.0"
