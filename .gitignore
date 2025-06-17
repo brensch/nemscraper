@@ -24,4 +24,4 @@ logs/
 *.prom
 *.tmp
 
-secrets/
+secrets/*.json
