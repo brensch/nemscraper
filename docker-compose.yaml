@@ -68,11 +68,9 @@ services:
   file-compactor:
     build:
       context: .
-      dockerfile: Dockerfile.uploader
+      dockerfile: Dockerfile.compactor
     working_dir: /usr/src/app
     user: "1000:1000"
-    environment:
-        GOOGLE_APPLICATION_CREDENTIALS: /usr/src/app/secrets/gcs.json
     volumes:
       - ./assets:/usr/src/app/assets
     command:
