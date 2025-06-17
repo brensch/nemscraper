@@ -2598,6 +2598,7 @@ dependencies = [
  "arrow-csv",
  "arrow-schema 55.1.0",
  "async_zip",
+ "bytes",
  "chrono",
  "clap",
  "encoding_rs",
