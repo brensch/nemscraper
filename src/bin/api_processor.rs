@@ -51,21 +51,6 @@ async fn process_zip(req: ProcessRequest) -> Result<impl Reply, Rejection> {
         req.zip_url, req.gcs_bucket, req.gcs_prefix
     );
 
-    // Optional profiling for development
-    let enable_profiling = env::var("ENABLE_PROFILING").unwrap_or_default() == "true";
-    let _guard = if enable_profiling {
-        Some(
-            ProfilerGuard::new(100)
-                .map_err(|e| {
-                    warn!("Failed to start profiler: {}", e);
-                    e
-                })
-                .ok(),
-        )
-    } else {
-        None
-    };
-
     match stream_zip_to_parquet_gcs(&req.zip_url, &req.gcs_bucket, req.gcs_prefix.as_deref()).await
     {
         Ok((metrics, gcs_objects)) => {
@@ -78,15 +63,6 @@ async fn process_zip(req: ProcessRequest) -> Result<impl Reply, Rejection> {
                 elapsed,
                 gcs_objects.len()
             );
-
-            // Write flamegraph if profiling enabled
-            if enable_profiling {
-                if let Some(Some(guard)) = _guard {
-                    write_flamegraph(guard).await.unwrap_or_else(|e| {
-                        warn!("Failed to write flamegraph: {}", e);
-                    });
-                }
-            }
 
             Ok(warp::reply::json(&ProcessResponse {
                 success: true,
@@ -107,20 +83,6 @@ async fn process_zip(req: ProcessRequest) -> Result<impl Reply, Rejection> {
             }))
         }
     }
-}
-
-async fn write_flamegraph(guard: ProfilerGuard<'_>) -> Result<()> {
-    let now = Local::now().format("%Y%m%d_%H%M%S").to_string();
-    let flames_dir = PathBuf::from("flames");
-    fs::create_dir_all(&flames_dir)?;
-
-    if let Ok(report) = guard.report().build() {
-        let svg_path = flames_dir.join(format!("flamegraph_{}.svg", now));
-        let mut svg_file = File::create(&svg_path)?;
-        report.flamegraph(&mut svg_file)?;
-        info!("Wrote flamegraph SVG to {}", svg_path.display());
-    }
-    Ok(())
 }
 
 #[tokio::main]
