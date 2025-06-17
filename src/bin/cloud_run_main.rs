@@ -6,7 +6,6 @@ use serde::{Deserialize, Serialize};
 use std::{
     env,
     fs::{self, File},
-    io::Write,
     path::PathBuf,
     time::Instant,
 };

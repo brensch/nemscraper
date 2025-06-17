@@ -5,7 +5,6 @@ use pprof::ProfilerGuard;
 use std::{
     env,
     fs::{self, File},
-    io::Write,
     path::PathBuf,
     time::Instant,
 };

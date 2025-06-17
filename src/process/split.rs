@@ -3,9 +3,9 @@ use anyhow::{Context, Result};
 use futures_util::StreamExt;
 use reqwest;
 use std::io::Read;
-use std::io::{BufRead, BufReader, Cursor};
-use tokio::io::{AsyncBufReadExt, BufReader as AsyncBufReader};
-use tracing::{debug, instrument, warn};
+use std::io::{BufReader, Cursor};
+use tokio::io::BufReader as AsyncBufReader;
+use tracing::{debug, instrument};
 use zip::ZipArchive;
 
 /// A simple accumulator for rows and bytes.

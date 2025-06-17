@@ -2,10 +2,7 @@
 
 use anyhow::Result;
 use chrono::{Duration as ChronoDuration, Utc};
-use nemscraper::{
-    fetch::{urls::spawn_fetch_zip_urls, zips},
-    process::{self, split::RowsAndBytes},
-};
+use nemscraper::fetch::{urls::spawn_fetch_zip_urls, zips};
 use reqwest::Client;
 use std::{ffi::OsStr, fs, path::PathBuf, sync::Arc, time::Instant};
 use tokio::{
