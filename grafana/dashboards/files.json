@@ -1215,8 +1215,8 @@
         "list": []
     },
     "time": {
-        "from": "2025-06-02T09:09:39.730Z",
-        "to": "2025-06-02T11:42:27.072Z"
+        "from": "now-30m",
+        "to": "now"
     },
     "timepicker": {},
     "timezone": "browser",
