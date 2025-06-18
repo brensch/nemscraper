@@ -65,14 +65,39 @@ fn parse_header_and_create_string_schema(
     Ok((headers, Schema::new(fields)))
 }
 
-/// 5) Analyze first batch to detect schema, dates, and trimming needs
-fn analyze_batch_for_schema(
-    batch: &RecordBatch,
-    headers: &[String],
-) -> Result<SchemaInfo, anyhow::Error> {
+/// Helper to analyze a single value for type inference
+fn analyze_value(value: &str) -> (bool, bool, DataType) {
+    let cleaned = clean_str(value);
+
+    // Skip empty values for type inference
+    if cleaned.is_empty() {
+        return (false, false, DataType::Utf8);
+    }
+
+    let needs_trimming = cleaned != value;
+
+    // Check if it's a date column
+    let is_date = NaiveDateTime::parse_from_str(&cleaned, "%Y/%m/%d %H:%M:%S").is_ok();
+
+    let inferred_type = if is_date {
+        DataType::Utf8 // Will be converted to timestamp later
+    } else {
+        infer_arrow_dtype_from_str(&cleaned)
+    };
+
+    (needs_trimming, is_date, inferred_type)
+}
+
+/// 5) Analyze batches for schema, scanning until non-empty values are found
+fn analyze_batches_for_schema(data: &str, headers: &[String]) -> Result<SchemaInfo, anyhow::Error> {
     let mut final_fields = Vec::new();
     let mut date_columns = Vec::new();
     let mut trim_columns = Vec::new();
+
+    // Track what we've learned about each column
+    let mut column_info: Vec<(bool, bool, DataType, bool)> =
+        vec![(false, false, DataType::Utf8, false); headers.len()];
+    // (needs_trimming, is_date, inferred_type, found_non_empty)
 
     // Build table name from headers 1,2,3
     let table_name = if headers.len() >= 4 {
@@ -81,51 +106,103 @@ fn analyze_batch_for_schema(
         "default_table".to_string()
     };
 
-    // Analyze each column
-    for (col_idx, header) in headers.iter().enumerate() {
-        let array = batch.column(col_idx);
+    // Create string schema for reading
+    let string_schema = {
+        let fields: Vec<Field> = headers
+            .iter()
+            .map(|name| Field::new(name, DataType::Utf8, true))
+            .collect();
+        Schema::new(fields)
+    };
 
-        if let Some(string_array) = array.as_any().downcast_ref::<StringArray>() {
-            let mut needs_trimming = false;
-            let mut is_date_column = false;
-            let mut inferred_type = DataType::Utf8;
+    let mut cursor = Cursor::new(data.as_bytes());
+    let csv_reader = ReaderBuilder::new(Arc::new(string_schema))
+        .with_header(true)
+        .with_batch_size(8_192)
+        .build(&mut cursor)
+        .context("creating CSV reader for schema inference")?;
 
-            // Check first non-null value
-            if let Some(first_val) = string_array.iter().find_map(|v| v) {
-                let cleaned = clean_str(first_val);
+    let mut batch_count = 0;
+    const MAX_BATCHES_FOR_INFERENCE: usize = 10; // Limit to avoid reading entire file
 
-                // Check if trimming changed the value
-                if cleaned != first_val {
-                    needs_trimming = true;
-                }
+    for batch_result in csv_reader {
+        let batch = batch_result.context("reading CSV batch for schema inference")?;
+        batch_count += 1;
 
-                // Check if it's a date column
-                if NaiveDateTime::parse_from_str(&cleaned, "%Y/%m/%d %H:%M:%S").is_ok() {
-                    is_date_column = true;
+        // Analyze each column
+        for (col_idx, header) in headers.iter().enumerate() {
+            let array = batch.column(col_idx);
+            let (
+                ref mut needs_trimming,
+                ref mut is_date,
+                ref mut inferred_type,
+                ref mut found_non_empty,
+            ) = &mut column_info[col_idx];
+
+            if let Some(string_array) = array.as_any().downcast_ref::<StringArray>() {
+                // If we haven't found a non-empty value yet, keep looking
+                if !*found_non_empty {
+                    for value in string_array.iter().flatten() {
+                        let cleaned = clean_str(value);
+                        if !cleaned.is_empty() {
+                            let (trim_needed, is_date_val, data_type) = analyze_value(value);
+                            *needs_trimming = trim_needed;
+                            *is_date = is_date_val;
+                            *inferred_type = data_type;
+                            *found_non_empty = true;
+                            break;
+                        }
+                    }
                 } else {
-                    // Try to infer numeric type
-                    inferred_type = infer_arrow_dtype_from_str(&cleaned);
+                    // We already found the type, but still check for trimming needs
+                    for value in string_array.iter().flatten() {
+                        let cleaned = clean_str(value);
+                        if !cleaned.is_empty() && cleaned != value {
+                            *needs_trimming = true;
+                            break;
+                        }
+                    }
                 }
             }
+        }
 
-            if needs_trimming {
-                trim_columns.push(header.clone());
-            }
+        // Check if we've found non-empty values for all columns
+        let all_columns_analyzed = column_info.iter().all(|(_, _, _, found)| *found);
 
-            if is_date_column {
-                date_columns.push(header.clone());
-                // Date columns get timestamp type in final schema
-                final_fields.push(Field::new(
-                    header,
-                    DataType::Timestamp(TimeUnit::Millisecond, Some("+10:00".into())),
-                    true,
-                ));
-            } else {
-                final_fields.push(Field::new(header, inferred_type, true));
-            }
+        if all_columns_analyzed || batch_count >= MAX_BATCHES_FOR_INFERENCE {
+            debug!("Schema inference complete after {} batches", batch_count);
+            break;
+        }
+    }
+
+    // Build final schema and column lists
+    for (col_idx, header) in headers.iter().enumerate() {
+        let (needs_trimming, is_date, inferred_type, found_non_empty) = &column_info[col_idx];
+
+        if *needs_trimming {
+            trim_columns.push(header.clone());
+        }
+
+        if *is_date {
+            date_columns.push(header.clone());
+            // Date columns get timestamp type in final schema
+            final_fields.push(Field::new(
+                header,
+                DataType::Timestamp(TimeUnit::Millisecond, Some("+10:00".into())),
+                true,
+            ));
         } else {
-            // Shouldn't happen since we read everything as strings initially
-            final_fields.push(Field::new(header, DataType::Utf8, true));
+            // Use inferred type, or default to Utf8 if no non-empty value was found
+            let final_type = if *found_non_empty {
+                inferred_type.clone()
+            } else {
+                warn!(
+                    "No non-empty values found for column '{}', defaulting to Utf8",
+                    header
+                );
+                DataType::Utf8
+            };
+            final_fields.push(Field::new(header, final_type, true));
         }
     }
 
@@ -240,6 +317,7 @@ fn convert_to_final_types(
     let new_schema = Arc::new(Schema::new(new_fields));
     Ok(RecordBatch::try_new(new_schema, new_columns)?)
 }
+
 /// 8) Extract date from filename for partitioning.
 fn extract_date_from_filename(filename: &str) -> Option<String> {
     // Look for YYYYMMDD pattern (8 consecutive digits)
@@ -293,28 +371,18 @@ fn extract_date_from_filename(filename: &str) -> Option<String> {
     None
 }
 
-/// 9) Main CSV→Parquet conversion using Arrow (memory efficient, single pass).
+/// 9) Main CSV→Parquet conversion using Arrow (memory efficient, with improved type inference).
 /// Returns the exact number of bytes written into the Parquet file.
 pub fn csv_to_parquet(file_name: &str, data: &str, out_dir: &Path) -> Result<u64> {
     debug!("Starting Arrow-based CSV to Parquet conversion");
 
     // Step A: Parse header and create initial string schema
-    let (headers, string_schema) =
-        parse_header_and_create_string_schema(data).context("parsing CSV header")?;
+    let (headers, _) = parse_header_and_create_string_schema(data).context("parsing CSV header")?;
     debug!("Headers: {:?}", headers);
 
-    // Step B: Read first batch with string schema to analyze
-    let mut cursor = Cursor::new(data.as_bytes());
-    let mut schema_reader = ReaderBuilder::new(Arc::new(string_schema.clone()))
-        .with_header(true)
-        .with_batch_size(1_000)
-        .build(&mut cursor)
-        .context("creating CSV reader for schema inference")?;
-    let first_batch = schema_reader
-        .next()
-        .ok_or_else(|| anyhow!("No data found in CSV"))??;
-    let schema_info = analyze_batch_for_schema(&first_batch, &headers)
-        .context("analyzing schema from first batch")?;
+    // Step B: Analyze multiple batches to infer schema properly
+    let schema_info =
+        analyze_batches_for_schema(data, &headers).context("analyzing schema from CSV data")?;
     debug!("Final schema: {:?}", schema_info.schema);
     debug!("Table name: {}", schema_info.table_name);
 
