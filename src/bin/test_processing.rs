@@ -169,7 +169,7 @@ fn count_d_rows_in_zip(zip_path: &Path) -> Result<usize> {
 
         for line_result in reader.lines() {
             let line = line_result.with_context(|| "Failed to read a CSV line")?;
-            if line.chars().next() == Some('D') {
+            if line.starts_with('D') {
                 file_d_count += 1;
             }
         }
@@ -209,7 +209,7 @@ fn analyze_parquet_files(
         let entry = entry.context("Failed to read directory entry")?;
         let path = entry.path();
 
-        if path.extension().map_or(false, |ext| ext == "parquet") {
+        if path.extension().is_some_and(|ext| ext == "parquet") {
             parquet_files.push(path.to_path_buf());
         }
     }
@@ -303,7 +303,7 @@ fn show_column_details(path: &Path) -> Result<Vec<TypeIssue>> {
     println!("Schema fields: {}", schema.fields().len());
 
     // Build the reader
-    let mut reader = builder.build()?;
+    let reader = builder.build()?;
 
     // Collect column info
     let mut column_info: Vec<ColumnInfo> = schema
@@ -322,7 +322,7 @@ fn show_column_details(path: &Path) -> Result<Vec<TypeIssue>> {
     let mut batches_scanned = 0;
     const MAX_BATCHES_TO_SCAN: usize = 10; // Limit scanning to avoid reading entire large files
 
-    while let Some(batch) = reader.next() {
+    for batch in reader {
         let batch = batch?;
         batches_scanned += 1;
 
@@ -339,8 +339,8 @@ fn show_column_details(path: &Path) -> Result<Vec<TypeIssue>> {
 
     // Print results and collect type issues
     println!(
-        "{:<30} {:<25} {:<15} {}",
-        "Column", "Type", "Sample Row", "First Non-Empty Value"
+        "{:<30} {:<25} {:<15} First Non-Empty Value",
+        "Column", "Type", "Sample Row"
     );
     println!("{:-<100}", "");
 
@@ -375,7 +375,7 @@ fn show_column_details(path: &Path) -> Result<Vec<TypeIssue>> {
                 let trimmed = value.trim();
                 if !trimmed.is_empty() {
                     // Check if this looks like it should be a Float64
-                    if trimmed.parse::<f64>().is_ok() && !trimmed.parse::<i64>().is_ok() {
+                    if trimmed.parse::<f64>().is_ok() && trimmed.parse::<i64>().is_err() {
                         type_issues.push(TypeIssue {
                             file_path: file_name.clone(),
                             column_name: col_info.name.clone(),
@@ -634,8 +634,8 @@ fn print_comprehensive_stats(
             type_issues.len()
         );
         println!(
-            "{:<20} {:<30} {:<15} {:<20} {}",
-            "File", "Column", "Current Type", "Sample Value", "Suggested Type"
+            "{:<20} {:<30} {:<15} {:<20} Suggested Type",
+            "File", "Column", "Current Type", "Sample Value"
         );
         println!("{:-<100}", "");
 

@@ -45,7 +45,7 @@ impl HistoryRow for InputCompactionRow {
         vec![
             Arc::new(StringArray::from(vec![self.input_file.clone()])),
             Arc::new(arrow::array::Date32Array::from(vec![
-                self.partition.num_days_from_ce() as i32,
+                self.partition.num_days_from_ce(),
             ])),
             Arc::new(TimestampMicrosecondArray::from(vec![self
                 .compaction_start

@@ -121,7 +121,7 @@ async fn fetch_feed_links(client: Client, feed_url: String) -> Result<Vec<String
 
                 // c) extract all <a href="…"> elements ending in `.zip`
                 let links = Html::parse_document(&html)
-                    .select(&*ZIP_SELECTOR) // use the global selector
+                    .select(&ZIP_SELECTOR) // use the global selector
                     .filter_map(|elem| elem.value().attr("href"))
                     .filter_map(|href| base.join(href).ok())
                     .map(|url| url.to_string())

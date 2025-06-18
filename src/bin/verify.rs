@@ -74,7 +74,7 @@ fn main() -> Result<()> {
                 let reader = BufReader::new(&mut entry);
                 for line in reader.lines() {
                     let line = line.with_context(|| "Failed to read a CSV line")?;
-                    if line.chars().next() == Some('D') {
+                    if line.starts_with('D') {
                         count_d += 1;
                     }
                 }

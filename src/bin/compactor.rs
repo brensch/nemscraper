@@ -13,7 +13,6 @@ use parquet::arrow::parquet_to_arrow_schema;
 use parquet::basic::{BrotliLevel, Compression};
 use parquet::file::reader::{FileReader, SerializedFileReader};
 use parquet::{arrow::ArrowWriter, file::properties::WriterProperties};
-use rayon;
 use std::{
     collections::HashMap,
     env,
@@ -25,7 +24,6 @@ use std::{
     time::Duration,
 };
 use tracing::{debug, error, info, instrument, warn};
-use tracing_subscriber;
 use walkdir::WalkDir;
 
 // Per-partition locks to prevent concurrent compactions
@@ -615,7 +613,7 @@ fn compact_partition_inner(
                     )
                 })?;
                 let key = rel.to_string_lossy().to_string();
-                let sanitized = key.replace('/', "_").replace('\\', "_");
+                let sanitized = key.replace(['/', '\\'], "_");
 
                 let already_processed = hist.get(sanitized.clone());
                 debug!(
@@ -796,7 +794,7 @@ fn compact_partition_inner(
 fn extract_partition_date(part: &Path) -> Result<NaiveDate> {
     for comp in part.iter().map(|c| c.to_string_lossy()) {
         if let Some(d) = comp.strip_prefix("date=") {
-            return NaiveDate::parse_from_str(&d, "%Y-%m-%d").with_context(|| {
+            return NaiveDate::parse_from_str(d, "%Y-%m-%d").with_context(|| {
                 format!(
                     "Invalid date format '{}' in partition path {}",
                     d,
