@@ -303,7 +303,7 @@ pub fn csv_to_parquet(file_name: &str, data: &str, out_dir: &Path) -> Result<u64
         parse_header_and_create_string_schema(data).context("parsing CSV header")?;
     debug!("Headers: {:?}", headers);
 
-    // Step B: Read first batch with string schema to analyze
+    // Step B: Read first batch with string schema to infer types
     let mut cursor = Cursor::new(data.as_bytes());
     let mut schema_reader = ReaderBuilder::new(Arc::new(string_schema.clone()))
         .with_header(true)
@@ -312,27 +312,35 @@ pub fn csv_to_parquet(file_name: &str, data: &str, out_dir: &Path) -> Result<u64
         .context("creating CSV reader for schema inference")?;
     let first_batch = schema_reader
         .next()
-        .ok_or_else(|| anyhow!("No data found in CSV"))??;
-    let schema_info = analyze_batch_for_schema(&first_batch, &headers)
-        .context("analyzing schema from first batch")?;
+        .ok_or_else(|| anyhow!("No data found in CSV"))?
+        .context("reading first CSV batch")?;
+    let schema_info =
+        analyze_batch_for_schema(&first_batch, &headers).context("analyzing schema")?;
     debug!("Final schema: {:?}", schema_info.schema);
     debug!("Table name: {}", schema_info.table_name);
 
+    // ─── Build a schema that skips the first 4 columns ────────────────────────────────
+    let num_skip = 4;
+    let output_fields = schema_info
+        .schema
+        .fields()
+        .iter()
+        .skip(num_skip)
+        .map(|f| f.as_ref().clone())
+        .collect::<Vec<Field>>();
+    let output_schema = Arc::new(Schema::new(output_fields));
+
     // Step C: Setup output directory and partition
     let partition_date = extract_date_from_filename(file_name).unwrap_or_else(|| {
-        warn!(
-            "No date found in filename '{}'; using default partition",
-            file_name
-        );
+        warn!("No date found in '{}'; using 'unknown-date'", file_name);
         "unknown-date".to_string()
     });
-
     let table_dir = out_dir.join(&schema_info.table_name);
     fs::create_dir_all(&table_dir).context("creating table directory")?;
     let partition_dir = table_dir.join(format!("date={}", partition_date));
     fs::create_dir_all(&partition_dir).context("creating partition directory")?;
 
-    // Step D: Setup Parquet writer with final schema
+    // Step D: Setup Parquet writer with trimmed schema
     let final_name = format!("{}.parquet", file_name);
     let tmp_name = format!("{}.tmp", final_name);
     let final_path = partition_dir.join(&final_name);
@@ -345,14 +353,10 @@ pub fn csv_to_parquet(file_name: &str, data: &str, out_dir: &Path) -> Result<u64
     let props = WriterProperties::builder()
         .set_compression(Compression::BROTLI(BrotliLevel::try_new(5)?))
         .build();
-    let mut writer = ArrowWriter::try_new(
-        writer_file,
-        Arc::new(schema_info.schema.clone()),
-        Some(props),
-    )
-    .context("initializing Parquet writer")?;
+    let mut writer = ArrowWriter::try_new(writer_file, output_schema.clone(), Some(props))
+        .context("initializing Parquet writer")?;
 
-    // Step E: Re-read full CSV and write each batch
+    // Step E: Re-read full CSV and write each batch, projecting out first 4 cols
     let mut cursor = Cursor::new(data.as_bytes());
     let string_schema_for_reading = {
         let fields: Vec<Field> = headers
@@ -369,32 +373,37 @@ pub fn csv_to_parquet(file_name: &str, data: &str, out_dir: &Path) -> Result<u64
 
     for batch_result in csv_reader {
         let batch = batch_result.context("reading CSV batch")?;
-        let trimmed = apply_trimming(&batch, &schema_info.trim_columns)
-            .context("applying trimming to batch")?;
-        let final_batch = convert_to_final_types(&trimmed, &schema_info)
-            .context("converting batch to final types")?;
+        let trimmed =
+            apply_trimming(&batch, &schema_info.trim_columns).context("applying trimming")?;
+        let final_batch =
+            convert_to_final_types(&trimmed, &schema_info).context("converting types")?;
+
+        // Drop the first 4 columns before writing
+        let projected_cols = final_batch.columns()[num_skip..].to_vec();
+        let projected_batch = RecordBatch::try_new(output_schema.clone(), projected_cols)
+            .context("projecting columns")?;
+
         writer
-            .write(&final_batch)
+            .write(&projected_batch)
             .context("writing batch to Parquet")?;
     }
 
     // Finish writing (flush metadata etc.)
     writer.close().context("closing Parquet writer")?;
 
-    // Capture byte-count without any extra filesystem walk
+    // Capture byte‐count
     let parquet_bytes = tmp_file
         .stream_position()
-        .context("getting Parquet file stream position")?;
+        .context("getting Parquet file size")?;
 
-    // Atomically rename into place
-    fs::rename(&tmp_path, &final_path).context("renaming Parquet file into place")?;
+    // Atomically move into place
+    fs::rename(&tmp_path, &final_path).context("renaming Parquet file")?;
 
     debug!(
         "Wrote {} bytes of Parquet to {}",
         parquet_bytes,
         final_path.display()
     );
-
     Ok(parquet_bytes)
 }
 
