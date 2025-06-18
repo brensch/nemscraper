@@ -43,9 +43,6 @@ impl CsvBatchProcessor {
         let trimmed = buf.trim_start();
 
         if trimmed.starts_with("I,") {
-            // Count the I-line itself
-            self.row_count += 1;
-
             // 1) If there’s an existing batch, flush it now
             if !self.batch.is_empty() {
                 self.flush_batch(file_name, out_dir)?;

@@ -1,11 +1,16 @@
 use anyhow::{Context, Result};
+use arrow::array::*;
+use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
+use arrow::record_batch::RecordBatch;
 use arrow_array::RecordBatchReader;
-use chrono::{DateTime, NaiveDate, Utc};
+use chrono::{DateTime, FixedOffset, NaiveDate, NaiveDateTime, TimeZone, Utc};
 use nemscraper::history::compacted::InputCompactionRow;
 use nemscraper::history::table_history::{HistoryRow, TableHistory};
 use once_cell::sync::Lazy;
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+use parquet::arrow::parquet_to_arrow_schema;
 use parquet::basic::{BrotliLevel, Compression};
+use parquet::file::reader::{FileReader, SerializedFileReader};
 use parquet::{arrow::ArrowWriter, file::properties::WriterProperties};
 use rayon;
 use std::{
@@ -192,70 +197,293 @@ fn compact_partition(
     result
 }
 
-/// Performs the core compaction logic for a single partition.
-///
-/// # Overview
-/// This function implements a safe, atomic parquet file compaction process that merges
-/// multiple input parquet files into a single "compacted.parquet" file per partition.
-/// It's designed to handle concurrent access, prevent data corruption, and maintain
-/// a complete audit trail of processed files.
-///
-/// # Detailed Process Flow
-///
-/// ## 1. Input Discovery & Filtering
-/// - Scans the input directory for `.parquet` files within the specified partition
-/// - Filters out files that have already been successfully processed (using history table)
-/// - Creates sanitized keys for each new file (replacing path separators for storage)
-/// - Early returns if no new files are found
-///
-/// ## 2. Schema Resolution & File Setup
-/// - Determines the Arrow schema either from:
-///   - Existing `compacted.parquet` file (if it exists) - ensures schema compatibility
-///   - First new input file (for new partitions) - establishes the schema baseline
-/// - Creates a temporary file (`compacted.parquet.tmp`) for atomic writing
-/// - Configures Arrow writer with Brotli compression for efficient storage
-///
-/// ## 3. Existing Data Preservation
-/// - If a `compacted.parquet` file already exists, reads all its data first
-/// - Streams the existing data batch-by-batch into the temporary file
-/// - This ensures no previously compacted data is lost during the merge
-///
-/// ## 4. New Data Integration
-/// - Processes each new input file sequentially in the order discovered
-/// - For each file:
-///   - Opens a ParquetRecordBatchReader with 1KB batch size for memory efficiency
-///   - Streams all record batches from the input file to the temporary output
-///   - Tracks successful processing for later history recording
-/// - Handles schema validation automatically through Arrow's type system
-///
-/// ## 5. Atomic Commit & History Recording
-/// - Closes the Arrow writer to ensure all data is properly flushed and footers written
-/// - Atomically renames the temporary file to replace the existing compacted file
-/// - Only after successful rename, records each processed file in the history table
-/// - This two-phase commit ensures either complete success or complete rollback
-///
-/// # Concurrency Safety
-/// - Must be called while holding a per-partition mutex lock (handled by caller)
-/// - Uses filesystem atomic rename operation for crash safety
-/// - History updates happen only after successful file operations
-///
-/// # Error Handling Strategy
-/// - Comprehensive error context is added at each step with file paths and operation details
-/// - Any failure before the atomic rename leaves the existing compacted file untouched
-/// - Failed compactions are not recorded in history, allowing retry on next cycle
-/// - Temporary files are cleaned up automatically on process restart
-///
-/// # Performance Characteristics
-/// - Memory usage is bounded by batch size (1KB) regardless of total file size
-/// - I/O is sequential with minimal random access
-/// - Compression reduces output file size by ~60-80% depending on data
-/// - Time complexity is O(total_input_size) with single-pass processing
-///
-/// # Data Integrity Guarantees
-/// - Parquet file format checksums protect against corruption during writing
-/// - Atomic rename prevents partial file states from being visible
-/// - History table prevents duplicate processing of input files
-/// - Schema validation ensures all files in a partition have compatible structure
+/// Helper function to read schema directly from parquet metadata
+fn read_schema_from_parquet_metadata(file_path: &Path) -> Result<Arc<Schema>> {
+    debug!(file = %file_path.display(), "Reading schema from parquet metadata");
+
+    let file = File::open(file_path)
+        .with_context(|| format!("Failed to open parquet file {}", file_path.display()))?;
+
+    let reader = SerializedFileReader::new(file).with_context(|| {
+        format!(
+            "Failed to create parquet reader for {}",
+            file_path.display()
+        )
+    })?;
+
+    let metadata = reader.metadata();
+    let file_metadata = metadata.file_metadata();
+    let parquet_schema = file_metadata.schema_descr();
+    let key_value_metadata = file_metadata.key_value_metadata();
+
+    let arrow_schema =
+        parquet_to_arrow_schema(parquet_schema, key_value_metadata).with_context(|| {
+            format!(
+                "Failed to convert parquet schema to arrow schema for {}",
+                file_path.display()
+            )
+        })?;
+
+    Ok(Arc::new(arrow_schema))
+}
+
+/// Determines the "most evolved" type between two data types
+fn get_most_evolved_type(type1: &DataType, type2: &DataType) -> DataType {
+    match (type1, type2) {
+        // Float64 is more evolved than Utf8
+        (DataType::Utf8, DataType::Float64) => DataType::Float64,
+        (DataType::Float64, DataType::Utf8) => DataType::Float64,
+
+        // Timestamp is more evolved than Utf8 - always use +10:00 timezone
+        (DataType::Utf8, DataType::Timestamp(TimeUnit::Millisecond, _)) => {
+            DataType::Timestamp(TimeUnit::Millisecond, Some("+10:00".into()))
+        }
+        (DataType::Timestamp(TimeUnit::Millisecond, _), DataType::Utf8) => {
+            DataType::Timestamp(TimeUnit::Millisecond, Some("+10:00".into()))
+        }
+
+        // Handle timestamp timezone normalization - always prefer +10:00
+        (
+            DataType::Timestamp(TimeUnit::Millisecond, _),
+            DataType::Timestamp(TimeUnit::Millisecond, _),
+        ) => DataType::Timestamp(TimeUnit::Millisecond, Some("+10:00".into())),
+
+        // If types are the same, return either one
+        (a, b) if a == b => a.clone(),
+
+        // Default: return the first type (shouldn't happen in our case)
+        (a, _) => a.clone(),
+    }
+}
+
+/// Determines if a conversion from one type to another is supported
+fn can_convert_type(from: &DataType, to: &DataType) -> bool {
+    match (from, to) {
+        // Utf8 can be converted to Float64 or Timestamp
+        (DataType::Utf8, DataType::Float64) => true,
+        (DataType::Utf8, DataType::Timestamp(TimeUnit::Millisecond, _)) => true,
+
+        // Float64 stays as Float64
+        (DataType::Float64, DataType::Float64) => true,
+
+        // Timestamp conversions (including timezone changes)
+        (
+            DataType::Timestamp(TimeUnit::Millisecond, _),
+            DataType::Timestamp(TimeUnit::Millisecond, _),
+        ) => true,
+
+        // Same types are always convertible
+        (a, b) if a == b => true,
+
+        _ => false,
+    }
+}
+
+/// Evolves a schema by taking the most evolved type for each field
+fn evolve_schema(base_schema: &Schema, new_schema: &Schema) -> Result<Arc<Schema>> {
+    let mut evolved_fields = Vec::new();
+    let mut changes_made = false;
+
+    for (i, base_field) in base_schema.fields().iter().enumerate() {
+        if let Some(new_field) = new_schema.fields().get(i) {
+            if base_field.name() == new_field.name() {
+                // Get the most evolved type between base and new
+                let evolved_type =
+                    get_most_evolved_type(base_field.data_type(), new_field.data_type());
+
+                // Check that both types can be converted to the evolved type
+                if !can_convert_type(base_field.data_type(), &evolved_type) {
+                    return Err(anyhow::anyhow!(
+                        "Cannot convert field '{}' from {:?} to evolved type {:?}",
+                        base_field.name(),
+                        base_field.data_type(),
+                        evolved_type
+                    ));
+                }
+
+                if !can_convert_type(new_field.data_type(), &evolved_type) {
+                    return Err(anyhow::anyhow!(
+                        "Cannot convert field '{}' from {:?} to evolved type {:?}",
+                        new_field.name(),
+                        new_field.data_type(),
+                        evolved_type
+                    ));
+                }
+
+                if &evolved_type != base_field.data_type() {
+                    info!(
+                        field = %base_field.name(),
+                        base_type = ?base_field.data_type(),
+                        new_type = ?new_field.data_type(),
+                        evolved_type = ?evolved_type,
+                        "Evolving field type"
+                    );
+                    changes_made = true;
+                }
+
+                // Create field with evolved type, preserving nullability from base
+                let evolved_field =
+                    Field::new(base_field.name(), evolved_type, base_field.is_nullable());
+                evolved_fields.push(evolved_field);
+            } else {
+                return Err(anyhow::anyhow!(
+                    "Field name mismatch at position {}: '{}' vs '{}'",
+                    i,
+                    base_field.name(),
+                    new_field.name()
+                ));
+            }
+        } else {
+            return Err(anyhow::anyhow!(
+                "New schema has fewer fields than base schema"
+            ));
+        }
+    }
+
+    if new_schema.fields().len() > base_schema.fields().len() {
+        return Err(anyhow::anyhow!(
+            "New schema has more fields than base schema"
+        ));
+    }
+
+    if changes_made {
+        info!("Schema evolution completed with type upgrades");
+    }
+
+    Ok(Arc::new(Schema::new(evolved_fields)))
+}
+
+/// Parse timestamp from string in the format "YYYY/MM/DD HH:MM:SS"
+fn parse_timestamp_millis(s: &str) -> Option<i64> {
+    let s = s.trim();
+    if s.len() < 19 || &s[4..5] != "/" || &s[7..8] != "/" || &s[10..11] != " " {
+        return None;
+    }
+    let year: i32 = s[0..4].parse().ok()?;
+    let month: u32 = s[5..7].parse().ok()?;
+    let day: u32 = s[8..10].parse().ok()?;
+    let hour: u32 = s[11..13].parse().ok()?;
+    let min: u32 = s[14..16].parse().ok()?;
+    let sec: u32 = s[17..19].parse().ok()?;
+
+    let naive = NaiveDate::from_ymd_opt(year, month, day)?.and_hms_opt(hour, min, sec)?;
+    let offset = FixedOffset::east_opt(10 * 3600).unwrap();
+    offset
+        .from_local_datetime(&naive)
+        .single()
+        .map(|dt| dt.timestamp_millis())
+}
+
+/// Converts a column from one type to another
+fn convert_column(array: &dyn Array, target_field: &Field) -> Result<ArrayRef> {
+    match (array.data_type(), target_field.data_type()) {
+        // Utf8 to Float64
+        (DataType::Utf8, DataType::Float64) => {
+            if let Some(string_array) = array.as_any().downcast_ref::<StringArray>() {
+                let float_values: Float64Array = string_array
+                    .iter()
+                    .map(|opt_str| {
+                        opt_str.and_then(|s| {
+                            let cleaned = s.trim();
+                            if cleaned.is_empty() {
+                                None
+                            } else {
+                                cleaned.parse::<f64>().ok()
+                            }
+                        })
+                    })
+                    .collect();
+                Ok(Arc::new(float_values))
+            } else {
+                Err(anyhow::anyhow!(
+                    "Expected StringArray for Utf8 to Float64 conversion"
+                ))
+            }
+        }
+        // Utf8 to Timestamp
+        (DataType::Utf8, DataType::Timestamp(TimeUnit::Millisecond, tz)) => {
+            if let Some(string_array) = array.as_any().downcast_ref::<StringArray>() {
+                let timestamp_values: Vec<Option<i64>> = string_array
+                    .iter()
+                    .map(|opt_str| {
+                        opt_str.and_then(|s| {
+                            let cleaned = s.trim();
+                            if cleaned.is_empty() {
+                                None
+                            } else {
+                                parse_timestamp_millis(cleaned)
+                            }
+                        })
+                    })
+                    .collect();
+                let timestamp_array =
+                    TimestampMillisecondArray::from(timestamp_values).with_timezone_opt(tz.clone());
+                Ok(Arc::new(timestamp_array))
+            } else {
+                Err(anyhow::anyhow!(
+                    "Expected StringArray for Utf8 to Timestamp conversion"
+                ))
+            }
+        }
+        // Timestamp timezone conversion
+        (
+            DataType::Timestamp(TimeUnit::Millisecond, from_tz),
+            DataType::Timestamp(TimeUnit::Millisecond, to_tz),
+        ) if from_tz != to_tz => {
+            if let Some(ts_array) = array.as_any().downcast_ref::<TimestampMillisecondArray>() {
+                let new_array = ts_array.clone().with_timezone_opt(to_tz.clone());
+                Ok(Arc::new(new_array))
+            } else {
+                Err(anyhow::anyhow!(
+                    "Expected TimestampMillisecondArray for timezone conversion"
+                ))
+            }
+        }
+        // No conversion needed
+        _ => Ok(array.slice(0, array.len())),
+    }
+}
+
+/// Converts a record batch to match a target schema
+fn convert_batch_to_schema(batch: RecordBatch, target_schema: &Schema) -> Result<RecordBatch> {
+    let mut new_columns = Vec::new();
+
+    for (i, target_field) in target_schema.fields().iter().enumerate() {
+        let source_array = batch.column(i);
+        let converted_array = convert_column(source_array, target_field)
+            .with_context(|| format!("Failed to convert column '{}'", target_field.name()))?;
+        new_columns.push(converted_array);
+    }
+
+    RecordBatch::try_new(Arc::new(target_schema.clone()), new_columns)
+        .with_context(|| "Failed to create converted record batch")
+}
+
+/// Reads all data from a parquet file and converts it to the target schema
+fn read_and_convert_parquet_file(
+    file_path: &Path,
+    target_schema: &Schema,
+) -> Result<Vec<RecordBatch>> {
+    let file = File::open(file_path)
+        .with_context(|| format!("Failed to open parquet file {}", file_path.display()))?;
+
+    let mut reader = ParquetRecordBatchReaderBuilder::try_new(file)
+        .with_context(|| format!("Failed to create reader for {}", file_path.display()))?
+        .with_batch_size(1024)
+        .build()
+        .with_context(|| format!("Failed to build reader for {}", file_path.display()))?;
+
+    let mut converted_batches = Vec::new();
+    while let Some(batch) = reader.next().transpose()? {
+        let converted_batch = convert_batch_to_schema(batch, target_schema)
+            .with_context(|| format!("Failed to convert batch from {}", file_path.display()))?;
+        converted_batches.push(converted_batch);
+    }
+
+    Ok(converted_batches)
+}
+
+/// Performs the core compaction logic with schema evolution support
 fn compact_partition_inner(
     input_root: &Path,
     output_root: &Path,
@@ -325,57 +553,30 @@ fn compact_partition_inner(
             .with_context(|| format!("Failed to remove existing temp file {}", tmp.display()))?;
     }
 
-    // Create the temp file for writing
+    // Step 1: Determine the evolved schema by examining all input files
+    let mut evolved_schema = if compacted.exists() {
+        info!("Reading schema from existing compacted file");
+        read_schema_from_parquet_metadata(&compacted)?
+    } else {
+        info!("Reading schema from first input file");
+        read_schema_from_parquet_metadata(&new_inputs[0].0)?
+    };
+
+    // Evolve schema by examining all input files
+    for (input_path, _) in &new_inputs {
+        let input_schema = read_schema_from_parquet_metadata(input_path)?;
+        evolved_schema = evolve_schema(&evolved_schema, &input_schema)
+            .with_context(|| format!("Failed to evolve schema with {}", input_path.display()))?;
+    }
+
+    info!(
+        final_schema_fields = evolved_schema.fields().len(),
+        "Computed evolved schema"
+    );
+
+    // Step 2: Create writer with evolved schema
     let writer_file = File::create(&tmp)
         .with_context(|| format!("Failed to create temp file {}", tmp.display()))?;
-
-    // infer schema from existing compacted file or first new input
-    let schema = if compacted.exists() {
-        info!(compacted_file = %compacted.display(), "Reading schema from existing compacted file");
-        let f = File::open(&compacted).with_context(|| {
-            format!(
-                "Failed to open existing compacted file {}",
-                compacted.display()
-            )
-        })?;
-        let reader = ParquetRecordBatchReaderBuilder::try_new(f)
-            .with_context(|| {
-                format!(
-                    "Failed to create reader for existing compacted file {}",
-                    compacted.display()
-                )
-            })?
-            .with_batch_size(1024)
-            .build()
-            .with_context(|| {
-                format!(
-                    "Failed to build reader for existing compacted file {}",
-                    compacted.display()
-                )
-            })?;
-        reader.schema()
-    } else {
-        let first = &new_inputs[0].0;
-        info!(first_input = %first.display(), "Reading schema from first input file");
-        let f = File::open(first)
-            .with_context(|| format!("Failed to open first input file {}", first.display()))?;
-        let reader = ParquetRecordBatchReaderBuilder::try_new(f)
-            .with_context(|| {
-                format!(
-                    "Failed to create reader for first input file {}",
-                    first.display()
-                )
-            })?
-            .with_batch_size(1024)
-            .build()
-            .with_context(|| {
-                format!(
-                    "Failed to build reader for first input file {}",
-                    first.display()
-                )
-            })?;
-        reader.schema()
-    };
 
     let props = WriterProperties::builder()
         .set_compression(Compression::BROTLI(
@@ -383,59 +584,36 @@ fn compact_partition_inner(
         ))
         .build();
 
-    let mut writer = ArrowWriter::try_new(BufWriter::new(writer_file), schema, Some(props))
-        .with_context(|| {
-            format!(
-                "Failed to create Arrow writer for temp file {}",
-                tmp.display()
-            )
-        })?;
+    let mut writer = ArrowWriter::try_new(
+        BufWriter::new(writer_file),
+        evolved_schema.clone(),
+        Some(props),
+    )
+    .with_context(|| {
+        format!(
+            "Failed to create Arrow writer for temp file {}",
+            tmp.display()
+        )
+    })?;
 
-    // Copy existing data from compacted file if it exists
+    // Step 3: Process existing compacted file if it exists
     if compacted.exists() {
-        info!(compacted_file = %compacted.display(), "Copying existing data from compacted file");
-        let f = File::open(&compacted).with_context(|| {
-            format!(
-                "Failed to open existing compacted file for reading {}",
-                compacted.display()
-            )
-        })?;
-        let mut reader = ParquetRecordBatchReaderBuilder::try_new(f)
-            .with_context(|| {
-                format!(
-                    "Failed to create reader for existing compacted file {}",
-                    compacted.display()
-                )
-            })?
-            .with_batch_size(1024)
-            .build()
-            .with_context(|| {
-                format!(
-                    "Failed to build reader for existing compacted file {}",
-                    compacted.display()
-                )
-            })?;
+        info!("Converting and copying existing compacted data");
+        let existing_batches = read_and_convert_parquet_file(&compacted, &evolved_schema)
+            .with_context(|| "Failed to read and convert existing compacted file")?;
 
-        let mut batch_count = 0;
-        while let Some(batch) = reader.next().transpose().with_context(|| {
-            format!(
-                "Failed to read batch from existing compacted file {}",
-                compacted.display()
-            )
-        })? {
-            writer.write(&batch).with_context(|| {
-                format!(
-                    "Failed to write existing batch {} to temp file {}",
-                    batch_count,
-                    tmp.display()
-                )
-            })?;
-            batch_count += 1;
+        for batch in existing_batches {
+            writer
+                .write(&batch)
+                .with_context(|| "Failed to write converted existing batch")?;
         }
-        info!(batches_copied = batch_count, "Copied existing batches");
+        // info!(
+        //     "Copied {} batches from existing compacted file",
+        //     existing_batches.len()
+        // );
     }
 
-    // Process new input files
+    // Step 4: Process all new input files
     let start = Utc::now();
     let mut successful_inputs = Vec::new();
 
@@ -446,43 +624,24 @@ fn compact_partition_inner(
             "Processing input file"
         );
 
-        let f = File::open(path)
-            .with_context(|| format!("Failed to open input file {}", path.display()))?;
-        let mut reader = ParquetRecordBatchReaderBuilder::try_new(f)
-            .with_context(|| format!("Failed to create reader for input file {}", path.display()))?
-            .with_batch_size(1024)
-            .build()
-            .with_context(|| format!("Failed to build reader for input file {}", path.display()))?;
+        let converted_batches = read_and_convert_parquet_file(path, &evolved_schema)
+            .with_context(|| format!("Failed to read and convert input file {}", path.display()))?;
 
-        let mut batch_count = 0;
-        while let Some(batch) = reader.next().transpose().with_context(|| {
-            format!(
-                "Failed to read batch {} from input file {}",
-                batch_count,
-                path.display()
-            )
-        })? {
+        for batch in converted_batches {
             writer.write(&batch).with_context(|| {
-                format!(
-                    "Failed to write batch {} from input file {} to temp file {}",
-                    batch_count,
-                    path.display(),
-                    tmp.display()
-                )
+                format!("Failed to write batch from input file {}", path.display())
             })?;
-            batch_count += 1;
         }
 
         debug!(
             file = %path.display(),
-            batches_written = batch_count,
             "Successfully processed input file"
         );
 
         successful_inputs.push((path.clone(), key.clone()));
     }
 
-    // Close the writer and ensure all data is flushed
+    // Step 5: Finalize
     writer.close().with_context(|| {
         format!(
             "Failed to close Arrow writer for temp file {}",
@@ -490,7 +649,6 @@ fn compact_partition_inner(
         )
     })?;
 
-    // Atomically replace the compacted file
     fs::rename(&tmp, &compacted).with_context(|| {
         format!(
             "Failed to rename temp file {} to final file {}",
@@ -502,10 +660,10 @@ fn compact_partition_inner(
     info!(
         outfile = %compacted.display(),
         input_files_processed = successful_inputs.len(),
-        "Successfully wrote compacted file"
+        "Successfully wrote compacted file with evolved schema"
     );
 
-    // Only record successful compactions in history AFTER everything succeeds
+    // Record successful compactions in history
     let end = Utc::now();
     let part_date = extract_partition_date(partition).with_context(|| {
         format!(
