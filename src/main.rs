@@ -7,16 +7,15 @@ use nemscraper::{
     process::{self, split::RowsAndBytes},
 };
 use reqwest::Client;
-use std::{ffi::OsStr, fs, path::PathBuf, sync::Arc, time::Instant};
+use std::{collections::HashSet, ffi::OsStr, fs, path::PathBuf, sync::Arc};
 use tokio::{
-    sync::mpsc,
+    sync::{mpsc, Mutex},
     task::{self, JoinSet},
     time,
 };
 use tracing::{error, info};
 use tracing_subscriber::{fmt, EnvFilter};
 
-// Assuming these modules exist and have the necessary functions.
 mod history;
 mod utils;
 
@@ -26,13 +25,15 @@ use crate::history::{
     table_history::{HistoryRow, TableHistory},
 };
 
-// A struct to hold the application's shared state, making it easier to pass around.
+/// Shared application state
 struct AppState {
     zips_dir: PathBuf,
     parquet_dir: PathBuf,
     downloaded_history: Arc<TableHistory<DownloadedRow>>,
     processed_history: Arc<TableHistory<ProcessedRow>>,
     http_client: Client,
+    // Tracks in-progress downloads to avoid duplicates
+    in_flight: Arc<Mutex<HashSet<String>>>,
 }
 
 #[tokio::main]
@@ -40,7 +41,7 @@ async fn main() -> Result<()> {
     init_logging();
     info!("Starting (pid={})", std::process::id());
 
-    // --- Setup ---
+    // --- Setup directories and history stores ---
     let (zips_dir, parquet_dir, hist_dir) = setup_directories("assets")?;
     let downloaded_history = setup_history(&hist_dir, TableHistory::new_downloaded)?;
     let processed_history = setup_history(&hist_dir, TableHistory::new_processed)?;
@@ -51,6 +52,7 @@ async fn main() -> Result<()> {
         downloaded_history,
         processed_history,
         http_client: Client::new(),
+        in_flight: Arc::new(Mutex::new(HashSet::new())),
     });
 
     // --- Channels ---
@@ -85,6 +87,20 @@ fn setup_directories(root: &str) -> Result<(PathBuf, PathBuf, PathBuf)> {
     Ok((zips_dir, parquet_dir, hist_dir))
 }
 
+/// Initializes a TableHistory and starts its vacuum loop.
+fn setup_history<R>(
+    dir: &PathBuf,
+    builder: impl Fn(PathBuf) -> Result<Arc<TableHistory<R>>>,
+) -> Result<Arc<TableHistory<R>>>
+where
+    R: HistoryRow + Send + Sync + 'static,
+{
+    let store = builder(dir.clone())?;
+    store.vacuum().ok();
+    store.start_vacuum_loop();
+    Ok(store)
+}
+
 /// Spawns the pool of download workers.
 fn spawn_downloader_pool(
     state: Arc<AppState>,
@@ -94,17 +110,13 @@ fn spawn_downloader_pool(
     const NUM_DOWNLOADERS: usize = 4;
     tokio::spawn(async move {
         let (worker_id_tx, mut worker_id_rx) = mpsc::channel(NUM_DOWNLOADERS);
-
         // Pre-fill the pool with worker IDs
         for id in 1..=NUM_DOWNLOADERS {
             worker_id_tx.send(id).await.unwrap();
         }
 
         while let Some(url) = url_rx.recv().await {
-            // Wait for a free worker ID
             let worker_id = worker_id_rx.recv().await.unwrap();
-
-            // Clone handles for the new task
             let state_clone = state.clone();
             let proc_tx_clone = proc_tx.clone();
             let worker_id_tx_clone = worker_id_tx.clone();
@@ -131,13 +143,44 @@ async fn download_and_log(
         .and_then(OsStr::to_str)
         .unwrap_or("unknown")
         .to_string();
-    // skip already downloaded files
+
+    // ---- Prevent double-downloads ----
+    {
+        let mut in_flight = state.in_flight.lock().await;
+        if !in_flight.insert(name.clone()) {
+            info!(file_name = %name, worker_id, "Already downloading — skipping");
+            return;
+        }
+    }
+
+    /// RAII guard to remove from in_flight when this function exits
+    struct InFlightGuard {
+        name: String,
+        set: Arc<Mutex<HashSet<String>>>,
+    }
+    impl Drop for InFlightGuard {
+        fn drop(&mut self) {
+            let name = self.name.clone();
+            let set = self.set.clone();
+            tokio::spawn(async move {
+                set.lock().await.remove(&name);
+            });
+        }
+    }
+    let _guard = InFlightGuard {
+        name: name.clone(),
+        set: state.in_flight.clone(),
+    };
+    // ---- End prevent double-downloads ----
+
+    // Skip if already downloaded historically
     if state.downloaded_history.get(name.clone()) {
         return;
     }
 
-    info!(file_name = %name, worker_id = worker_id, "Downloading file");
-    let start = Instant::now();
+    info!(file_name = %name, worker_id, "Downloading file");
+    let start = std::time::Instant::now();
+
     match zips::download_zip(&state.http_client, url, &state.zips_dir).await {
         Ok(result) => {
             let elapsed = start.elapsed();
@@ -153,7 +196,7 @@ async fn download_and_log(
                 thread: worker_id as u32,
             });
 
-            info!(file_name = %name, size_bytes = result.size, worker_id = worker_id, "Download complete");
+            info!(file_name = %name, size_bytes = result.size, worker_id, "Download complete");
             let _ = proc_tx.send(result.path);
         }
         Err(e) => {
@@ -168,8 +211,6 @@ fn spawn_processor_pool(state: Arc<AppState>, mut proc_rx: mpsc::UnboundedReceiv
 
     tokio::spawn(async move {
         let (worker_id_tx, mut worker_id_rx) = mpsc::channel(num_workers);
-
-        // Pre-fill the pool with worker IDs
         for id in 1..=num_workers {
             worker_id_tx.send(id).await.unwrap();
         }
@@ -177,19 +218,16 @@ fn spawn_processor_pool(state: Arc<AppState>, mut proc_rx: mpsc::UnboundedReceiv
         let mut tasks = JoinSet::new();
 
         while let Some(msg) = proc_rx.recv().await {
-            // Wait for a free worker ID
             let worker_id = worker_id_rx.recv().await.unwrap();
-
-            // Clone handles for the new task
             let state_clone = state.clone();
             let worker_id_tx_clone = worker_id_tx.clone();
 
             tasks.spawn(async move {
                 process_and_log(msg, worker_id, state_clone).await;
-                // Return the worker ID to the pool
                 worker_id_tx_clone.send(worker_id).await.unwrap();
             });
         }
+
         info!("Processing channel closed. Waiting for remaining jobs.");
         while let Some(res) = tasks.join_next().await {
             if let Err(e) = res {
@@ -206,16 +244,15 @@ async fn process_and_log(path: PathBuf, worker_id: usize, state: Arc<AppState>) 
         .file_name()
         .map(|s| s.to_string_lossy().to_string())
         .unwrap_or_else(|| "unknown".into());
-    // skip already processed files
+
     if state.processed_history.get(name.clone()) {
         return;
     }
 
-    info!(file_name = %name, worker_id = worker_id, "Processing file");
-    let start = Instant::now();
+    info!(file_name = %name, worker_id, "Processing file");
+    let start = std::time::Instant::now();
 
     let state_for_blocking = state.clone();
-    // The actual CPU-bound work is spawned on a blocking thread
     let result = task::spawn_blocking(move || {
         process::split::split_zip_to_parquet(&path, &state_for_blocking.parquet_dir)
     })
@@ -226,7 +263,6 @@ async fn process_and_log(path: PathBuf, worker_id: usize, state: Arc<AppState>) 
             let end = Utc::now();
             let start_ts = end - ChronoDuration::microseconds(start.elapsed().as_micros() as i64);
 
-            // The original `state` is still valid here because we only moved a clone.
             let _ = state.processed_history.add(&ProcessedRow {
                 filename: name.clone(),
                 total_rows: rows,
@@ -236,18 +272,18 @@ async fn process_and_log(path: PathBuf, worker_id: usize, state: Arc<AppState>) 
                 thread: worker_id as u32,
             });
 
-            info!(file_name = %name, total_rows = rows, size_bytes = bytes, worker_id = worker_id, "Processing complete");
+            info!(file_name = %name, total_rows = rows, size_bytes = bytes, worker_id, "Processing complete");
         }
         Ok(Err(e)) => {
-            error!(file_name = %name, worker_id = worker_id, error = %e, "Processing failed")
+            error!(file_name = %name, worker_id, error = %e, "Processing failed");
         }
         Err(e) => {
-            error!(file_name = %name, worker_id = worker_id, error = %e, "Processor task panicked")
+            error!(file_name = %name, worker_id, error = %e, "Processor task panicked");
         }
     }
 }
 
-/// Spawns a task that periodically enqueues existing zip files.
+/// Periodically enqueues existing zip files.
 fn spawn_periodic_zip_enqueue(zips_dir: PathBuf, tx: mpsc::UnboundedSender<PathBuf>) {
     tokio::spawn(async move {
         loop {
@@ -255,30 +291,9 @@ fn spawn_periodic_zip_enqueue(zips_dir: PathBuf, tx: mpsc::UnboundedSender<PathB
             if let Err(e) = enqueue_zips(&zips_dir, &tx) {
                 error!("Failed to enqueue existing zips: {}", e);
             }
-            // Sleep for one day
-            time::sleep(time::Duration::from_secs(86_400)).await;
+            time::sleep(time::Duration::from_secs(86_400)).await; // one day
         }
     });
-}
-
-// --- Unchanged Helper Functions ---
-
-fn init_logging() {
-    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
-    fmt::Subscriber::builder().with_env_filter(filter).init();
-}
-
-fn setup_history<R>(
-    dir: &PathBuf,
-    builder: impl Fn(PathBuf) -> Result<Arc<TableHistory<R>>>,
-) -> Result<Arc<TableHistory<R>>>
-where
-    R: HistoryRow + Send + Sync + 'static,
-{
-    let store = builder(dir.clone())?;
-    store.vacuum().ok();
-    store.start_vacuum_loop();
-    Ok(store)
 }
 
 fn enqueue_zips(zips_dir: &PathBuf, tx: &mpsc::UnboundedSender<PathBuf>) -> Result<()> {
@@ -289,4 +304,9 @@ fn enqueue_zips(zips_dir: &PathBuf, tx: &mpsc::UnboundedSender<PathBuf>) -> Resu
         }
     }
     Ok(())
+}
+
+fn init_logging() {
+    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+    fmt::Subscriber::builder().with_env_filter(filter).init();
 }

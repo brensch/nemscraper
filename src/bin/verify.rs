@@ -12,23 +12,14 @@ use zip::ZipArchive;
 
 fn main() -> Result<()> {
     // Print current working directory (for debugging)
-    println!("current dir = {:?}", std::env::current_dir()?);
+    println!("current dir = {:?}\n", std::env::current_dir()?);
 
-    // ----------------------------------------
     // 1) Find all ZIP files under assets/zips/
-    // ----------------------------------------
     let zip_pattern = "assets/zips/*.zip";
     let zip_paths: Vec<PathBuf> = glob(zip_pattern)
         .with_context(|| format!("Failed to read glob pattern '{}'", zip_pattern))?
-        .filter_map(|entry| match entry {
-            Ok(path) => Some(path),
-            Err(err) => {
-                eprintln!("Warning: glob error: {}", err);
-                None
-            }
-        })
+        .filter_map(|entry| entry.ok())
         .collect();
-
     if zip_paths.is_empty() {
         return Err(anyhow::anyhow!(
             "No ZIP files found under '{}'",
@@ -36,21 +27,12 @@ fn main() -> Result<()> {
         ));
     }
 
-    // ----------------------------------------
     // 2) Find all Parquet files under assets/parquet/
-    // ----------------------------------------
     let parquet_pattern = "assets/parquet/**/*.parquet";
     let parquet_paths: Vec<PathBuf> = glob(parquet_pattern)
         .with_context(|| format!("Failed to read glob pattern '{}'", parquet_pattern))?
-        .filter_map(|entry| match entry {
-            Ok(path) => Some(path),
-            Err(err) => {
-                eprintln!("Warning: glob error: {}", err);
-                None
-            }
-        })
+        .filter_map(|entry| entry.ok())
         .collect();
-
     if parquet_paths.is_empty() {
         return Err(anyhow::anyhow!(
             "No Parquet files found under '{}'",
@@ -58,93 +40,96 @@ fn main() -> Result<()> {
         ));
     }
 
-    // ----------------------------------------
-    // 3) In parallel: open each ZIP and count lines starting with 'd' in each .csv
-    // ----------------------------------------
-    let per_zip_counts: Vec<(PathBuf, usize)> = zip_paths
+    // 3) Find all Parquet files under assets/compacted/
+    let compacted_pattern = "assets/compacted/**/*.parquet";
+    let compacted_paths: Vec<PathBuf> = glob(compacted_pattern)
+        .with_context(|| format!("Failed to read glob pattern '{}'", compacted_pattern))?
+        .filter_map(|entry| entry.ok())
+        .collect();
+    if compacted_paths.is_empty() {
+        return Err(anyhow::anyhow!(
+            "No Parquet files found under '{}'",
+            compacted_pattern
+        ));
+    }
+
+    // 4) In parallel: count 'D'-lines in each ZIP
+    let per_zip_counts: Vec<usize> = zip_paths
         .par_iter()
-        .map(|zip_path| {
-            // Open the ZIP file from disk
+        .map(|zip_path| -> Result<usize> {
             let file = File::open(zip_path)
                 .with_context(|| format!("Failed to open ZIP '{}'", zip_path.display()))?;
             let mut archive = ZipArchive::new(file)
-                .with_context(|| format!("Failed to read ZIP archive '{}'", zip_path.display()))?;
+                .with_context(|| format!("Failed to read ZIP '{}'", zip_path.display()))?;
 
-            // Counter for lines starting with 'd' across all CSVs inside this ZIP
             let mut count_d = 0;
-
-            // Iterate through each entry in the ZIP
             for i in 0..archive.len() {
-                // We need `entry_name` before creating a BufReader,
-                // so we can avoid borrowing `entry` again inside the closure.
                 let mut entry = archive.by_index(i).with_context(|| {
                     format!("Failed to access entry {} in '{}'", i, zip_path.display())
                 })?;
-                let raw_name = entry.name().to_string();
-                let name_lower = raw_name.to_lowercase();
-
+                let name_lower = entry.name().to_lowercase();
                 if !name_lower.ends_with(".csv") {
-                    continue; // Only process CSV files
+                    continue;
                 }
-                let csv_name = raw_name.clone();
-
-                // Wrap this entry in BufReader to iterate lines
                 let reader = BufReader::new(&mut entry);
-                for line_result in reader.lines() {
-                    let line = line_result
-                        .with_context(|| format!("Failed to read a line in '{}'", csv_name))?;
-                    if let Some(first_char) = line.chars().next() {
-                        if first_char == 'D' {
-                            count_d += 1;
-                        }
+                for line in reader.lines() {
+                    let line = line.with_context(|| "Failed to read a CSV line")?;
+                    if line.chars().next() == Some('D') {
+                        count_d += 1;
                     }
                 }
             }
-
-            Ok((zip_path.clone(), count_d))
+            Ok(count_d)
         })
         .collect::<Result<Vec<_>>>()?;
+    let total_zip: usize = per_zip_counts.iter().sum();
 
-    // Print per-ZIP results
-    let total_d_lines: usize = per_zip_counts.iter().map(|(_, cnt)| *cnt).sum();
-    println!("  → Total across all ZIPs: {} line(s)\n", total_d_lines);
-
-    // ----------------------------------------
-    // 4) In parallel: open each Parquet and sum row counts
-    // ----------------------------------------
-    let per_parquet_counts: Vec<(PathBuf, usize)> = parquet_paths
+    // 5) In parallel: sum rows in assets/parquet
+    let per_parquet_counts: Vec<usize> = parquet_paths
         .par_iter()
-        .map(|pq_path| {
+        .map(|pq_path| -> Result<usize> {
             let file = File::open(pq_path)
                 .with_context(|| format!("Failed to open Parquet '{}'", pq_path.display()))?;
-            let reader = SerializedFileReader::new(file).with_context(|| {
-                format!(
-                    "Failed to create Parquet reader for '{}'",
-                    pq_path.display()
-                )
-            })?;
-            let metadata = reader.metadata().file_metadata();
-            let num_rows = metadata.num_rows() as usize;
-            Ok((pq_path.clone(), num_rows))
+            let reader = SerializedFileReader::new(file)
+                .with_context(|| format!("Failed to read Parquet '{}'", pq_path.display()))?;
+            Ok(reader.metadata().file_metadata().num_rows() as usize)
         })
         .collect::<Result<Vec<_>>>()?;
+    let total_parquet: usize = per_parquet_counts.iter().sum();
 
-    // Print per-Parquet results
-    let total_rows: usize = per_parquet_counts.iter().map(|(_, cnt)| *cnt).sum();
-    println!("  → Total rows across all Parquet files: {}\n", total_rows);
+    // 6) In parallel: sum rows in assets/compacted
+    let per_compacted_counts: Vec<usize> = compacted_paths
+        .par_iter()
+        .map(|pq_path| -> Result<usize> {
+            let file = File::open(pq_path)
+                .with_context(|| format!("Failed to open Parquet '{}'", pq_path.display()))?;
+            let reader = SerializedFileReader::new(file)
+                .with_context(|| format!("Failed to read Parquet '{}'", pq_path.display()))?;
+            Ok(reader.metadata().file_metadata().num_rows() as usize)
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let total_compacted: usize = per_compacted_counts.iter().sum();
+
+    // 7) Print summary table
+    //
+    // delta = count(dir) - count(assets/zips)
+    let delta_parquet = total_parquet as isize - total_zip as isize;
+    let delta_compacted = total_compacted as isize - total_zip as isize;
 
     println!(
-        "delta between ZIP and Parquet row counts: {}",
-        total_d_lines - total_rows
+        "\n{: <25} {:>15} {:>15}",
+        "Directory", "Count", "Delta vs zip"
     );
-    if total_d_lines != total_rows {
-        eprintln!(
-            "Warning: ZIP line count ({}) does not match Parquet row count ({})",
-            total_d_lines, total_rows
-        );
-    } else {
-        println!("Counts match! ✅");
-    }
+    println!("{:-<55}", "");
+    println!("{: <25} {:>15} {:>15}", "assets/zips", total_zip, 0);
+    println!(
+        "{: <25} {:>15} {:>15}",
+        "assets/parquet", total_parquet, delta_parquet
+    );
+    println!(
+        "{: <25} {:>15} {:>15}",
+        "assets/compacted", total_compacted, delta_compacted
+    );
 
     Ok(())
 }
