@@ -1,10 +1,7 @@
 use anyhow::Result;
 use arrow::array::ArrayRef;
 use chrono::{DateTime, Datelike, NaiveDate, Utc};
-use std::{
-    path::PathBuf,
-    sync::Arc,
-};
+use std::{path::PathBuf, sync::Arc};
 
 use crate::history::table_history::{HistoryRow, TableHistory};
 
