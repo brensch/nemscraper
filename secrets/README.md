@@ -9,10 +9,10 @@ PROJECT_ID=selfforecasting
 gcloud iam service-accounts create uploader-sa \
   --display-name="File Uploader Service Account"
 
-# Grant Storage Object Admin (to write to your bucket)
+# Grant Storage Admin (to rsync files to GCS)
 gcloud projects add-iam-policy-binding $PROJECT_ID \
   --member="serviceAccount:uploader-sa@$PROJECT_ID.iam.gserviceaccount.com" \
-  --role="roles/storage.objectAdmin"
+  --role="roles/storage.admin"
 
 # Grant BigQuery User (to run queries/jobs)
 gcloud projects add-iam-policy-binding $PROJECT_ID \

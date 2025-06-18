@@ -1029,6 +1029,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "19d374276b40fb8bbdee95aef7c7fa6b5316ec764510eb64b8dd0e2ed0d7e7f5"
 
 [[package]]
+name = "crc32c"
+version = "0.6.8"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3a47af21622d091a8f0fb295b88bc886ac74efcc613efc19f5d0b21de5c89e47"
+dependencies = [
+ "rustc_version",
+]
+
+[[package]]
 name = "crc32fast"
 version = "1.4.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2729,9 +2738,11 @@ dependencies = [
  "anyhow",
  "arrow 55.1.0",
  "arrow-array 55.1.0",
+ "base64 0.22.1",
  "bytes",
  "chrono",
  "clap",
+ "crc32c",
  "futures",
  "futures-util",
  "gcloud-bigquery",

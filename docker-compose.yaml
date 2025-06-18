@@ -49,21 +49,17 @@ services:
       - ./assets:/assets
       - ./node_exporter_textfile:/textfile
 
-  file-uploader:
-    build:
-      context: .
-      dockerfile: Dockerfile.uploader
-    working_dir: /usr/src/app
+  gcloud-sync:
+    image: google/cloud-sdk:alpine
+    restart: always
     user: "1000:1000"
     environment:
-        GOOGLE_APPLICATION_CREDENTIALS: /usr/src/app/secrets/gcs.json
+      GOOGLE_APPLICATION_CREDENTIALS: /secrets/gcs.json
     volumes:
-      - ./secrets/uploader-sa.json:/usr/src/app/secrets/gcs.json:ro
-      - ./assets:/usr/src/app/assets
-    command:
-      - "--repo-path=assets/parquet/"
-      - "--bucket=aemo_data"
-
+      - ./secrets/uploader-sa.json:/secrets/gcs.json:ro
+      - ./assets:/assets:ro
+      - ./scripts/gcloud-sync.sh:/usr/local/bin/gcloud-sync.sh:ro
+    command: ["bash", "/usr/local/bin/gcloud-sync.sh"]
 
   file-compactor:
     build:
@@ -87,4 +83,3 @@ services:
     volumes:
       - ./assets:/usr/src/app/assets
     command: ["./target/release/nemscraper"]
-
