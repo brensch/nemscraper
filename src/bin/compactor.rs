@@ -1,163 +1,105 @@
-use anyhow::{Context, Result};
+use anyhow::{anyhow, Context, Result};
 use arrow_array::RecordBatchReader;
 use chrono::{DateTime, NaiveDate, Utc};
 use nemscraper::history::compacted::InputCompactionRow;
 use nemscraper::history::table_history::{HistoryRow, TableHistory};
+use once_cell::sync::Lazy;
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use parquet::{arrow::ArrowWriter, file::properties::WriterProperties};
 use std::{
+    collections::HashMap,
     env,
     fs::{self, File},
+    io::BufWriter,
     path::{Path, PathBuf},
-    sync::{
-        atomic::{AtomicBool, Ordering},
-        Arc,
-    },
-    thread,
-    time::Duration,
+    process::Command,
+    sync::{Arc, Mutex as StdMutex},
 };
-use tracing::{debug, error, info, instrument, warn};
+use tracing::{debug, error, info, instrument};
 use tracing_subscriber;
 use walkdir::WalkDir;
 
-static COMPACTION_IN_PROGRESS: AtomicBool = AtomicBool::new(false);
+// Per-partition locks to prevent concurrent compactions
+static PARTITION_LOCKS: Lazy<StdMutex<HashMap<String, Arc<StdMutex<()>>>>> =
+    Lazy::new(|| StdMutex::new(HashMap::new()));
 
-#[instrument]
 fn main() -> Result<()> {
-    // initialize tracing subscriber
     tracing_subscriber::fmt().with_env_filter("info").init();
 
-    info!("Starting continuous compactor (5-minute intervals)");
-
-    // usage: compactor <INPUT_DIR> <OUTPUT_DIR> <METADATA_DIR>
     let mut args = env::args().skip(1);
-    let input_root = PathBuf::from(
-        args.next()
-            .expect("Usage: compactor <INPUT_DIR> <OUTPUT_DIR> <METADATA_DIR>"),
-    );
-    let output_root = PathBuf::from(
-        args.next()
-            .expect("Usage: compactor <INPUT_DIR> <OUTPUT_DIR> <METADATA_DIR>"),
-    );
-    let meta_root = PathBuf::from(
-        args.next()
-            .expect("Usage: compactor <INPUT_DIR> <OUTPUT_DIR> <METADATA_DIR>"),
-    );
+    let input_root = PathBuf::from(args.next().expect("Missing <INPUT_DIR>"));
+    let output_root = PathBuf::from(args.next().expect("Missing <OUTPUT_DIR>"));
+    let meta_root = PathBuf::from(args.next().expect("Missing <META_DIR>"));
+    let gcs_bucket = args.next().expect("Missing <GCS_BUCKET>");
+    let gcs_prefix = args.next().expect("Missing <GCS_PREFIX>");
 
-    // ensure roots exist
     info!(
-        input = input_root.to_str(),
-        output = output_root.to_str(),
-        meta = meta_root.to_str(),
-        "Paths set"
+        input = %input_root.display(),
+        output = %output_root.display(),
+        meta = %meta_root.display(),
+        bucket = %gcs_bucket,
+        prefix = %gcs_prefix,
+        "Starting compaction"
     );
-    if !input_root.exists() {
-        error!(root = input_root.to_str(), "Input directory does not exist");
-        anyhow::bail!("Input directory not found: {}", input_root.display());
-    }
 
-    // initialize history tracker once
-    let hist = TableHistory::new_compacted(meta_root.clone())?;
+    let hist = TableHistory::new_compacted(&meta_root)?;
     hist.vacuum()?;
-    info!(metadata_dir=%meta_root.display(), "Initialized history tracker");
 
-    // main loop - run every 5 minutes
-    loop {
-        let start_time = Utc::now();
+    let mut partitions = discover_partitions(&input_root)?;
+    partitions.sort();
+    partitions.dedup();
 
-        // check if previous compaction is still running
-        if COMPACTION_IN_PROGRESS.load(Ordering::Acquire) {
-            warn!("Previous compaction still in progress, skipping this cycle");
-        } else {
-            // set flag to indicate compaction started
-            COMPACTION_IN_PROGRESS.store(true, Ordering::Release);
+    // determine worker count automatically
+    let num_workers = std::thread::available_parallelism().map_or(1, |n| n.get());
+    info!(workers = num_workers, "Using parallelism");
 
-            info!("Starting compaction cycle");
+    rayon::ThreadPoolBuilder::new()
+        .num_threads(num_workers)
+        .build_global()?;
 
-            // run compaction
-            match run_compaction_cycle(&input_root, &output_root, &hist) {
-                Ok(()) => {
-                    let duration = Utc::now() - start_time;
-                    info!(
-                        duration_ms = duration.num_milliseconds(),
-                        "Compaction cycle completed successfully"
-                    );
+    rayon::scope(|s| {
+        for partition in partitions {
+            let input_root = input_root.clone();
+            let output_root = output_root.clone();
+            let hist = Arc::clone(&hist);
+            let gcs_bucket = gcs_bucket.clone();
+            let gcs_prefix = gcs_prefix.clone();
+
+            s.spawn(move |_| {
+                if let Err(e) = compact_and_upload(
+                    &input_root,
+                    &output_root,
+                    &partition,
+                    &hist,
+                    &gcs_bucket,
+                    &gcs_prefix,
+                ) {
+                    error!(?partition, error=?e, "Partition failed");
                 }
-                Err(e) => {
-                    let duration = Utc::now() - start_time;
-                    error!(
-                        duration_ms = duration.num_milliseconds(),
-                        error = ?e,
-                        "Compaction cycle failed"
-                    );
-                }
-            }
-
-            // clear flag to indicate compaction finished
-            COMPACTION_IN_PROGRESS.store(false, Ordering::Release);
+            });
         }
+    });
 
-        info!("Sleeping for 5 minutes until next cycle...");
-        thread::sleep(Duration::from_secs(300)); // 5 minutes
-    }
-}
-
-#[instrument(skip(hist))]
-fn run_compaction_cycle(
-    input_root: &Path,
-    output_root: &Path,
-    hist: &TableHistory<InputCompactionRow>,
-) -> Result<()> {
-    // discover partitions
-    let mut parts = discover_partitions(input_root)?;
-    parts.sort();
-    parts.dedup();
-    info!(count = parts.len(), "Discovered partitions");
-
-    if parts.is_empty() {
-        info!("No partitions found, nothing to compact");
-        return Ok(());
-    }
-
-    let mut success_count = 0;
-    let mut error_count = 0;
-
-    for partition in parts {
-        match compact_partition(input_root, output_root, &partition, hist) {
-            Ok(()) => {
-                success_count += 1;
-                debug!(?partition, "Partition compacted successfully");
-            }
-            Err(e) => {
-                error_count += 1;
-                error!(partition=?partition, error=?e, "Partition compaction failed");
-            }
-        }
-    }
-
-    info!(success_count, error_count, "Compaction cycle finished");
-
-    // run vacuum after compaction cycle
-    if let Err(e) = hist.vacuum() {
-        warn!(error=?e, "History vacuum failed");
-    }
-
+    hist.vacuum()?;
     Ok(())
 }
 
-#[instrument(skip(root))]
-fn discover_partitions(root: &Path) -> Result<Vec<PathBuf>> {
+#[instrument(skip(input_root))]
+fn discover_partitions(input_root: &Path) -> Result<Vec<PathBuf>> {
     let mut parts = Vec::new();
-    for entry in WalkDir::new(root).into_iter().filter_map(Result::ok) {
+    for entry in WalkDir::new(input_root)
+        .follow_links(false)
+        .into_iter()
+        .filter_map(Result::ok)
+    {
         let path = entry.path();
         if path.extension().and_then(|s| s.to_str()) == Some("parquet") {
             if let Some(parent) = path.parent() {
                 let rel = parent
-                    .strip_prefix(root)
+                    .strip_prefix(input_root)
                     .context("strip_prefix failed")?
                     .to_path_buf();
-                parts.push(rel.clone());
-                debug!(relative_path = rel.to_str(), "Found partition");
+                parts.push(rel);
             }
         }
     }
@@ -165,152 +107,140 @@ fn discover_partitions(root: &Path) -> Result<Vec<PathBuf>> {
 }
 
 #[instrument(skip(hist))]
-fn compact_partition(
+fn compact_and_upload(
     input_root: &Path,
     output_root: &Path,
     partition: &Path,
-    hist: &TableHistory<InputCompactionRow>,
+    hist: &Arc<TableHistory<InputCompactionRow>>,
+    gcs_bucket: &str,
+    gcs_prefix: &str,
 ) -> Result<()> {
-    info!(?partition, "Compacting partition");
+    let partition_key = partition.to_string_lossy().to_string();
+    let lock_arc = {
+        let mut map = PARTITION_LOCKS.lock().unwrap();
+        map.entry(partition_key.clone())
+            .or_insert_with(|| Arc::new(StdMutex::new(())))
+            .clone()
+    };
+
+    let guard = match lock_arc.try_lock() {
+        Ok(g) => g,
+        Err(_) => {
+            info!(?partition, "Compaction already in progress; skipping");
+            return Ok(());
+        }
+    };
+
+    info!(?partition, "Acquired lock, scanning inputs");
     let in_dir = input_root.join(partition);
-    debug!(input_dir=%in_dir.display(), "Input partition directory");
-
     let out_dir = output_root.join(partition);
-    debug!(output_dir=%out_dir.display(), "Output partition directory");
+    fs::create_dir_all(&out_dir)?;
 
-    // gather new input files
-    let mut to_compact = Vec::new();
+    let mut new_inputs = Vec::new();
     if in_dir.exists() {
-        debug!("Listing directory {:?}", in_dir.display());
-        for entry in fs::read_dir(&in_dir)
-            .with_context(|| format!("Reading directory {}", in_dir.display()))?
-        {
+        for entry in fs::read_dir(&in_dir)? {
             let p = entry?.path();
             if p.extension().and_then(|s| s.to_str()) == Some("parquet") {
-                let rel = p
-                    .strip_prefix(input_root)
-                    .with_context(|| format!("Strip prefix for input file {}", p.display()))?;
+                let rel = p.strip_prefix(input_root)?;
                 let key = rel.to_string_lossy().to_string();
-                let sanitized_key = key.replace('/', "_").replace('\\', "_"); // Replace path separators
-                if !hist.get(sanitized_key.clone()) {
-                    debug!(file=%p.display(), key, "Queueing for compaction");
-                    to_compact.push((p.clone(), key));
+                let sanitized = key.replace('/', "_").replace('\\', "_");
+                if !hist.get(sanitized.clone()) {
+                    new_inputs.push((p.clone(), sanitized));
                 }
             }
         }
-    } else {
-        info!(
-            "Input directory {} does not exist, skipping",
-            in_dir.display()
-        );
     }
 
-    if to_compact.is_empty() {
-        info!(?partition, "No new files to compact");
+    if new_inputs.is_empty() {
+        info!(?partition, "No new files");
         return Ok(());
     }
 
-    let compaction_count = to_compact.len();
-    let start_time = Utc::now();
-    info!(count = compaction_count, "Starting compaction run");
-
-    // prepare writer with schema from first file
-    fs::create_dir_all(&out_dir)
-        .with_context(|| format!("Creating output directory {}", out_dir.display()))?;
-    let out_file = out_dir.join("compacted.parquet");
-    debug!(outfile=%out_file.display(), "Creating writer");
-    let writer_file = File::create(&out_file)
-        .with_context(|| format!("Creating output file {}", out_file.display()))?;
-
+    let compacted = out_dir.join("compacted.parquet");
+    let tmp = out_dir.join("compacted.parquet.tmp");
+    let writer_file = File::create(&tmp)?;
     let props = WriterProperties::builder().build();
-    let first_path = &to_compact[0].0;
-    debug!(first_input=%first_path.display(), "Opening first input to infer schema");
-    let mut reader0 = ParquetRecordBatchReaderBuilder::try_new(
-        File::open(&first_path)
-            .with_context(|| format!("Opening first input file {}", first_path.display()))?,
-    )?
-    .with_batch_size(1024)
-    .build()?;
-    let schema = reader0.schema();
-    let mut writer = ArrowWriter::try_new(writer_file, schema, Some(props))?;
 
-    // stream inputs
-    for (path, _) in &to_compact {
-        debug!("Opening input file {}", path.display());
-        let mut reader = ParquetRecordBatchReaderBuilder::try_new(
-            File::open(path).with_context(|| format!("Opening input file {}", path.display()))?,
-        )?
-        .with_batch_size(1024)
-        .build()?;
+    // infer schema via RecordBatchReader trait
+    let schema = if compacted.exists() {
+        let f = File::open(&compacted)?;
+        let mut reader = ParquetRecordBatchReaderBuilder::try_new(f)?
+            .with_batch_size(1024)
+            .build()?;
+        reader.schema()
+    } else {
+        let first = &new_inputs[0].0;
+        let f = File::open(first)?;
+        let mut reader = ParquetRecordBatchReaderBuilder::try_new(f)?
+            .with_batch_size(1024)
+            .build()?;
+        reader.schema()
+    };
+
+    let mut writer = ArrowWriter::try_new(BufWriter::new(writer_file), schema, Some(props))?;
+
+    if compacted.exists() {
+        let f = File::open(&compacted)?;
+        let mut reader = ParquetRecordBatchReaderBuilder::try_new(f)?
+            .with_batch_size(1024)
+            .build()?;
         while let Some(batch) = reader.next().transpose()? {
-            writer
-                .write(&batch)
-                .with_context(|| format!("Writing batch from {}", path.display()))?;
+            writer.write(&batch)?;
         }
     }
 
-    // stream existing outputs (except compacted)
-    if out_dir.exists() {
-        for entry in fs::read_dir(&out_dir)
-            .with_context(|| format!("Reading output directory {}", out_dir.display()))?
-        {
-            let p = entry?.path();
-            if let Some(name) = p.file_name().and_then(|n| n.to_str()) {
-                if name != "compacted.parquet"
-                    && p.extension().and_then(|s| s.to_str()) == Some("parquet")
-                {
-                    debug!("Opening existing output file {}", p.display());
-                    let mut reader = ParquetRecordBatchReaderBuilder::try_new(
-                        File::open(&p)
-                            .with_context(|| format!("Opening output file {}", p.display()))?,
-                    )?
-                    .with_batch_size(1024)
-                    .build()?;
-                    while let Some(batch) = reader.next().transpose()? {
-                        writer
-                            .write(&batch)
-                            .with_context(|| format!("Writing batch from {}", p.display()))?;
-                    }
-                }
-            }
+    let start = Utc::now();
+    for (path, key) in &new_inputs {
+        debug!(file=%path.display(), "Adding input");
+        let f = File::open(path)?;
+        let mut reader = ParquetRecordBatchReaderBuilder::try_new(f)?
+            .with_batch_size(1024)
+            .build()?;
+        while let Some(batch) = reader.next().transpose()? {
+            writer.write(&batch)?;
         }
-    }
-
-    writer.close().context("Closing Parquet writer")?;
-    info!(outfile=%out_file.display(), "Finished writing compacted.parquet");
-
-    // record history events
-    let end_time = Utc::now();
-    let partition_date = extract_partition_date(partition)?; // <-- Parse from path
-
-    for (_, key) in to_compact {
-        let sanitized_key = key.replace('/', "_").replace('\\', "_"); // Replace path separators
+        let end = Utc::now();
+        let part_date = extract_partition_date(partition)?;
         let row = InputCompactionRow {
-            input_file: sanitized_key.clone(),
-            partition: partition_date,
-            compaction_start: start_time,
-            compaction_end: end_time,
+            input_file: key.clone(),
+            partition: part_date,
+            compaction_start: start,
+            compaction_end: end,
             thread: 0,
         };
-        hist.add(&row)
-            .with_context(|| format!("Recording history for {}", key))?;
-        debug!(key, "Recorded history event");
+        hist.add(&row)?;
     }
 
-    info!(count = compaction_count, ?partition, "Compaction complete");
+    writer.close()?;
+    fs::rename(&tmp, &compacted)?;
+    info!(outfile=%compacted.display(), "Wrote compacted");
+
+    let mut uri = format!("gs://{}/", gcs_bucket);
+    if !gcs_prefix.is_empty() {
+        uri.push_str(gcs_prefix.trim_end_matches('/'));
+        uri.push('/');
+    }
+    uri.push_str(&partition.to_string_lossy());
+    uri.push_str("/compacted.parquet");
+    info!(gcs=%uri, "Uploading");
+    let status = Command::new("gsutil")
+        .arg("cp")
+        .arg(&compacted)
+        .arg(&uri)
+        .status()?;
+    if !status.success() {
+        return Err(anyhow!("gsutil upload failed: {}", uri));
+    }
+
+    drop(guard);
     Ok(())
 }
 
-// Extract partition date from the path like "FPP---CONTRIBUTION_FACTOR---1/date=2025-04-28"
-fn extract_partition_date(partition_path: &Path) -> Result<NaiveDate> {
-    let path_str = partition_path.to_string_lossy();
-
-    // Look for "date=YYYY-MM-DD" pattern
-    if let Some(date_part) = path_str.split('/').find(|part| part.starts_with("date=")) {
-        let date_str = date_part.strip_prefix("date=").unwrap();
-        NaiveDate::parse_from_str(date_str, "%Y-%m-%d")
-            .with_context(|| format!("Failed to parse date from {}", date_str))
-    } else {
-        anyhow::bail!("No date found in partition path: {}", path_str);
+fn extract_partition_date(part: &Path) -> Result<NaiveDate> {
+    for comp in part.iter().map(|c| c.to_string_lossy()) {
+        if let Some(d) = comp.strip_prefix("date=") {
+            return NaiveDate::parse_from_str(&d, "%Y-%m-%d").context("Invalid date");
+        }
     }
+    Err(anyhow!("No date=YYYY-MM-DD in {:?}", part))
 }
