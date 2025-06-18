@@ -3,9 +3,10 @@ use arrow::array::*;
 use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
 use arrow::record_batch::RecordBatch;
 use arrow_array::RecordBatchReader;
-use chrono::{DateTime, FixedOffset, NaiveDate, NaiveDateTime, TimeZone, Utc};
+use chrono::TimeZone;
+use chrono::{FixedOffset, NaiveDate, Utc};
 use nemscraper::history::compacted::InputCompactionRow;
-use nemscraper::history::table_history::{HistoryRow, TableHistory};
+use nemscraper::history::table_history::TableHistory;
 use once_cell::sync::Lazy;
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use parquet::arrow::parquet_to_arrow_schema;
@@ -279,76 +280,129 @@ fn can_convert_type(from: &DataType, to: &DataType) -> bool {
     }
 }
 
-/// Evolves a schema by taking the most evolved type for each field
+/// Creates a null array of the specified type and length
+fn create_null_array(data_type: &DataType, length: usize) -> Result<ArrayRef> {
+    match data_type {
+        DataType::Utf8 => {
+            let mut builder = StringBuilder::new();
+            for _ in 0..length {
+                builder.append_null();
+            }
+            Ok(Arc::new(builder.finish()))
+        }
+        DataType::Float64 => {
+            let mut builder = Float64Builder::new();
+            for _ in 0..length {
+                builder.append_null();
+            }
+            Ok(Arc::new(builder.finish()))
+        }
+        DataType::Timestamp(TimeUnit::Millisecond, tz) => {
+            let mut builder = TimestampMillisecondBuilder::new();
+            for _ in 0..length {
+                builder.append_null();
+            }
+            let array = builder.finish().with_timezone_opt(tz.clone());
+            Ok(Arc::new(array))
+        }
+        DataType::Int64 => {
+            let mut builder = Int64Builder::new();
+            for _ in 0..length {
+                builder.append_null();
+            }
+            Ok(Arc::new(builder.finish()))
+        }
+        DataType::Int32 => {
+            let mut builder = Int32Builder::new();
+            for _ in 0..length {
+                builder.append_null();
+            }
+            Ok(Arc::new(builder.finish()))
+        }
+        DataType::Boolean => {
+            let mut builder = BooleanBuilder::new();
+            for _ in 0..length {
+                builder.append_null();
+            }
+            Ok(Arc::new(builder.finish()))
+        }
+        _ => Err(anyhow::anyhow!(
+            "Unsupported data type for null array creation: {:?}",
+            data_type
+        )),
+    }
+}
+
+/// Evolves a schema by taking the union of all fields and the most evolved type for each field
 fn evolve_schema(base_schema: &Schema, new_schema: &Schema) -> Result<Arc<Schema>> {
-    let mut evolved_fields = Vec::new();
+    let mut field_map: HashMap<String, Field> = HashMap::new();
     let mut changes_made = false;
 
-    for (i, base_field) in base_schema.fields().iter().enumerate() {
-        if let Some(new_field) = new_schema.fields().get(i) {
-            if base_field.name() == new_field.name() {
-                // Get the most evolved type between base and new
-                let evolved_type =
-                    get_most_evolved_type(base_field.data_type(), new_field.data_type());
+    // First, add all fields from the base schema
+    for field in base_schema.fields() {
+        field_map.insert(field.name().clone(), field.as_ref().clone());
+    }
 
-                // Check that both types can be converted to the evolved type
-                if !can_convert_type(base_field.data_type(), &evolved_type) {
-                    return Err(anyhow::anyhow!(
-                        "Cannot convert field '{}' from {:?} to evolved type {:?}",
-                        base_field.name(),
-                        base_field.data_type(),
-                        evolved_type
-                    ));
-                }
+    // Then, process fields from the new schema
+    for new_field in new_schema.fields() {
+        if let Some(existing_field) = field_map.get(new_field.name()) {
+            // Field exists in both schemas - evolve the type
+            let evolved_type =
+                get_most_evolved_type(existing_field.data_type(), new_field.data_type());
 
-                if !can_convert_type(new_field.data_type(), &evolved_type) {
-                    return Err(anyhow::anyhow!(
-                        "Cannot convert field '{}' from {:?} to evolved type {:?}",
-                        new_field.name(),
-                        new_field.data_type(),
-                        evolved_type
-                    ));
-                }
-
-                if &evolved_type != base_field.data_type() {
-                    info!(
-                        field = %base_field.name(),
-                        base_type = ?base_field.data_type(),
-                        new_type = ?new_field.data_type(),
-                        evolved_type = ?evolved_type,
-                        "Evolving field type"
-                    );
-                    changes_made = true;
-                }
-
-                // Create field with evolved type, preserving nullability from base
-                let evolved_field =
-                    Field::new(base_field.name(), evolved_type, base_field.is_nullable());
-                evolved_fields.push(evolved_field);
-            } else {
+            // Check that both types can be converted to the evolved type
+            if !can_convert_type(existing_field.data_type(), &evolved_type) {
                 return Err(anyhow::anyhow!(
-                    "Field name mismatch at position {}: '{}' vs '{}'",
-                    i,
-                    base_field.name(),
-                    new_field.name()
+                    "Cannot convert field '{}' from {:?} to evolved type {:?}",
+                    existing_field.name(),
+                    existing_field.data_type(),
+                    evolved_type
                 ));
             }
+
+            if !can_convert_type(new_field.data_type(), &evolved_type) {
+                return Err(anyhow::anyhow!(
+                    "Cannot convert field '{}' from {:?} to evolved type {:?}",
+                    new_field.name(),
+                    new_field.data_type(),
+                    evolved_type
+                ));
+            }
+
+            if &evolved_type != existing_field.data_type() {
+                info!(
+                    field = %existing_field.name(),
+                    base_type = ?existing_field.data_type(),
+                    new_type = ?new_field.data_type(),
+                    evolved_type = ?evolved_type,
+                    "Evolving field type"
+                );
+                changes_made = true;
+            }
+
+            // Create field with evolved type, preserving nullability (most permissive)
+            let nullable = existing_field.is_nullable() || new_field.is_nullable();
+            let evolved_field = Field::new(existing_field.name(), evolved_type, nullable);
+            field_map.insert(existing_field.name().clone(), evolved_field);
         } else {
-            return Err(anyhow::anyhow!(
-                "New schema has fewer fields than base schema"
-            ));
+            // New field doesn't exist in base schema - add it
+            info!(
+                field = %new_field.name(),
+                field_type = ?new_field.data_type(),
+                "Adding new field to schema"
+            );
+            field_map.insert(new_field.name().clone(), new_field.as_ref().clone());
+            changes_made = true;
         }
     }
 
-    if new_schema.fields().len() > base_schema.fields().len() {
-        return Err(anyhow::anyhow!(
-            "New schema has more fields than base schema"
-        ));
+    if changes_made {
+        info!("Schema evolution completed with type upgrades and/or new fields");
     }
 
-    if changes_made {
-        info!("Schema evolution completed with type upgrades");
-    }
+    // Create evolved schema with fields in a consistent order (alphabetical)
+    let mut evolved_fields: Vec<Field> = field_map.into_values().collect();
+    evolved_fields.sort_by(|a, b| a.name().cmp(b.name()));
 
     Ok(Arc::new(Schema::new(evolved_fields)))
 }
@@ -444,26 +498,57 @@ fn convert_column(array: &dyn Array, target_field: &Field) -> Result<ArrayRef> {
     }
 }
 
-/// Converts a record batch to match a target schema
+/// Converts a record batch to match a target schema, handling missing and extra columns
 fn convert_batch_to_schema(batch: RecordBatch, target_schema: &Schema) -> Result<RecordBatch> {
+    let source_schema = batch.schema();
     let mut new_columns = Vec::new();
 
-    for (i, target_field) in target_schema.fields().iter().enumerate() {
-        let source_array = batch.column(i);
-        let converted_array = convert_column(source_array, target_field)
-            .with_context(|| format!("Failed to convert column '{}'", target_field.name()))?;
-        new_columns.push(converted_array);
+    // Create a mapping from field name to column index in the source batch
+    let source_field_map: HashMap<String, usize> = source_schema
+        .fields()
+        .iter()
+        .enumerate()
+        .map(|(i, field)| (field.name().clone(), i))
+        .collect();
+
+    // Process each field in the target schema
+    for target_field in target_schema.fields() {
+        if let Some(&source_column_idx) = source_field_map.get(target_field.name()) {
+            // Field exists in source - convert it
+            let source_array = batch.column(source_column_idx);
+            let converted_array = convert_column(source_array, target_field)
+                .with_context(|| format!("Failed to convert column '{}'", target_field.name()))?;
+            new_columns.push(converted_array);
+        } else {
+            // Field doesn't exist in source - create null array
+            let null_array = create_null_array(target_field.data_type(), batch.num_rows())
+                .with_context(|| {
+                    format!(
+                        "Failed to create null array for missing column '{}'",
+                        target_field.name()
+                    )
+                })?;
+            new_columns.push(null_array);
+
+            debug!(
+                field = %target_field.name(),
+                field_type = ?target_field.data_type(),
+                rows = batch.num_rows(),
+                "Created null array for missing column"
+            );
+        }
     }
 
     RecordBatch::try_new(Arc::new(target_schema.clone()), new_columns)
         .with_context(|| "Failed to create converted record batch")
 }
 
-/// Reads all data from a parquet file and converts it to the target schema
-fn read_and_convert_parquet_file(
+/// Streams data from a parquet file, converting each batch to target schema and writing immediately
+fn stream_and_convert_parquet_file(
     file_path: &Path,
     target_schema: &Schema,
-) -> Result<Vec<RecordBatch>> {
+    writer: &mut ArrowWriter<BufWriter<File>>,
+) -> Result<usize> {
     let file = File::open(file_path)
         .with_context(|| format!("Failed to open parquet file {}", file_path.display()))?;
 
@@ -473,17 +558,31 @@ fn read_and_convert_parquet_file(
         .build()
         .with_context(|| format!("Failed to build reader for {}", file_path.display()))?;
 
-    let mut converted_batches = Vec::new();
+    let mut batch_count = 0;
     while let Some(batch) = reader.next().transpose()? {
-        let converted_batch = convert_batch_to_schema(batch, target_schema)
-            .with_context(|| format!("Failed to convert batch from {}", file_path.display()))?;
-        converted_batches.push(converted_batch);
+        let converted_batch = convert_batch_to_schema(batch, target_schema).with_context(|| {
+            format!(
+                "Failed to convert batch {} from {}",
+                batch_count,
+                file_path.display()
+            )
+        })?;
+
+        writer.write(&converted_batch).with_context(|| {
+            format!(
+                "Failed to write converted batch {} from {}",
+                batch_count,
+                file_path.display()
+            )
+        })?;
+
+        batch_count += 1;
     }
 
-    Ok(converted_batches)
+    Ok(batch_count)
 }
 
-/// Performs the core compaction logic with schema evolution support
+/// Performs the core compaction logic with streaming schema evolution
 fn compact_partition_inner(
     input_root: &Path,
     output_root: &Path,
@@ -553,16 +652,17 @@ fn compact_partition_inner(
             .with_context(|| format!("Failed to remove existing temp file {}", tmp.display()))?;
     }
 
-    // Step 1: Determine the evolved schema by examining all input files
+    // Step 1: Determine the evolved schema by examining all schemas (metadata only)
+    info!("Determining evolved schema from all input files");
     let mut evolved_schema = if compacted.exists() {
-        info!("Reading schema from existing compacted file");
+        debug!("Reading schema from existing compacted file");
         read_schema_from_parquet_metadata(&compacted)?
     } else {
-        info!("Reading schema from first input file");
+        debug!("Reading schema from first input file");
         read_schema_from_parquet_metadata(&new_inputs[0].0)?
     };
 
-    // Evolve schema by examining all input files
+    // Evolve schema by examining all input files (just metadata, not data)
     for (input_path, _) in &new_inputs {
         let input_schema = read_schema_from_parquet_metadata(input_path)?;
         evolved_schema = evolve_schema(&evolved_schema, &input_schema)
@@ -571,10 +671,11 @@ fn compact_partition_inner(
 
     info!(
         final_schema_fields = evolved_schema.fields().len(),
+        field_types = ?evolved_schema.fields().iter().map(|f| format!("{}: {:?}", f.name(), f.data_type())).collect::<Vec<_>>(),
         "Computed evolved schema"
     );
 
-    // Step 2: Create writer with evolved schema
+    // Step 2: Create streaming writer with evolved schema
     let writer_file = File::create(&tmp)
         .with_context(|| format!("Failed to create temp file {}", tmp.display()))?;
 
@@ -596,24 +697,19 @@ fn compact_partition_inner(
         )
     })?;
 
-    // Step 3: Process existing compacted file if it exists
+    // Step 3: Stream existing compacted file if it exists (convert and write immediately)
     if compacted.exists() {
-        info!("Converting and copying existing compacted data");
-        let existing_batches = read_and_convert_parquet_file(&compacted, &evolved_schema)
-            .with_context(|| "Failed to read and convert existing compacted file")?;
-
-        for batch in existing_batches {
-            writer
-                .write(&batch)
-                .with_context(|| "Failed to write converted existing batch")?;
-        }
-        // info!(
-        //     "Copied {} batches from existing compacted file",
-        //     existing_batches.len()
-        // );
+        info!("Streaming and converting existing compacted data");
+        let existing_batch_count =
+            stream_and_convert_parquet_file(&compacted, &evolved_schema, &mut writer)
+                .with_context(|| "Failed to stream and convert existing compacted file")?;
+        info!(
+            "Streamed {} batches from existing compacted file",
+            existing_batch_count
+        );
     }
 
-    // Step 4: Process all new input files
+    // Step 4: Stream all new input files (one at a time, convert and write immediately)
     let start = Utc::now();
     let mut successful_inputs = Vec::new();
 
@@ -621,27 +717,24 @@ fn compact_partition_inner(
         info!(
             file = %path.display(),
             progress = format!("{}/{}", i + 1, new_inputs.len()),
-            "Processing input file"
+            "Streaming input file"
         );
 
-        let converted_batches = read_and_convert_parquet_file(path, &evolved_schema)
-            .with_context(|| format!("Failed to read and convert input file {}", path.display()))?;
-
-        for batch in converted_batches {
-            writer.write(&batch).with_context(|| {
-                format!("Failed to write batch from input file {}", path.display())
+        let batch_count = stream_and_convert_parquet_file(path, &evolved_schema, &mut writer)
+            .with_context(|| {
+                format!("Failed to stream and convert input file {}", path.display())
             })?;
-        }
 
         debug!(
             file = %path.display(),
-            "Successfully processed input file"
+            batches_processed = batch_count,
+            "Successfully streamed input file"
         );
 
         successful_inputs.push((path.clone(), key.clone()));
     }
 
-    // Step 5: Finalize
+    // Step 5: Finalize (same as before)
     writer.close().with_context(|| {
         format!(
             "Failed to close Arrow writer for temp file {}",
@@ -672,7 +765,7 @@ fn compact_partition_inner(
         )
     })?;
 
-    for (path, key) in successful_inputs {
+    for (_path, key) in successful_inputs {
         let row = InputCompactionRow {
             input_file: key.clone(),
             partition: part_date,
