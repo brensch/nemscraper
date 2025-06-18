@@ -1,17 +1,10 @@
-use anyhow::{Context, Result};
+use anyhow::Result;
 use arrow::array::ArrayRef;
-use arrow::record_batch::RecordBatch;
 use chrono::{DateTime, Datelike, NaiveDate, Utc};
-use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
-use parquet::{arrow::ArrowWriter, file::properties::WriterProperties};
 use std::{
-    env,
-    fs::{self, File},
-    path::{Path, PathBuf},
+    path::PathBuf,
     sync::Arc,
-    thread,
 };
-use walkdir::WalkDir;
 
 use crate::history::table_history::{HistoryRow, TableHistory};
 
@@ -32,10 +25,7 @@ impl HistoryRow for InputCompactionRow {
     }
 
     fn schema() -> arrow::datatypes::Schema {
-        use arrow::{
-            array::{ArrayRef, StringArray, TimestampMicrosecondArray, UInt32Array},
-            datatypes::{DataType as ArrowDataType, Field, Schema as ArrowSchema, TimeUnit},
-        };
+        use arrow::datatypes::{DataType as ArrowDataType, Field, Schema as ArrowSchema, TimeUnit};
         ArrowSchema::new(vec![
             Field::new("input_file", ArrowDataType::Utf8, false),
             Field::new("partition", ArrowDataType::Date32, false),
