@@ -176,6 +176,7 @@ fn apply_trimming(
 /// Convert a string array to a timezone-aware timestamp array
 fn convert_date_column(array: &ArrayRef, target_field: &Field) -> (Field, ArrayRef) {
     if let Some(string_array) = array.as_any().downcast_ref::<StringArray>() {
+        // 1) parse your strings into Option<i64> millis, as before…
         let timestamps: Vec<Option<i64>> = string_array
             .iter()
             .map(|opt_str| {
@@ -186,8 +187,21 @@ fn convert_date_column(array: &ArrayRef, target_field: &Field) -> (Field, ArrayR
             })
             .collect();
 
-        let timestamp_array = TimestampMillisecondArray::from(timestamps).with_timezone("+10:00");
-        (target_field.clone(), Arc::new(timestamp_array) as ArrayRef)
+        // 2) build the actual Array with timezone metadata
+        let tz = "+10:00".to_string();
+        let timestamp_array = TimestampMillisecondArray::from(timestamps).with_timezone(tz.clone());
+
+        // 3) construct a new Field with the same name, nullability, and metadata...
+        let mut new_field = Field::new(
+            target_field.name(),
+            DataType::Timestamp(TimeUnit::Millisecond, Some(tz.into())),
+            target_field.is_nullable(),
+        );
+        // ...and preserve any existing metadata (if you have any attached)
+        new_field = new_field.with_metadata(target_field.metadata().clone());
+
+        // 4) return the new field + the array
+        (new_field, Arc::new(timestamp_array) as ArrayRef)
     } else {
         (target_field.clone(), array.clone())
     }

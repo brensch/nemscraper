@@ -2,13 +2,13 @@ use anyhow::{Context, Result};
 use chrono::{FixedOffset, NaiveDate};
 use clap::Parser;
 use glob::glob;
-use log::info;
 use polars::datatypes::time_zone::{parse_fixed_offset, parse_time_zone};
 use polars::lazy::dsl::concat;
 use polars::prelude::*;
 use std::fs::{create_dir_all, File};
 use std::ops::Neg;
 use std::path::PathBuf;
+use tracing::info;
 
 #[derive(Parser)]
 #[command(
@@ -26,7 +26,11 @@ struct Args {
 }
 
 fn main() -> Result<()> {
-    env_logger::init();
+    // Initialize logging to log info with the tracing package
+    tracing_subscriber::fmt().with_env_filter("info").init();
+
+    info!("Starting FPP pipeline...");
+
     let args = Args::parse();
     create_dir_all(&args.output)?;
     info!("Starting full FPP pipeline for date: {}", args.date);
@@ -104,9 +108,12 @@ fn read_parquet_files(pattern: &str) -> Result<DataFrame> {
     }
 }
 
-fn run_step_1_frequency_measure(input_dir: &str, _date: &str, output_path: &PathBuf) -> Result<()> {
+fn run_step_1_frequency_measure(input_dir: &str, date: &str, output_path: &PathBuf) -> Result<()> {
     info!("Running Step 1: Frequency Measure Calculation");
-    let scada_path = format!("{}/CAUSER_PAYS_SCADA---NETWORK---1/**/*.parquet", input_dir);
+    let scada_path = format!(
+        "{}/CAUSER_PAYS_SCADA---NETWORK---1/date={}/*.parquet",
+        input_dir, date
+    );
 
     let df = read_parquet_files(&scada_path)?;
 
@@ -140,7 +147,10 @@ fn run_step_2_reference_trajectory(
     output_path: &PathBuf,
 ) -> Result<()> {
     info!("Running Step 2: Reference Trajectory Calculation");
-    let targets_path = format!("{}/DISPATCH---UNIT_SOLUTION---5/**/*.parquet", input_dir);
+    let targets_path = format!(
+        "{}/DISPATCH---UNIT_SOLUTION---5/date={}/*.parquet",
+        input_dir, date
+    );
 
     let targets_df = read_parquet_files(&targets_path)?
         .lazy()
@@ -259,7 +269,7 @@ fn run_step_2_reference_trajectory(
 fn run_step_3_unit_deviations(
     input_dir: &str,
     trajectory_path: &PathBuf,
-    _date: &str,
+    date: &str,
     output_path: &PathBuf,
 ) -> Result<()> {
     info!("Running Step 3: Unit Deviation Calculation");
@@ -284,7 +294,7 @@ fn run_step_3_unit_deviations(
     }
 
     // Read unit MW data - let's first check what SCADA files exist
-    let scada_path = format!("{}/FPP---UNIT_MW---1/**/*.parquet", input_dir);
+    let scada_path = format!("{}/FPP---UNIT_MW---1/date={}/*.parquet", input_dir, date);
     info!("Looking for SCADA files at: {}", scada_path);
 
     // Check if files exist
@@ -332,8 +342,15 @@ fn run_step_3_unit_deviations(
     // Debug: Show some SCADA data
     if scada_df.height() > 0 {
         info!("First few SCADA rows:");
-        println!("{}", scada_df.head(Some(5)));
+        println!("{}", scada_df.head(Some(10)));
     }
+
+    // right before your join in run_step_3:
+    let ref_small = trajectory_df.clone().lazy().select([col("ts")]).collect()?;
+    println!("Reference ts sample:\n{}", ref_small.head(Some(10)));
+
+    let scada_small = scada_df.clone().lazy().select([col("ts")]).collect()?;
+    println!("  SCADA ts sample:\n{}", scada_small.head(Some(10)));
 
     // Try LEFT join first to see what's not matching
     let joined_df = trajectory_df
