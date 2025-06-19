@@ -1,142 +1,113 @@
-use anyhow::Result;
-use futures::future::join_all;
-use google_cloud_bigquery::client::{Client as BigqueryClient, ClientConfig as BigqueryConfig};
-use google_cloud_bigquery::http::dataset::{Dataset as BqDataset, DatasetReference};
-use google_cloud_bigquery::http::job::{
-    Job, JobConfiguration, JobConfigurationQuery, JobReference, JobType,
-};
-use google_cloud_storage::client::{Client as StorageClient, ClientConfig as StorageConfig};
-use google_cloud_storage::http::objects::list::ListObjectsRequest;
+// //! src/bin/load_bigquery.rs
 
-const GCP_PROJECT_ID: &str = "selfforecasting";
-const BQ_DATASET_ID: &str = "aemo_analytics";
-const GCS_BUCKET_NAME: &str = "aemo_data";
-const GCS_FOLDER_PREFIX: &str = "";
-const BQ_LOCATION: &str = "US";
+// use anyhow::{Context, Result};
+// use futures::future::join_all;
+// use google_cloud_bigquery::client::{Client as BqClient, ClientConfig as BqConfig};
+// use google_cloud_bigquery::http::job::query::QueryRequest;
+// use google_cloud_bigquery::query::row::Row;
+// use google_cloud_storage::client::{Client as StorageClient, ClientConfig as StorageConfig};
+// use google_cloud_storage::http::objects::list::ListObjectsRequest; // ← correct
+// use rustls::crypto::aws_lc_rs::default_provider;
 
-#[tokio::main]
-async fn main() -> Result<()> {
-    // 0) bootstrap TLS for rustls
-    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+// #[tokio::main]
+// async fn main() -> Result<()> {
+//     let _ = default_provider().install_default();
 
-    // 1) BigQuery + GCS clients
-    let (bq_config, _) = BigqueryConfig::new_with_auth().await?;
-    let bq_client = BigqueryClient::new(bq_config).await?;
-    let storage_cfg = StorageConfig::default().with_auth().await?;
-    let storage_client = StorageClient::new(storage_cfg);
+//     let project =
+//         std::env::var("GOOGLE_CLOUD_PROJECT").context("Please set env var GOOGLE_CLOUD_PROJECT")?;
+//     let dataset = "aemo_analytics";
+//     let bucket = "aemo_data";
 
-    // 2) ensure dataset
-    ensure_dataset_exists(&bq_client).await?;
+//     // GCS client
+//     let storage_cfg = StorageConfig::default()
+//         .with_auth()
+//         .await
+//         .context("authenticating GCS client")?;
+//     let storage_client = StorageClient::new(storage_cfg);
 
-    // 3) list folders
-    let folders = get_top_level_folders(&storage_client).await?;
+//     // list “folders” under gs://bucket/ with delimiter = "/"
+//     let list_req = ListObjectsRequest {
+//         bucket: bucket.to_string(),
+//         delimiter: Some("/".to_string()),
+//         ..Default::default()
+//     };
+//     let resp = storage_client
+//         .list_objects(&list_req)
+//         .await
+//         .context("listing bucket prefixes")?;
+//     let prefixes = resp.prefixes.unwrap_or_default();
 
-    // 4) build all CREATE EXTERNAL TABLE statements
-    let mut ext_sqls = Vec::with_capacity(folders.len());
-    for folder in folders.into_iter().filter(|f| !f.is_empty()) {
-        let table_name = folder.to_lowercase().replace("---", "_");
-        let ext_id = format!("{}.{}.ext_{}", GCP_PROJECT_ID, BQ_DATASET_ID, table_name);
-        let gcs_uri = format!("gs://{}/{}/*", GCS_BUCKET_NAME, folder);
-        let hive_pref = format!("gs://{}/{}", GCS_BUCKET_NAME, folder);
+//     if prefixes.is_empty() {
+//         println!("⚠️  No top-level folders under gs://{}/", bucket);
+//         return Ok(());
+//     }
 
-        let sql = format!(
-            r#"
-CREATE OR REPLACE EXTERNAL TABLE `{ext_id}`
-WITH PARTITION COLUMNS (
-  date DATE
-)
-OPTIONS (
-  format = 'PARQUET',
-  uris = ['{gcs_uri}'],
-  hive_partition_uri_prefix = '{hive_pref}',
-  require_hive_partition_filter = FALSE
-)"#,
-            ext_id = ext_id,
-            gcs_uri = gcs_uri,
-            hive_pref = hive_pref,
-        );
-        ext_sqls.push(sql);
-    }
+//     // BigQuery client
+//     let (bq_cfg, project_opt) = BqConfig::new_with_auth()
+//         .await
+//         .context("authenticating BigQuery client")?;
+//     let project_id =
+//         project_opt.ok_or_else(|| anyhow::anyhow!("no project_id from credentials"))?;
+//     let bq_client = BqClient::new(bq_cfg).await?;
 
-    // 5) fire them all off in parallel
-    let jobs = ext_sqls.into_iter().map(|q| run_bq_query(&bq_client, q));
-    let results = join_all(jobs).await;
-    for res in results {
-        if let Err(err) = res {
-            eprintln!("BigQuery DDL failed: {:?}", err);
-        }
-    }
+//     // spawn all DDLs in parallel
+//     let mut tasks = Vec::with_capacity(prefixes.len());
+//     for raw_prefix in prefixes {
+//         let raw = raw_prefix.trim_end_matches('/');
+//         let table_id = format!("ext_{}", raw.replace('-', "_").to_lowercase());
+//         let uri_prefix = format!("gs://{}/{}/", bucket, raw);
+//         let gcs_uri = format!("{}*", uri_prefix);
 
-    println!("✔︎ all external tables creation jobs dispatched");
-    Ok(())
-}
+//         let ddl = format!(
+//             r#"
+// CREATE OR REPLACE EXTERNAL TABLE `{project}.{dataset}.{table_id}`
+// WITH PARTITION COLUMNS (
+//   date DATE
+// )
+// OPTIONS (
+//   format = 'PARQUET',
+//   uris = ['{gcs_uri}'],
+//   hive_partition_uri_prefix = '{uri_prefix}',
+//   require_hive_partition_filter = FALSE
+// );
+// "#,
+//             project = project,
+//             dataset = dataset,
+//             table_id = table_id,
+//             gcs_uri = gcs_uri,
+//             uri_prefix = uri_prefix,
+//         );
 
-async fn ensure_dataset_exists(bq_client: &BigqueryClient) -> Result<()> {
-    if bq_client
-        .dataset()
-        .get(GCP_PROJECT_ID, BQ_DATASET_ID)
-        .await
-        .is_ok()
-    {
-        return Ok(());
-    }
-    let mut meta = BqDataset::default();
-    meta.dataset_reference = DatasetReference {
-        project_id: GCP_PROJECT_ID.to_string(),
-        dataset_id: BQ_DATASET_ID.to_string(),
-    };
-    meta.location = BQ_LOCATION.to_string();
-    bq_client.dataset().create(&meta).await?;
-    Ok(())
-}
+//         let client = bq_client.clone();
+//         let proj = project_id.clone();
+//         let dataset = dataset.to_string();
+//         let table_ref = table_id.clone();
 
-async fn get_top_level_folders(storage: &StorageClient) -> Result<Vec<String>> {
-    let resp = storage
-        .list_objects(&ListObjectsRequest {
-            bucket: GCS_BUCKET_NAME.to_string(),
-            prefix: Some(GCS_FOLDER_PREFIX.to_string()),
-            delimiter: Some("/".to_string()),
-            ..Default::default()
-        })
-        .await?;
-    Ok(resp
-        .prefixes
-        .unwrap_or_default()
-        .into_iter()
-        .map(|p| {
-            p.replace(GCS_FOLDER_PREFIX, "")
-                .trim_end_matches('/')
-                .to_string()
-        })
-        .filter(|s| !s.is_empty())
-        .collect())
-}
+//         tasks.push(tokio::spawn(async move {
+//             println!("▶ Creating/updating: {}.{}", dataset, table_ref);
+//             let req = QueryRequest {
+//                 query: ddl,
+//                 use_legacy_sql: false,
+//                 ..Default::default()
+//             };
+//             let mut rows = client.query::<Row>(&proj, req).await?;
+//             while let Some(_) = rows.next().await? { /* drain */ }
+//             Ok::<_, anyhow::Error>(())
+//         }));
+//     }
 
-async fn run_bq_query(bq: &BigqueryClient, query: String) -> Result<()> {
-    let ts = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)?
-        .as_millis();
-    let job_ref = JobReference {
-        project_id: GCP_PROJECT_ID.to_string(),
-        job_id: format!("ddl_{}", ts),
-        location: Some(BQ_LOCATION.to_string()),
-    };
-    let job = Job {
-        job_reference: job_ref,
-        configuration: JobConfiguration {
-            job: JobType::Query(JobConfigurationQuery {
-                query,
-                use_legacy_sql: Some(false),
-                ..Default::default()
-            }),
-            ..Default::default()
-        },
-        ..Default::default()
-    };
-    let res = bq.job().create(&job).await?;
-    if res.status.error_result.is_some() || res.status.errors.is_some() {
-        anyhow::bail!("BigQuery reported errors: {:?}", res.status);
-    }
-    println!("✅  Job {} submitted", res.job_reference.job_id);
-    Ok(())
+//     let results = join_all(tasks).await;
+//     let success = results
+//         .into_iter()
+//         .filter(|r| matches!(r, Ok(Ok(()))))
+//         .count();
+//     println!("✅ {} external tables created/updated.", success);
+
+//     Ok(())
+// }
+
+fn main() {
+    // This is a placeholder for the main function.
+    // The actual implementation would go here.
+    println!("This is a placeholder for the load_bigquery.rs script.");
 }
