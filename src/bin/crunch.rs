@@ -6,7 +6,7 @@ use polars::prelude::*;
 use std::{
     fs::{create_dir_all, File},
     path::PathBuf,
-}; // col, lit, when, etc.
+};
 
 #[derive(Parser)]
 #[command(
@@ -15,13 +15,10 @@ use std::{
     about = "AWEFS Alternative Reality FPP Recalculation Pipeline"
 )]
 struct Args {
-    /// Date to process (YYYY-MM-DD)
     #[arg(short, long)]
     date: String,
-    /// Input base path for parquet folders
     #[arg(long, default_value = "./assets/parquet")]
     input: String,
-    /// Output directory for results
     #[arg(long, default_value = "./output")]
     output: String,
 }
@@ -33,54 +30,42 @@ fn main() -> Result<()> {
     let output = PathBuf::from(&args.output);
     create_dir_all(&output)?;
 
-    // 1. Raw SCADA
     let raw = load_raw_scada(&input, date)?;
     write_df(&raw, output.join("1_raw_scada.parquet"))?;
 
-    // 2. EWMA
     let scada_ewm = compute_ewm(raw)?;
     write_df(&scada_ewm, output.join("2_scada_ewma.parquet"))?;
 
-    // 3. Residual join
     let residuals = join_residuals(&input, date)?;
     write_df(&residuals, output.join("3_residuals.parquet"))?;
 
-    // 4. Split perf
     let split = split_performance(residuals)?;
     write_df(&split, output.join("4_perf_split.parquet"))?;
 
-    // 5. Aggregate
     let summary = aggregate_residuals(split)?;
     write_df(&summary, output.join("5_residual_summary.parquet"))?;
 
-    // 6. Constraint freq
     let constraint = load_constraint_freq(&input, date)?;
     write_df(&constraint, output.join("6_constraint_freq.parquet"))?;
 
-    // 7. Contribution factor
     let with_cf = join_contribution_factor(summary, &input, date)?;
     write_df(&with_cf, output.join("7_residual_with_cf.parquet"))?;
 
-    // 8. Overlay DCF
     let with_dcf = overlay_dcf(with_cf, &input, date)?;
     write_df(&with_dcf, output.join("8_with_dcf.parquet"))?;
 
-    // 9. Weighted CF
     let weighted = calculate_weighted_cf(with_dcf)?;
     write_df(&weighted, output.join("9_weighted_residual_cf.parquet"))?;
 
-    // 10. Charges
     let charges = compute_charges(weighted, &input, date)?;
     write_df(&charges, output.join("10_interval_charges.parquet"))?;
 
-    // 11. Summary
     let final_summary = summarize_total_charge(charges)?;
     write_df(&final_summary, output.join("11_fpp_charge_summary.parquet"))?;
 
     Ok(())
 }
 
-// Write by reference—clone internally so original stays usable
 fn write_df(df: &DataFrame, path: PathBuf) -> Result<()> {
     let mut file = File::create(path)?;
     let mut df_clone = df.clone();
@@ -94,14 +79,15 @@ fn load_raw_scada(input: &PathBuf, date: &str) -> Result<DataFrame> {
         input.display(),
         date
     );
+    // Scan and select
     let df = LazyFrame::scan_parquet(&pattern, ScanArgsParquet::default())?
         .select(&[
             col("MEASUREMENTTIME").alias("ts"),
             col("FREQUENCYDEVIATION").alias("freq_dev"),
         ])
-        // Use a SortOptions slice, not &[bool]
-        .sort_by_exprs(&[col("ts")], &[SortOptions::default()])
         .collect()?;
+    // Sort by the ts column
+    let df = df.sort(["ts"], Default::default())?;
     Ok(df)
 }
 
@@ -139,7 +125,6 @@ fn join_residuals(input: &PathBuf, date: &str) -> Result<DataFrame> {
         ),
         ScanArgsParquet::default(),
     )?;
-
     let df = runs_lf
         .filter(
             col("ORIGIN")
@@ -224,7 +209,6 @@ fn join_contribution_factor(res: DataFrame, input: &PathBuf, date: &str) -> Resu
         col("CONTRIBUTION_FACTOR"),
     ])
     .collect()?;
-
     let out = res
         .lazy()
         .join(
@@ -252,7 +236,6 @@ fn overlay_dcf(df: DataFrame, input: &PathBuf, date: &str) -> Result<DataFrame> 
         col("DEFAULT_CONTRIBUTION_FACTOR"),
     ])
     .collect()?;
-
     let res_dcf = LazyFrame::scan_parquet(
         &format!(
             "{}/FPP---FORECAST_RESIDUAL_DCF---1/date={}/**/*.parquet",
@@ -267,7 +250,6 @@ fn overlay_dcf(df: DataFrame, input: &PathBuf, date: &str) -> Result<DataFrame> 
         col("RESIDUAL_DCF"),
     ])
     .collect()?;
-
     let out = df
         .lazy()
         .join(
@@ -318,7 +300,6 @@ fn compute_charges(df: DataFrame, input: &PathBuf, date: &str) -> Result<DataFra
         col("FPP_PAYMENT_RATE"),
     ])
     .collect()?;
-
     let res_rates = LazyFrame::scan_parquet(
         &format!(
             "{}/FPP---EST_RESIDUAL_COST_RATE---1/date={}/**/*.parquet",
@@ -333,7 +314,6 @@ fn compute_charges(df: DataFrame, input: &PathBuf, date: &str) -> Result<DataFra
         col("FPP_RECOVERY_RATE"),
     ])
     .collect()?;
-
     let out = df
         .lazy()
         .join(
@@ -350,7 +330,7 @@ fn compute_charges(df: DataFrame, input: &PathBuf, date: &str) -> Result<DataFra
         )
         .with_columns(&[
             (col("weighted_raise_cf") * col("FPP_PAYMENT_RATE")).alias("raise_charge"),
-            (col("weighted_lower_cf") * col("FPP_RECOVERY_RATE")).alias("lower_charge"),
+            (col("weighted_lower_cf") * col("FREQUENCYDEVRECOVERY_RATE")).alias("lower_charge"),
         ])
         .with_column((col("raise_charge") + col("lower_charge")).alias("interval_charge"))
         .collect()?;
