@@ -275,8 +275,49 @@ fn run_step_3_unit_deviations(
         trajectory_path
     ))?;
 
-    // Read unit MW data - using the correct table name from your column definitions
+    info!("Trajectory data shape: {:?}", trajectory_df.shape());
+
+    // Debug: Show some trajectory data
+    if trajectory_df.height() > 0 {
+        info!("First few trajectory rows:");
+        println!("{}", trajectory_df.head(Some(5)));
+    }
+
+    // Read unit MW data - let's first check what SCADA files exist
     let scada_path = format!("{}/FPP---UNIT_MW---1/**/*.parquet", input_dir);
+    info!("Looking for SCADA files at: {}", scada_path);
+
+    // Check if files exist
+    let scada_files: Vec<_> = glob(&scada_path)
+        .context("Failed to parse SCADA glob pattern")?
+        .filter_map(|p| p.ok())
+        .collect();
+
+    info!("Found {} SCADA files", scada_files.len());
+
+    if scada_files.is_empty() {
+        // Let's check what FPP directories actually exist
+        let fpp_base_path = format!("{}/FPP*", input_dir);
+        let fpp_dirs: Vec<_> = glob(&fpp_base_path)
+            .context("Failed to parse FPP glob pattern")?
+            .filter_map(|p| p.ok())
+            .collect();
+
+        info!("Available FPP directories: {:?}", fpp_dirs);
+
+        // Also check for any UNIT_MW related files
+        let unit_mw_path = format!("{}/**/*UNIT_MW*", input_dir);
+        let unit_mw_files: Vec<_> = glob(&unit_mw_path)
+            .context("Failed to parse UNIT_MW glob pattern")?
+            .filter_map(|p| p.ok())
+            .take(10) // Just show first 10
+            .collect();
+
+        info!("Any UNIT_MW related files found: {:?}", unit_mw_files);
+
+        anyhow::bail!("No SCADA files found at path: {}", scada_path);
+    }
+
     let scada_df = read_parquet_files(&scada_path)?
         .lazy()
         .select([
@@ -286,11 +327,59 @@ fn run_step_3_unit_deviations(
         ])
         .collect()?;
 
-    // Join and calculate deviations
-    let mut deviations_df = trajectory_df
+    info!("SCADA data shape: {:?}", scada_df.shape());
+
+    // Debug: Show some SCADA data
+    if scada_df.height() > 0 {
+        info!("First few SCADA rows:");
+        println!("{}", scada_df.head(Some(5)));
+    }
+
+    // Try LEFT join first to see what's not matching
+    let joined_df = trajectory_df
+        .clone()
         .lazy()
         .join(
-            scada_df.lazy(),
+            scada_df.clone().lazy(),
+            [col("ts"), col("DUID")],
+            [col("ts"), col("DUID")],
+            JoinArgs::new(JoinType::Left), // Changed to LEFT join for debugging
+        )
+        .collect()?;
+
+    info!("After LEFT join shape: {:?}", joined_df.shape());
+
+    // Count non-null SCADAVALUE entries
+    let non_null_count = joined_df.column("SCADAVALUE")?.null_count();
+    let total_rows = joined_df.height();
+    info!(
+        "SCADAVALUE: {} non-null out of {} total rows ({:.2}% match rate)",
+        total_rows - non_null_count,
+        total_rows,
+        (total_rows - non_null_count) as f64 / total_rows as f64 * 100.0
+    );
+
+    if total_rows - non_null_count == 0 {
+        info!("No matches found! This suggests timestamp or DUID mismatch.");
+
+        // Show sample of what we're trying to join
+        if trajectory_df.height() > 0 {
+            info!("Sample trajectory data for join debugging:");
+            println!("{}", trajectory_df.select(["ts", "DUID"])?.head(Some(3)));
+        }
+
+        if scada_df.height() > 0 {
+            info!("Sample SCADA data for join debugging:");
+            println!("{}", scada_df.select(["ts", "DUID"])?.head(Some(3)));
+        }
+    }
+
+    // Continue with INNER join for actual processing, but now we know why it might be empty
+    let mut deviations_df = trajectory_df
+        .clone()
+        .lazy()
+        .join(
+            scada_df.clone().lazy(),
             [col("ts"), col("DUID")],
             [col("ts"), col("DUID")],
             JoinArgs::new(JoinType::Inner),
@@ -299,11 +388,12 @@ fn run_step_3_unit_deviations(
         .select([col("ts"), col("DUID"), col("deviation_mw")])
         .collect()?;
 
+    info!("Final deviations shape: {:?}", deviations_df.shape());
+
     ParquetWriter::new(&mut File::create(output_path)?).finish(&mut deviations_df)?;
     info!("Successfully saved to {:?}", output_path);
     Ok(())
 }
-
 fn run_step_4_performance(
     fm_path: &PathBuf,
     deviation_path: &PathBuf,
