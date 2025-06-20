@@ -178,12 +178,36 @@ fn run_step_2_reference_trajectory(
 ) -> anyhow::Result<()> {
     info!("Step 2: streaming reference trajectories by origin");
 
-    // 1) Read just the ORIGIN column to get all distinct origins
     let pred_path = format!(
         "{}/DEMAND---INTERMITTENT_DS_PRED---1/date={}/*.parquet",
         input_dir, date
     );
-    let tiny = LazyFrame::scan_parquet(&pred_path, ScanArgsParquet::default())?
+
+    let latest_forecasts_lf = LazyFrame::scan_parquet(&pred_path, ScanArgsParquet::default())?
+        .sort_by_exprs(
+            // Expressions to sort by
+            vec![col("FORECAST_PRIORITY"), col("OFFERDATETIME")],
+            // Sort options, with descending flags set for both columns
+            SortMultipleOptions {
+                descending: vec![true, true],
+                ..Default::default()
+            },
+        )
+        .unique(
+            // CORRECTED: Pass the subset of columns as a Vec of Strings.
+            Some(vec![
+                "RUN_DATETIME".to_string(),
+                "DUID".to_string(),
+                "ORIGIN".to_string(),
+            ]),
+            UniqueKeepStrategy::First,
+        )
+        .cache();
+
+    // 1) Read just the ORIGIN column to get all distinct origins
+    // MODIFIED: Use the pre-filtered lazy frame for efficiency.
+    let tiny = latest_forecasts_lf
+        .clone()
         .select([col("ORIGIN")])
         .unique_stable(None, UniqueKeepStrategy::First)
         .collect()?;
@@ -240,7 +264,9 @@ fn run_step_2_reference_trajectory(
         };
 
         // a) Lazy scan for just this origin - clone origin to avoid move
-        let origin_pred = LazyFrame::scan_parquet(&pred_path, ScanArgsParquet::default())?
+        // MODIFIED: Filter the cached lazy frame instead of re-scanning the parquet files.
+        let origin_pred = latest_forecasts_lf
+            .clone()
             .filter(col("ORIGIN").eq(lit(origin.clone())))
             .select([
                 col("INTERVAL_DATETIME").alias("ts_5m"),
@@ -322,8 +348,6 @@ fn run_step_2_reference_trajectory(
         ParquetWriter::new(&mut f)
             .with_compression(ParquetCompression::Snappy)
             .finish(&mut df_out.clone())?; // clone here is tiny
-
-        // Drop df_out before next loop iteration to free memory
     }
 
     Ok(())
@@ -474,6 +498,7 @@ fn run_step_3_unit_deviations(
     info!("Successfully saved to {:?}", output_path);
     Ok(())
 }
+
 fn run_step_4_performance(
     fm_path: &PathBuf,
     deviation_path: &PathBuf,
