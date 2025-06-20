@@ -109,35 +109,63 @@ fn read_parquet_files(pattern: &str) -> Result<DataFrame> {
 }
 
 fn run_step_1_frequency_measure(input_dir: &str, date: &str, output_path: &PathBuf) -> Result<()> {
-    info!("Running Step 1: Frequency Measure Calculation");
-    let scada_path = format!(
-        "{}/CAUSER_PAYS_SCADA---NETWORK---1/date={}/*.parquet",
+    info!("Running Step 1: Region‐level Frequency Measure with EWMA");
+
+    // glob over the FPP regional freq‐measure files for this date
+    let scada_pattern = format!(
+        "{}/FPP---REGION_FREQ_MEASURE---1/date={}/*.parquet",
         input_dir, date
     );
+    info!("Reading regional frequency data from: {}", scada_pattern);
 
-    let df = read_parquet_files(&scada_path)?;
+    // https://aemo.com.au/-/media/files/stakeholder_consultation/consultations/nem-consultations/2022/frequency-contribution-factors-procedure/final-documents/turning-parameters-and-input-sources.pdf?la=en
+    let alpha = 2.0 / 9.0;
 
-    let mut result = df
+    // read & concat all the parquet files
+    let mut df = read_parquet_files(&scada_pattern)?
         .lazy()
+        // keep only good‐quality samples
+        .filter(col("HZ_QUALITY_FLAG").eq(lit(1)))
+        // select the raw fields
         .select([
-            col("MEASUREMENTTIME").alias("ts"),
-            col("FREQUENCYDEVIATION").alias("freq_dev"),
+            col("MEASUREMENT_DATETIME").alias("ts"),
+            col("REGIONID").alias("region"),
+            col("FREQ_DEVIATION_HZ").alias("freq_dev"),
+            col("FREQ_MEASURE_HZ").alias("aemo_freq_measure"),
         ])
+        // this is not working. i think we can just use the FREQ_MEASURE_HZ value though.
         .with_column(
             col("freq_dev")
                 .neg()
                 .ewm_mean(EWMOptions {
-                    alpha: 0.05,
+                    alpha,
                     adjust: false,
                     ..Default::default()
                 })
                 .alias("freq_measure"),
         )
-        .select([col("ts"), col("freq_measure")])
-        .collect()?;
+        // final layout: timestamp, region, raw deviation, AEMO’s measure, your EWMA
+        .select([
+            col("ts"),
+            col("region"),
+            col("freq_dev"),
+            col("aemo_freq_measure"),
+            col("freq_measure"),
+        ])
+        .collect()
+        .context("Failed to collect regional frequency‐measure DataFrame")?;
 
-    ParquetWriter::new(&mut File::create(output_path)?).finish(&mut result)?;
-    info!("Successfully saved to {:?}", output_path);
+    // write to Parquet
+    let mut out =
+        File::create(output_path).context(format!("Could not create {:?}", output_path))?;
+    ParquetWriter::new(&mut out)
+        .finish(&mut df)
+        .context("Failed to write regional frequency‐measure parquet")?;
+
+    info!(
+        "Saved regional freq_measure + comparison to {:?}",
+        output_path
+    );
     Ok(())
 }
 
