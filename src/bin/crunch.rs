@@ -1,4 +1,4 @@
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use chrono::FixedOffset;
 use chrono::{Duration as ChronoDuration, NaiveDate};
 use clap::Parser;
@@ -6,10 +6,12 @@ use glob::glob;
 use polars::datatypes::time_zone::{parse_fixed_offset, parse_time_zone};
 use polars::lazy::dsl::concat;
 use polars::prelude::*;
+use tracing::{warn, Level};
 
-use std::fs::{create_dir_all, File};
+use std::fs::{self, create_dir_all, File};
 use std::ops::Neg;
 use std::path::PathBuf;
+// use time_tz::{parse_fixed_offset, parse_time_zone};
 use tracing::info;
 
 #[derive(Parser)]
@@ -40,11 +42,11 @@ fn main() -> Result<()> {
     let fm_path = PathBuf::from(&args.output).join("01_frequency_measure.parquet");
     run_step_1_frequency_measure(&args.input, &args.date, &fm_path)?;
 
-    let trajectory_path = PathBuf::from(&args.output);
+    let trajectory_path = PathBuf::from(&args.output).join("02_reference_trajectories.parquet");
     run_step_2_reference_trajectory(&args.input, &args.date, &trajectory_path)?;
 
     let deviation_path = PathBuf::from(&args.output).join("03_unit_deviations.parquet");
-    run_step_3_unit_deviations(&args.input, &trajectory_path, &args.date, &deviation_path)?;
+    run_step_3_unit_deviations(&args.input, &args.date, &deviation_path, &trajectory_path)?;
 
     let performance_path = PathBuf::from(&args.output).join("04_unit_performance.parquet");
     run_step_4_performance(&fm_path, &deviation_path, &performance_path)?;
@@ -174,27 +176,25 @@ fn run_step_1_frequency_measure(input_dir: &str, date: &str, output_path: &PathB
 fn run_step_2_reference_trajectory(
     input_dir: &str,
     date: &str,
-    output_dir: &PathBuf,
+    output_path: &PathBuf,
 ) -> anyhow::Result<()> {
-    info!("Step 2: streaming reference trajectories by origin");
+    info!("Step 2: building combined reference trajectory");
 
     let pred_path = format!(
         "{}/DEMAND---INTERMITTENT_DS_PRED---1/date={}/*.parquet",
         input_dir, date
     );
 
+    // 1) Scan and filter the dataset once to get the latest, highest-priority forecasts.
     let latest_forecasts_lf = LazyFrame::scan_parquet(&pred_path, ScanArgsParquet::default())?
         .sort_by_exprs(
-            // Expressions to sort by
             vec![col("FORECAST_PRIORITY"), col("OFFERDATETIME")],
-            // Sort options, with descending flags set for both columns
             SortMultipleOptions {
                 descending: vec![true, true],
                 ..Default::default()
             },
         )
         .unique(
-            // CORRECTED: Pass the subset of columns as a Vec of Strings.
             Some(vec![
                 "RUN_DATETIME".to_string(),
                 "DUID".to_string(),
@@ -204,37 +204,16 @@ fn run_step_2_reference_trajectory(
         )
         .cache();
 
-    // 1) Read just the ORIGIN column to get all distinct origins
-    // MODIFIED: Use the pre-filtered lazy frame for efficiency.
-    let tiny = latest_forecasts_lf
-        .clone()
-        .select([col("ORIGIN")])
-        .unique_stable(None, UniqueKeepStrategy::First)
-        .collect()?;
-    let origins = {
-        let ca = tiny
-            .column("ORIGIN")?
-            .str()
-            .context("ORIGIN column not UTF8")?;
-        ca.into_no_null_iter()
-            .map(str::to_string)
-            .collect::<Vec<_>>()
-    };
-    info!("Found {} origins: {:?}", origins.len(), origins);
-
-    // 2) Build the 4s time spine once
+    // 2) Build the 4s time spine once.
     let start_dt = NaiveDate::parse_from_str(date, "%Y-%m-%d")?
         .and_hms_opt(0, 0, 0)
         .unwrap();
     let end_dt = start_dt + ChronoDuration::days(1) - ChronoDuration::seconds(4);
     let tz_name = "+10:00"; // NEM time
-
-    // Convert fixed offset to timezone database format, then parse
     let tz_parsed = {
         let tz_string = parse_fixed_offset(tz_name)?;
         parse_time_zone(&tz_string)?
     };
-
     let time_spine = polars::time::date_range(
         "ts".into(),
         start_dt,
@@ -246,256 +225,217 @@ fn run_step_2_reference_trajectory(
     )?;
     let time_spine_df = DataFrame::new(vec![time_spine.into_series().into()])?;
 
-    // 3) For each origin, build and write just that slice
-    for origin in origins {
-        info!("Processing origin {}", origin);
+    // 3) Get all unique (DUID, ORIGIN) pairs from the entire filtered dataset.
+    info!("Finding all unique DUID/ORIGIN pairs.");
+    let duid_origin_lf = latest_forecasts_lf
+        .clone()
+        .select([col("DUID"), col("ORIGIN")])
+        .unique_stable(None, UniqueKeepStrategy::First);
 
-        // interpolation fraction expr - recreate for each iteration to avoid move
-        let frac = {
-            let ms = col("ts")
-                .dt()
-                .timestamp(polars::prelude::TimeUnit::Milliseconds);
-            let floored = col("ts")
-                .dt()
-                .truncate(lit("5m"))
-                .dt()
-                .timestamp(TimeUnit::Milliseconds);
-            (ms - floored).cast(DataType::Float64) / lit(300_000.0)
-        };
+    // 4) Create a base grid by cross-joining the time spine with all DUID/ORIGIN pairs.
+    info!("Creating base time-series grid for all entities.");
+    let base_lf = time_spine_df.lazy().cross_join(duid_origin_lf, None);
 
-        // a) Lazy scan for just this origin - clone origin to avoid move
-        // MODIFIED: Filter the cached lazy frame instead of re-scanning the parquet files.
-        let origin_pred = latest_forecasts_lf
-            .clone()
-            .filter(col("ORIGIN").eq(lit(origin.clone())))
-            .select([
-                col("INTERVAL_DATETIME").alias("ts_5m"),
-                col("DUID"),
-                col("ORIGIN"),
-                col("FORECAST_POE50").alias("target_mw"),
-            ]);
+    // 5) Prepare the forecast data, selecting only the necessary columns.
+    let forecast_data_lf = latest_forecasts_lf.select([
+        col("INTERVAL_DATETIME").alias("ts_5m"),
+        col("DUID"),
+        col("ORIGIN"),
+        col("FORECAST_POE50").alias("target_mw"),
+    ]);
 
-        // b) unique (DUID, ORIGIN) pairs for this origin
-        let duid_origin_df = origin_pred
-            .clone()
-            .select([col("DUID"), col("ORIGIN")])
-            .unique_stable(None, UniqueKeepStrategy::First)
-            .collect()?;
+    // ================== CHANGE START ==================
 
-        // c) cross-join time × (DUID, ORIGIN)
-        let base = time_spine_df.cross_join(&duid_origin_df, None, None)?;
+    // 6) Create 'prev' and 'next' frames, renaming the target column BEFORE the join.
+    let prev_lf = forecast_data_lf.clone().select([
+        col("ts_5m"),
+        col("DUID"),
+        col("ORIGIN"),
+        col("target_mw").alias("prev_target"),
+    ]);
 
-        // d) pull in prev & next 5 min forecasts
-        let prev = origin_pred.clone().select([
+    let next_lf = forecast_data_lf
+        .clone()
+        .with_column((col("ts_5m") - lit(polars::prelude::Duration::parse("5m"))).alias("ts_5m"))
+        .select([
             col("ts_5m"),
-            col("DUID").alias("DUID_prev"),
-            col("ORIGIN").alias("ORIGIN_prev"),
-            col("target_mw").alias("prev_target"),
+            col("DUID"),
+            col("ORIGIN"),
+            col("target_mw").alias("next_target"),
         ]);
 
-        let next = origin_pred
-            .clone()
-            .with_column(
-                (col("ts_5m") - lit(polars::prelude::Duration::parse("5m"))).alias("ts_5m"),
-            )
-            .select([
-                col("ts_5m"),
-                col("DUID").alias("DUID_next"),
-                col("ORIGIN").alias("ORIGIN_next"),
-                col("target_mw").alias("next_target"),
-            ]);
+    // 7) Join the base grid. CRITICAL FIX: Add a unique suffix for each join to prevent collision.
+    info!("Joining forecast data to the time-series grid.");
+    let joined_lf = base_lf
+        .join(
+            prev_lf,
+            [
+                col("ts").dt().truncate(lit("5m")),
+                col("DUID"),
+                col("ORIGIN"),
+            ],
+            [col("ts_5m"), col("DUID"), col("ORIGIN")],
+            JoinArgs {
+                how: JoinType::Left,
+                suffix: Some("_prev".into()), // Add unique suffix
+                ..Default::default()
+            },
+        )
+        .join(
+            next_lf,
+            [
+                col("ts").dt().truncate(lit("5m")),
+                col("DUID"),
+                col("ORIGIN"),
+            ],
+            [col("ts_5m"), col("DUID"), col("ORIGIN")],
+            JoinArgs {
+                how: JoinType::Left,
+                suffix: Some("_next".into()), // Add unique suffix
+                ..Default::default()
+            },
+        );
 
-        let joined = base
-            .lazy()
-            .join(
-                prev,
-                &[
-                    col("ts").dt().truncate(lit("5m")),
-                    col("DUID"),
-                    col("ORIGIN"),
-                ],
-                &["ts_5m".into(), "DUID_prev".into(), "ORIGIN_prev".into()],
-                JoinArgs::new(JoinType::Left),
-            )
-            .drop(["DUID_prev", "ORIGIN_prev", "ts_5m"])
-            .join(
-                next,
-                &[
-                    col("ts").dt().truncate(lit("5m")),
-                    col("DUID"),
-                    col("ORIGIN"),
-                ],
-                &["ts_5m".into(), "DUID_next".into(), "ORIGIN_next".into()],
-                JoinArgs::new(JoinType::Left),
-            )
-            .drop(["DUID_next", "ORIGIN_next", "ts_5m"]);
+    // ================== CHANGE END ==================
 
-        // e) interpolate & write one small DataFrame
-        let df_out = joined
-            .with_column(
-                (col("prev_target").fill_null(0.0)
-                    + (col("next_target").fill_null(col("prev_target"))
-                        - col("prev_target").fill_null(0.0))
-                        * frac.fill_null(0.0))
-                .alias("reference_mw"),
-            )
-            .select([col("ts"), col("DUID"), col("ORIGIN"), col("reference_mw")])
-            .sort_by_exprs([col("ts"), col("DUID")], Default::default())
-            .collect()?; // this is small: (#timestamps×#duids_for_this_origin)
+    // 8) Interpolate between the 5-minute forecast points for the entire dataset.
+    info!("Interpolating to 4-second resolution.");
+    let frac = {
+        let ms = col("ts").dt().timestamp(TimeUnit::Milliseconds);
+        let floored = col("ts")
+            .dt()
+            .truncate(lit("5m"))
+            .dt()
+            .timestamp(TimeUnit::Milliseconds);
+        (ms - floored).cast(DataType::Float64) / lit(300_000.0)
+    };
 
-        let out_path = output_dir.join(format!("02_trajectory_{}.parquet", origin));
-        let mut f = File::create(&out_path)?;
-        ParquetWriter::new(&mut f)
-            .with_compression(ParquetCompression::Snappy)
-            .finish(&mut df_out.clone())?; // clone here is tiny
-    }
+    // The final `select` will discard the intermediate, suffixed columns like `DUID_prev`.
+    let final_lf = joined_lf
+        .with_column(
+            (col("prev_target").fill_null(0.0)
+                + (col("next_target").fill_null(col("prev_target"))
+                    - col("prev_target").fill_null(0.0))
+                    * frac.fill_null(0.0))
+            .alias("reference_mw"),
+        )
+        .select([col("ts"), col("DUID"), col("ORIGIN"), col("reference_mw")])
+        .sort_by_exprs(
+            [col("ts"), col("DUID"), col("ORIGIN")],
+            SortMultipleOptions::default(),
+        );
 
+    // 9) Collect the result and write to a single Parquet file.
+    info!("Collecting final DataFrame to write to single file...");
+    let mut df_out = final_lf.collect()?;
+
+    info!("Writing to {:?}", output_path);
+    let mut f = File::create(&output_path)?;
+    ParquetWriter::new(&mut f)
+        .with_compression(ParquetCompression::Snappy)
+        .finish(&mut df_out)?;
+
+    info!("Successfully wrote combined trajectory file.");
     Ok(())
 }
 
+/// Calculates the deviation between the reference trajectory and actual unit power measurements.
+///
+/// This function assumes the following inputs exist from previous steps:
+/// - A single reference trajectory file at `{input_dir}/02_reference_trajectories.parquet`.
+/// - Unit measurement (SCADA) files at `{input_dir}/FPP---UNIT_MW---1/date={date}/*.parquet`.
+///
+/// It performs an inner join on timestamp and DUID, calculates the deviation, and saves
+/// the result to the specified output path.
+/// Calculates the deviation between the reference trajectory and actual unit power measurements.
+/// Calculates the deviation between the reference trajectory and actual unit power measurements.
 fn run_step_3_unit_deviations(
     input_dir: &str,
-    trajectory_path: &PathBuf,
     date: &str,
     output_path: &PathBuf,
+    trajectory_path: &PathBuf,
 ) -> Result<()> {
     info!("Running Step 3: Unit Deviation Calculation");
 
-    // Read trajectory data
-    let trajectory_df = ParquetReader::new(&mut File::open(trajectory_path).context(format!(
-        "Failed to open trajectory file: {:?}",
-        trajectory_path
-    ))?)
-    .finish()
-    .context(format!(
-        "Failed to read trajectory parquet: {:?}",
-        trajectory_path
-    ))?;
+    // 1. Calculate previous and next dates to expand the read window.
+    let current_date =
+        NaiveDate::parse_from_str(date, "%Y-%m-%d").context("Failed to parse date string")?;
+    let prev_date = current_date - chrono::Duration::days(1);
+    let next_date = current_date + chrono::Duration::days(1);
 
-    info!("Trajectory data shape: {:?}", trajectory_df.shape());
+    // 2. Lazily scan the reference trajectory file.
+    info!("Scanning trajectory data from: {:?}", trajectory_path);
+    let trajectory_lf = LazyFrame::scan_parquet(trajectory_path, Default::default()).context(
+        format!("Failed to scan trajectory parquet: {:?}", trajectory_path),
+    )?;
 
-    // Debug: Show some trajectory data
-    if trajectory_df.height() > 0 {
-        info!("First few trajectory rows:");
-        println!("{}", trajectory_df.head(Some(5)));
-    }
-
-    // Read unit MW data - let's first check what SCADA files exist
-    let scada_path = format!("{}/FPP---UNIT_MW---1/date={}/*.parquet", input_dir, date);
-    info!("Looking for SCADA files at: {}", scada_path);
-
-    // Check if files exist
-    let scada_files: Vec<_> = glob(&scada_path)
-        .context("Failed to parse SCADA glob pattern")?
-        .filter_map(|p| p.ok())
-        .collect();
-
-    info!("Found {} SCADA files", scada_files.len());
-
-    if scada_files.is_empty() {
-        // Let's check what FPP directories actually exist
-        let fpp_base_path = format!("{}/FPP*", input_dir);
-        let fpp_dirs: Vec<_> = glob(&fpp_base_path)
-            .context("Failed to parse FPP glob pattern")?
-            .filter_map(|p| p.ok())
-            .collect();
-
-        info!("Available FPP directories: {:?}", fpp_dirs);
-
-        // Also check for any UNIT_MW related files
-        let unit_mw_path = format!("{}/**/*UNIT_MW*", input_dir);
-        let unit_mw_files: Vec<_> = glob(&unit_mw_path)
-            .context("Failed to parse UNIT_MW glob pattern")?
-            .filter_map(|p| p.ok())
-            .take(10) // Just show first 10
-            .collect();
-
-        info!("Any UNIT_MW related files found: {:?}", unit_mw_files);
-
-        anyhow::bail!("No SCADA files found at path: {}", scada_path);
-    }
-
-    let scada_df = read_parquet_files(&scada_path)?
-        .lazy()
-        .select([
-            col("INTERVAL_DATETIME").alias("ts"), // This table has INTERVAL_DATETIME
-            col("FPP_UNITID").alias("DUID"),      // Map FPP_UNITID to DUID
-            col("MEASURED_MW").alias("SCADAVALUE"), // Map MEASURED_MW to SCADAVALUE
-        ])
-        .collect()?;
-
-    info!("SCADA data shape: {:?}", scada_df.shape());
-
-    // Debug: Show some SCADA data
-    if scada_df.height() > 0 {
-        info!("First few SCADA rows:");
-        println!("{}", scada_df.head(Some(10)));
-    }
-
-    // right before your join in run_step_3:
-    let ref_small = trajectory_df.clone().lazy().select([col("ts")]).collect()?;
-    println!("Reference ts sample:\n{}", ref_small.head(Some(10)));
-
-    let scada_small = scada_df.clone().lazy().select([col("ts")]).collect()?;
-    println!("  SCADA ts sample:\n{}", scada_small.head(Some(10)));
-
-    // Try LEFT join first to see what's not matching
-    let joined_df = trajectory_df
-        .clone()
-        .lazy()
-        .join(
-            scada_df.clone().lazy(),
-            [col("ts"), col("DUID")],
-            [col("ts"), col("DUID")],
-            JoinArgs::new(JoinType::Left), // Changed to LEFT join for debugging
-        )
-        .collect()?;
-
-    info!("After LEFT join shape: {:?}", joined_df.shape());
-
-    // Count non-null SCADAVALUE entries
-    let non_null_count = joined_df.column("SCADAVALUE")?.null_count();
-    let total_rows = joined_df.height();
+    // 3. Scan each date partition individually and then concatenate them into a single LazyFrame.
+    // This is more robust than using a single complex glob string with brace expansion.
     info!(
-        "SCADAVALUE: {} non-null out of {} total rows ({:.2}% match rate)",
-        total_rows - non_null_count,
-        total_rows,
-        (total_rows - non_null_count) as f64 / total_rows as f64 * 100.0
+        "Scanning unit MW data from partitions: {}, {}, {}",
+        prev_date, date, next_date
     );
+    let scada_frames_to_concat = vec![
+        LazyFrame::scan_parquet(
+            &format!(
+                "{}/FPP---UNIT_MW---1/date={}/*.parquet",
+                input_dir,
+                prev_date.format("%Y-%m-%d")
+            ),
+            Default::default(),
+        )
+        .context("Scan failed for previous day")?,
+        LazyFrame::scan_parquet(
+            &format!("{}/FPP---UNIT_MW---1/date={}/*.parquet", input_dir, date),
+            Default::default(),
+        )
+        .context("Scan failed for current day")?,
+        LazyFrame::scan_parquet(
+            &format!(
+                "{}/FPP---UNIT_MW---1/date={}/*.parquet",
+                input_dir,
+                next_date.format("%Y-%m-%d")
+            ),
+            Default::default(),
+        )
+        .context("Scan failed for next day")?,
+    ];
 
-    if total_rows - non_null_count == 0 {
-        info!("No matches found! This suggests timestamp or DUID mismatch.");
+    let scada_lf = concat(&scada_frames_to_concat, Default::default())?.select([
+        col("INTERVAL_DATETIME").alias("ts"),
+        col("FPP_UNITID").alias("DUID"),
+        col("MEASURED_MW"),
+    ]);
 
-        // Show sample of what we're trying to join
-        if trajectory_df.height() > 0 {
-            info!("Sample trajectory data for join debugging:");
-            println!("{}", trajectory_df.select(["ts", "DUID"])?.head(Some(3)));
-        }
-
-        if scada_df.height() > 0 {
-            info!("Sample SCADA data for join debugging:");
-            println!("{}", scada_df.select(["ts", "DUID"])?.head(Some(3)));
-        }
-    }
-
-    // Continue with INNER join for actual processing, but now we know why it might be empty
-    let mut deviations_df = trajectory_df
-        .clone()
-        .lazy()
+    // 4. Perform a standard INNER JOIN on the exact timestamp and DUID.
+    info!("Performing INNER join to align SCADA data to trajectory...");
+    let deviations_lf = trajectory_lf
         .join(
-            scada_df.clone().lazy(),
+            scada_lf,
             [col("ts"), col("DUID")],
             [col("ts"), col("DUID")],
             JoinArgs::new(JoinType::Inner),
         )
-        .with_column((col("SCADAVALUE") - col("reference_mw")).alias("deviation_mw"))
-        .select([col("ts"), col("DUID"), col("deviation_mw")])
-        .collect()?;
+        .with_column((col("MEASURED_MW") - col("reference_mw")).alias("deviation_mw"))
+        .select([col("ts"), col("DUID"), col("ORIGIN"), col("deviation_mw")])
+        .sort(["ts", "ORIGIN", "DUID"], Default::default());
 
-    info!("Final deviations shape: {:?}", deviations_df.shape());
+    // 5. Collect the final result into a DataFrame.
+    info!("Collecting final deviations DataFrame...");
+    let mut final_df = deviations_lf.collect()?;
+    info!("Final deviations shape: {:?}", final_df.shape());
 
-    ParquetWriter::new(&mut File::create(output_path)?).finish(&mut deviations_df)?;
-    info!("Successfully saved to {:?}", output_path);
+    // 6. Write the result to the specified output file if it's not empty.
+    if !final_df.is_empty() {
+        info!("Writing final deviations to: {:?}", output_path);
+        ParquetWriter::new(&mut File::create(output_path)?)
+            .with_compression(ParquetCompression::Snappy)
+            .finish(&mut final_df)?;
+        info!("Successfully completed Step 3.");
+    } else {
+        info!("Join resulted in an empty DataFrame. No file written.");
+    }
+
     Ok(())
 }
 

@@ -223,37 +223,8 @@
                     "editorMode": "code",
                     "format": 0,
                     "rawQuery": true,
-                    "rawSql": "SELECT\r\n*\r\nFROM read_parquet('/data/output/02_reference_trajectory.parquet', \r\n                  hive_partitioning=true, \r\n                  union_by_name=true)\r\nwhere duid='ARWF1'\r\n",
-                    "refId": "A",
-                    "sql": {
-                        "columns": [
-                            {
-                                "parameters": [],
-                                "type": "function"
-                            }
-                        ],
-                        "groupBy": [
-                            {
-                                "property": {
-                                    "type": "string"
-                                },
-                                "type": "groupBy"
-                            }
-                        ],
-                        "limit": 50
-                    }
-                },
-                {
-                    "datasource": {
-                        "type": "motherduck-duckdb-datasource",
-                        "uid": "P18CE15CC9D3BAB28"
-                    },
-                    "editorMode": "code",
-                    "format": 1,
-                    "hide": false,
-                    "rawQuery": true,
-                    "rawSql": "SELECT\r\n*\r\nFROM read_parquet('/data/output/03_unit_deviations.parquet', \r\n                  hive_partitioning=true, \r\n                  union_by_name=true)\r\n",
-                    "refId": "B",
+                    "rawSql": "SELECT\r\n*\r\nFROM read_parquet('/data/output/02_reference_trajectories.parquet', \r\n                  hive_partitioning=true, \r\n                  union_by_name=true)\r\nwhere duid='ARWF1' \r\n",
+                    "refId": "trajectories",
                     "sql": {
                         "columns": [
                             {
@@ -282,7 +253,120 @@
                     "hide": false,
                     "rawQuery": true,
                     "rawSql": "SELECT\r\nmeasurement_datetime, measured_mw, fpp_unitid, deviation_mw, date\r\n FROM read_parquet('/data/compacted/FPP---UNIT_MW---1/**/*.parquet', \r\n                  hive_partitioning=true, \r\n                  union_by_name=true)\r\nwhere FPP_UNITID='ARWF1'\r\nand $__timeFilter(measurement_datetime)\r\norder by measurement_datetime",
-                    "refId": "C",
+                    "refId": "Supplied",
+                    "sql": {
+                        "columns": [
+                            {
+                                "parameters": [],
+                                "type": "function"
+                            }
+                        ],
+                        "groupBy": [
+                            {
+                                "property": {
+                                    "type": "string"
+                                },
+                                "type": "groupBy"
+                            }
+                        ],
+                        "limit": 50
+                    }
+                }
+            ],
+            "title": "New panel",
+            "type": "timeseries"
+        },
+        {
+            "datasource": {
+                "type": "motherduck-duckdb-datasource",
+                "uid": "P18CE15CC9D3BAB28"
+            },
+            "fieldConfig": {
+                "defaults": {
+                    "color": {
+                        "mode": "palette-classic"
+                    },
+                    "custom": {
+                        "axisBorderShow": false,
+                        "axisCenteredZero": false,
+                        "axisColorMode": "text",
+                        "axisLabel": "",
+                        "axisPlacement": "auto",
+                        "barAlignment": 0,
+                        "barWidthFactor": 0.6,
+                        "drawStyle": "line",
+                        "fillOpacity": 0,
+                        "gradientMode": "none",
+                        "hideFrom": {
+                            "legend": false,
+                            "tooltip": false,
+                            "viz": false
+                        },
+                        "insertNulls": false,
+                        "lineInterpolation": "linear",
+                        "lineWidth": 1,
+                        "pointSize": 5,
+                        "scaleDistribution": {
+                            "type": "linear"
+                        },
+                        "showPoints": "auto",
+                        "spanNulls": false,
+                        "stacking": {
+                            "group": "A",
+                            "mode": "none"
+                        },
+                        "thresholdsStyle": {
+                            "mode": "off"
+                        }
+                    },
+                    "mappings": [],
+                    "thresholds": {
+                        "mode": "absolute",
+                        "steps": [
+                            {
+                                "color": "green"
+                            },
+                            {
+                                "color": "red",
+                                "value": 80
+                            }
+                        ]
+                    }
+                },
+                "overrides": []
+            },
+            "gridPos": {
+                "h": 11,
+                "w": 24,
+                "x": 0,
+                "y": 20
+            },
+            "id": 3,
+            "options": {
+                "legend": {
+                    "calcs": [],
+                    "displayMode": "list",
+                    "placement": "right",
+                    "showLegend": true
+                },
+                "tooltip": {
+                    "hideZeros": false,
+                    "mode": "single",
+                    "sort": "none"
+                }
+            },
+            "pluginVersion": "12.0.1",
+            "targets": [
+                {
+                    "datasource": {
+                        "type": "motherduck-duckdb-datasource",
+                        "uid": "P18CE15CC9D3BAB28"
+                    },
+                    "editorMode": "code",
+                    "format": 0,
+                    "rawQuery": true,
+                    "rawSql": "SELECT\r\n*\r\nFROM read_parquet('/data/output/02_trajectory_NEWGRWF.parquet', \r\n                  hive_partitioning=true, \r\n                  union_by_name=true)\r\n",
+                    "refId": "A",
                     "sql": {
                         "columns": [
                             {
