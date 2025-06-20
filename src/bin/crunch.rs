@@ -1,10 +1,12 @@
 use anyhow::{Context, Result};
-use chrono::{FixedOffset, NaiveDate};
+use chrono::FixedOffset;
+use chrono::{Duration as ChronoDuration, NaiveDate};
 use clap::Parser;
 use glob::glob;
 use polars::datatypes::time_zone::{parse_fixed_offset, parse_time_zone};
 use polars::lazy::dsl::concat;
 use polars::prelude::*;
+
 use std::fs::{create_dir_all, File};
 use std::ops::Neg;
 use std::path::PathBuf;
@@ -38,7 +40,7 @@ fn main() -> Result<()> {
     let fm_path = PathBuf::from(&args.output).join("01_frequency_measure.parquet");
     run_step_1_frequency_measure(&args.input, &args.date, &fm_path)?;
 
-    let trajectory_path = PathBuf::from(&args.output).join("02_reference_trajectory.parquet");
+    let trajectory_path = PathBuf::from(&args.output);
     run_step_2_reference_trajectory(&args.input, &args.date, &trajectory_path)?;
 
     let deviation_path = PathBuf::from(&args.output).join("03_unit_deviations.parquet");
@@ -172,125 +174,158 @@ fn run_step_1_frequency_measure(input_dir: &str, date: &str, output_path: &PathB
 fn run_step_2_reference_trajectory(
     input_dir: &str,
     date: &str,
-    output_path: &PathBuf,
-) -> Result<()> {
-    info!("Running Step 2: Reference Trajectory Calculation");
-    let targets_path = format!(
-        "{}/DISPATCH---UNIT_SOLUTION---5/date={}/*.parquet",
+    output_dir: &PathBuf,
+) -> anyhow::Result<()> {
+    info!("Step 2: streaming reference trajectories by origin");
+
+    // 1) Read just the ORIGIN column to get all distinct origins
+    let pred_path = format!(
+        "{}/DEMAND---INTERMITTENT_DS_PRED---1/date={}/*.parquet",
         input_dir, date
     );
-
-    let targets_df = read_parquet_files(&targets_path)?
-        .lazy()
-        .select([
-            col("SETTLEMENTDATE").alias("ts_5m"), // Changed from INTERVAL_DATETIME to SETTLEMENTDATE
-            col("DUID"),
-            col("TOTALCLEARED"),
-        ])
-        .sort_by_exprs([col("ts_5m")], SortMultipleOptions::default())
-        .collect()?;
-
-    let start_date = NaiveDate::parse_from_str(date, "%Y-%m-%d")?;
-    let start_naive = start_date.and_hms_opt(0, 0, 0).unwrap();
-    let end_naive = start_naive + chrono::Duration::days(1) - chrono::Duration::seconds(4);
-
-    let tz_name = parse_fixed_offset("+10:00")?;
-    let tz = parse_time_zone(&tz_name)?;
-    // Create time spine
-    let ts_series = polars::time::date_range(
-        "ts".into(),
-        start_naive,
-        end_naive,
-        polars::prelude::Duration::parse("4s"),
-        ClosedWindow::Both,
-        TimeUnit::Milliseconds,
-        Some(&tz),
-    )?;
-
-    let time_spine_df = DataFrame::new(vec![ts_series.into_series().into()])?;
-
-    // Get unique DUIDs
-    let duids_df = targets_df
-        .clone()
-        .lazy()
-        .select([col("DUID")])
+    let tiny = LazyFrame::scan_parquet(&pred_path, ScanArgsParquet::default())?
+        .select([col("ORIGIN")])
         .unique_stable(None, UniqueKeepStrategy::First)
         .collect()?;
+    let origins = {
+        let ca = tiny
+            .column("ORIGIN")?
+            .str()
+            .context("ORIGIN column not UTF8")?;
+        ca.into_no_null_iter()
+            .map(str::to_string)
+            .collect::<Vec<_>>()
+    };
+    info!("Found {} origins: {:?}", origins.len(), origins);
 
-    // Create base grid with cross join
-    let base_grid = time_spine_df.cross_join(&duids_df, None, None)?;
+    // 2) Build the 4s time spine once
+    let start_dt = NaiveDate::parse_from_str(date, "%Y-%m-%d")?
+        .and_hms_opt(0, 0, 0)
+        .unwrap();
+    let end_dt = start_dt + ChronoDuration::days(1) - ChronoDuration::seconds(4);
+    let tz_name = "+10:00"; // NEM time
 
-    // Prepare previous targets
-    let prev_targets = targets_df
-        .clone()
-        .lazy()
-        .select([
+    // Convert fixed offset to timezone database format, then parse
+    let tz_parsed = {
+        let tz_string = parse_fixed_offset(tz_name)?;
+        parse_time_zone(&tz_string)?
+    };
+
+    let time_spine = polars::time::date_range(
+        "ts".into(),
+        start_dt,
+        end_dt,
+        polars::prelude::Duration::parse("4s"),
+        polars::prelude::ClosedWindow::Both,
+        polars::prelude::TimeUnit::Milliseconds,
+        Some(&tz_parsed),
+    )?;
+    let time_spine_df = DataFrame::new(vec![time_spine.into_series().into()])?;
+
+    // 3) For each origin, build and write just that slice
+    for origin in origins {
+        info!("Processing origin {}", origin);
+
+        // interpolation fraction expr - recreate for each iteration to avoid move
+        let frac = {
+            let ms = col("ts")
+                .dt()
+                .timestamp(polars::prelude::TimeUnit::Milliseconds);
+            let floored = col("ts")
+                .dt()
+                .truncate(lit("5m"))
+                .dt()
+                .timestamp(TimeUnit::Milliseconds);
+            (ms - floored).cast(DataType::Float64) / lit(300_000.0)
+        };
+
+        // a) Lazy scan for just this origin - clone origin to avoid move
+        let origin_pred = LazyFrame::scan_parquet(&pred_path, ScanArgsParquet::default())?
+            .filter(col("ORIGIN").eq(lit(origin.clone())))
+            .select([
+                col("INTERVAL_DATETIME").alias("ts_5m"),
+                col("DUID"),
+                col("ORIGIN"),
+                col("FORECAST_POE50").alias("target_mw"),
+            ]);
+
+        // b) unique (DUID, ORIGIN) pairs for this origin
+        let duid_origin_df = origin_pred
+            .clone()
+            .select([col("DUID"), col("ORIGIN")])
+            .unique_stable(None, UniqueKeepStrategy::First)
+            .collect()?;
+
+        // c) cross-join time × (DUID, ORIGIN)
+        let base = time_spine_df.cross_join(&duid_origin_df, None, None)?;
+
+        // d) pull in prev & next 5 min forecasts
+        let prev = origin_pred.clone().select([
             col("ts_5m"),
-            col("DUID").alias("DUID_prev"), // Rename to avoid conflicts
-            col("TOTALCLEARED").alias("prev_target"),
-        ])
-        .collect()?;
+            col("DUID").alias("DUID_prev"),
+            col("ORIGIN").alias("ORIGIN_prev"),
+            col("target_mw").alias("prev_target"),
+        ]);
 
-    // Join with previous targets
-    let with_prev_target = base_grid
-        .lazy()
-        .join(
-            prev_targets.lazy(),
-            [col("ts").dt().truncate(lit("5m")), col("DUID")],
-            [col("ts_5m"), col("DUID_prev")],
-            JoinArgs::new(JoinType::Left),
-        )
-        .drop(["DUID_prev", "ts_5m"]) // Clean up unnecessary columns
-        .collect()?;
+        let next = origin_pred
+            .clone()
+            .with_column(
+                (col("ts_5m") - lit(polars::prelude::Duration::parse("5m"))).alias("ts_5m"),
+            )
+            .select([
+                col("ts_5m"),
+                col("DUID").alias("DUID_next"),
+                col("ORIGIN").alias("ORIGIN_next"),
+                col("target_mw").alias("next_target"),
+            ]);
 
-    // Prepare next targets
-    let next_targets = targets_df
-        .lazy()
-        .with_column(col("ts_5m") - lit(polars::prelude::Duration::parse("5m")))
-        .select([
-            col("ts_5m"),
-            col("DUID").alias("DUID_next"), // Rename to avoid conflicts
-            col("TOTALCLEARED").alias("next_target"),
-        ])
-        .collect()?;
+        let joined = base
+            .lazy()
+            .join(
+                prev,
+                &[
+                    col("ts").dt().truncate(lit("5m")),
+                    col("DUID"),
+                    col("ORIGIN"),
+                ],
+                &["ts_5m".into(), "DUID_prev".into(), "ORIGIN_prev".into()],
+                JoinArgs::new(JoinType::Left),
+            )
+            .drop(["DUID_prev", "ORIGIN_prev", "ts_5m"])
+            .join(
+                next,
+                &[
+                    col("ts").dt().truncate(lit("5m")),
+                    col("DUID"),
+                    col("ORIGIN"),
+                ],
+                &["ts_5m".into(), "DUID_next".into(), "ORIGIN_next".into()],
+                JoinArgs::new(JoinType::Left),
+            )
+            .drop(["DUID_next", "ORIGIN_next", "ts_5m"]);
 
-    // Join with next targets
-    let with_both_targets = with_prev_target
-        .lazy()
-        .join(
-            next_targets.lazy(),
-            [col("ts").dt().truncate(lit("5m")), col("DUID")],
-            [col("ts_5m"), col("DUID_next")],
-            JoinArgs::new(JoinType::Left),
-        )
-        .drop(["DUID_next", "ts_5m"]) // Clean up unnecessary columns
-        .collect()?;
+        // e) interpolate & write one small DataFrame
+        let df_out = joined
+            .with_column(
+                (col("prev_target").fill_null(0.0)
+                    + (col("next_target").fill_null(col("prev_target"))
+                        - col("prev_target").fill_null(0.0))
+                        * frac.fill_null(0.0))
+                .alias("reference_mw"),
+            )
+            .select([col("ts"), col("DUID"), col("ORIGIN"), col("reference_mw")])
+            .sort_by_exprs([col("ts"), col("DUID")], Default::default())
+            .collect()?; // this is small: (#timestamps×#duids_for_this_origin)
 
-    // Calculate interpolation
-    let interval_fraction = (col("ts").dt().timestamp(TimeUnit::Milliseconds)
-        - col("ts")
-            .dt()
-            .truncate(lit("5m"))
-            .dt()
-            .timestamp(TimeUnit::Milliseconds))
-    .cast(DataType::Float64)
-        / lit(300_000.0);
+        let out_path = output_dir.join(format!("02_trajectory_{}.parquet", origin));
+        let mut f = File::create(&out_path)?;
+        ParquetWriter::new(&mut f)
+            .with_compression(ParquetCompression::Snappy)
+            .finish(&mut df_out.clone())?; // clone here is tiny
 
-    let mut trajectory_df = with_both_targets
-        .lazy()
-        .with_column(
-            (col("prev_target").fill_null(0.0)
-                + (col("next_target").fill_null(col("prev_target"))
-                    - col("prev_target").fill_null(0.0))
-                    * interval_fraction.fill_null(0.0))
-            .alias("reference_mw"),
-        )
-        .select([col("ts"), col("DUID"), col("reference_mw")])
-        .sort_by_exprs([col("ts"), col("DUID")], SortMultipleOptions::default())
-        .collect()?;
+        // Drop df_out before next loop iteration to free memory
+    }
 
-    ParquetWriter::new(&mut File::create(output_path)?).finish(&mut trajectory_df)?;
-    info!("Successfully saved to {:?}", output_path);
     Ok(())
 }
 
