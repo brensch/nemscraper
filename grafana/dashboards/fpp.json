@@ -81,123 +81,10 @@
                 "overrides": []
             },
             "gridPos": {
-                "h": 9,
-                "w": 24,
-                "x": 0,
-                "y": 0
-            },
-            "id": 2,
-            "options": {
-                "legend": {
-                    "calcs": [],
-                    "displayMode": "list",
-                    "placement": "bottom",
-                    "showLegend": true
-                },
-                "tooltip": {
-                    "hideZeros": false,
-                    "mode": "single",
-                    "sort": "none"
-                }
-            },
-            "pluginVersion": "12.0.1",
-            "targets": [
-                {
-                    "datasource": {
-                        "type": "motherduck-duckdb-datasource",
-                        "uid": "P18CE15CC9D3BAB28"
-                    },
-                    "editorMode": "code",
-                    "format": 0,
-                    "rawQuery": true,
-                    "rawSql": "SELECT\r\nmeasurement_datetime, measured_mw, fpp_unitid, deviation_mw, date\r\n FROM read_parquet('/data/compacted/FPP---UNIT_MW---1/**/*.parquet', \r\n                  hive_partitioning=true, \r\n                  union_by_name=true)\r\nwhere FPP_UNITID='ARWF1'\r\nand $__timeFilter(measurement_datetime)\r\norder by measurement_datetime\r\n-- and $__timeFilter(date)\r\n-- limit 1000\r\n\r\n-- SELECT\r\n--   time_bucket($__interval, measurement_datetime) AS time,\r\n--   CAST(participantid AS VARCHAR) AS metric,\r\n--   AVG(measured_mw) AS measured_mw\r\n-- FROM read_parquet('/data/parquet/FPP---UNIT_MW---1/**/*.parquet', \r\n--                   hive_partitioning=true, \r\n--                   union_by_name=true)\r\n-- WHERE $__timeFilter(measurement_datetime)\r\n-- AND $__timeFilter(date)\r\n-- GROUP BY 1, 2\r\n-- ORDER BY 1, 2",
-                    "refId": "A",
-                    "sql": {
-                        "columns": [
-                            {
-                                "parameters": [],
-                                "type": "function"
-                            }
-                        ],
-                        "groupBy": [
-                            {
-                                "property": {
-                                    "type": "string"
-                                },
-                                "type": "groupBy"
-                            }
-                        ],
-                        "limit": 50
-                    }
-                }
-            ],
-            "title": "New panel",
-            "type": "timeseries"
-        },
-        {
-            "datasource": {
-                "type": "motherduck-duckdb-datasource",
-                "uid": "P18CE15CC9D3BAB28"
-            },
-            "fieldConfig": {
-                "defaults": {
-                    "color": {
-                        "mode": "palette-classic"
-                    },
-                    "custom": {
-                        "axisBorderShow": false,
-                        "axisCenteredZero": false,
-                        "axisColorMode": "text",
-                        "axisLabel": "",
-                        "axisPlacement": "auto",
-                        "barAlignment": 0,
-                        "barWidthFactor": 0.6,
-                        "drawStyle": "line",
-                        "fillOpacity": 0,
-                        "gradientMode": "none",
-                        "hideFrom": {
-                            "legend": false,
-                            "tooltip": false,
-                            "viz": false
-                        },
-                        "insertNulls": false,
-                        "lineInterpolation": "linear",
-                        "lineWidth": 1,
-                        "pointSize": 5,
-                        "scaleDistribution": {
-                            "type": "linear"
-                        },
-                        "showPoints": "auto",
-                        "spanNulls": false,
-                        "stacking": {
-                            "group": "A",
-                            "mode": "none"
-                        },
-                        "thresholdsStyle": {
-                            "mode": "off"
-                        }
-                    },
-                    "mappings": [],
-                    "thresholds": {
-                        "mode": "absolute",
-                        "steps": [
-                            {
-                                "color": "green"
-                            },
-                            {
-                                "color": "red",
-                                "value": 80
-                            }
-                        ]
-                    }
-                },
-                "overrides": []
-            },
-            "gridPos": {
                 "h": 11,
                 "w": 24,
                 "x": 0,
-                "y": 9
+                "y": 0
             },
             "id": 1,
             "options": {
@@ -249,10 +136,10 @@
                         "uid": "P18CE15CC9D3BAB28"
                     },
                     "editorMode": "code",
-                    "format": 0,
+                    "format": 1,
                     "hide": false,
                     "rawQuery": true,
-                    "rawSql": "SELECT\r\nmeasurement_datetime, measured_mw, fpp_unitid, deviation_mw, date\r\n FROM read_parquet('/data/compacted/FPP---UNIT_MW---1/**/*.parquet', \r\n                  hive_partitioning=true, \r\n                  union_by_name=true)\r\nwhere FPP_UNITID='ARWF1'\r\nand $__timeFilter(measurement_datetime)\r\norder by measurement_datetime",
+                    "rawSql": "SELECT\r\nmeasurement_datetime, measured_mw, scheduled_mw, participantid, fpp_unitid, deviation_mw\r\n FROM read_parquet('/data/compacted/FPP---UNIT_MW---1/**/*.parquet', \r\n                  hive_partitioning=true, \r\n                  union_by_name=true)\r\nwhere FPP_UNITID='ARWF1'\r\nand $__timeFilter(measurement_datetime)\r\norder by measurement_datetime",
                     "refId": "Supplied",
                     "sql": {
                         "columns": [
@@ -271,92 +158,7 @@
                         ],
                         "limit": 50
                     }
-                }
-            ],
-            "title": "New panel",
-            "type": "timeseries"
-        },
-        {
-            "datasource": {
-                "type": "motherduck-duckdb-datasource",
-                "uid": "P18CE15CC9D3BAB28"
-            },
-            "fieldConfig": {
-                "defaults": {
-                    "color": {
-                        "mode": "palette-classic"
-                    },
-                    "custom": {
-                        "axisBorderShow": false,
-                        "axisCenteredZero": false,
-                        "axisColorMode": "text",
-                        "axisLabel": "",
-                        "axisPlacement": "auto",
-                        "barAlignment": 0,
-                        "barWidthFactor": 0.6,
-                        "drawStyle": "line",
-                        "fillOpacity": 0,
-                        "gradientMode": "none",
-                        "hideFrom": {
-                            "legend": false,
-                            "tooltip": false,
-                            "viz": false
-                        },
-                        "insertNulls": false,
-                        "lineInterpolation": "linear",
-                        "lineWidth": 1,
-                        "pointSize": 5,
-                        "scaleDistribution": {
-                            "type": "linear"
-                        },
-                        "showPoints": "auto",
-                        "spanNulls": false,
-                        "stacking": {
-                            "group": "A",
-                            "mode": "none"
-                        },
-                        "thresholdsStyle": {
-                            "mode": "off"
-                        }
-                    },
-                    "mappings": [],
-                    "thresholds": {
-                        "mode": "absolute",
-                        "steps": [
-                            {
-                                "color": "green"
-                            },
-                            {
-                                "color": "red",
-                                "value": 80
-                            }
-                        ]
-                    }
                 },
-                "overrides": []
-            },
-            "gridPos": {
-                "h": 11,
-                "w": 24,
-                "x": 0,
-                "y": 20
-            },
-            "id": 3,
-            "options": {
-                "legend": {
-                    "calcs": [],
-                    "displayMode": "list",
-                    "placement": "right",
-                    "showLegend": true
-                },
-                "tooltip": {
-                    "hideZeros": false,
-                    "mode": "single",
-                    "sort": "none"
-                }
-            },
-            "pluginVersion": "12.0.1",
-            "targets": [
                 {
                     "datasource": {
                         "type": "motherduck-duckdb-datasource",
@@ -364,9 +166,10 @@
                     },
                     "editorMode": "code",
                     "format": 0,
+                    "hide": false,
                     "rawQuery": true,
-                    "rawSql": "SELECT\r\n*\r\nFROM read_parquet('/data/output/02_trajectory_NEWGRWF.parquet', \r\n                  hive_partitioning=true, \r\n                  union_by_name=true)\r\n",
-                    "refId": "A",
+                    "rawSql": "\r\n\r\nSELECT\r\n*\r\nFROM read_parquet('/data/output/03_unit_deviations.parquet', \r\n                  hive_partitioning=true, \r\n                  union_by_name=true)\r\nwhere duid='ARWF1' \r\n",
+                    "refId": "Calculated",
                     "sql": {
                         "columns": [
                             {
@@ -402,7 +205,7 @@
     },
     "timepicker": {},
     "timezone": "browser",
-    "title": "Thingy",
+    "title": "FPP",
     "uid": "8d9eeecb-bd78-47df-b34a-bf1ccb39c78b",
     "version": 1
 }

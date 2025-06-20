@@ -402,7 +402,7 @@ fn run_step_3_unit_deviations(
     ];
 
     let scada_lf = concat(&scada_frames_to_concat, Default::default())?.select([
-        col("INTERVAL_DATETIME").alias("ts"),
+        col("MEASUREMENT_DATETIME").alias("ts"),
         col("FPP_UNITID").alias("DUID"),
         col("MEASURED_MW"),
     ]);
