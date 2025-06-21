@@ -126,7 +126,7 @@
                     "editorMode": "code",
                     "format": 0,
                     "rawQuery": true,
-                    "rawSql": "SELECT\r\n*\r\nFROM read_parquet('/data/output/02_reference_trajectories.parquet', \r\n                  hive_partitioning=true, \r\n                  union_by_name=true)\r\nwhere duid='ARWF1' \r\n",
+                    "rawSql": "SELECT\r\n*\r\nFROM read_parquet('/data/output/02_hypothetical_trajectory.parquet', \r\n                  hive_partitioning=true, \r\n                  union_by_name=true)\r\nwhere duid='ARWF1' \r\n",
                     "refId": "DEMAND---INTERMITTENT_DS_PRED",
                     "sql": {
                         "columns": [
@@ -356,7 +356,7 @@
                     "format": 0,
                     "hide": false,
                     "rawQuery": true,
-                    "rawSql": "SELECT\r\n*\r\nFROM read_parquet('/data/output/03_unit_deviations.parquet', \r\n                  hive_partitioning=true, \r\n                  union_by_name=true)\r\nwhere duid='ARWF1' \r\n",
+                    "rawSql": "SELECT\r\n*\r\nFROM read_parquet('/data/output/03_hypothetical_deviations.parquet', \r\n                  hive_partitioning=true, \r\n                  union_by_name=true)\r\nwhere duid='ARWF1' \r\n",
                     "refId": "Calculated AWEFS deviation",
                     "sql": {
                         "columns": [
@@ -607,6 +607,85 @@
                                 "value": "right"
                             }
                         ]
+                    },
+                    {
+                        "matcher": {
+                            "id": "byName",
+                            "options": "deviation_mw"
+                        },
+                        "properties": [
+                            {
+                                "id": "color",
+                                "value": {
+                                    "fixedColor": "green",
+                                    "mode": "fixed"
+                                }
+                            },
+                            {
+                                "id": "custom.axisPlacement",
+                                "value": "right"
+                            }
+                        ]
+                    },
+                    {
+                        "matcher": {
+                            "id": "byName",
+                            "options": "p_lower"
+                        },
+                        "properties": [
+                            {
+                                "id": "color",
+                                "value": {
+                                    "fixedColor": "green",
+                                    "mode": "fixed"
+                                }
+                            }
+                        ]
+                    },
+                    {
+                        "matcher": {
+                            "id": "byName",
+                            "options": "p_raise"
+                        },
+                        "properties": [
+                            {
+                                "id": "color",
+                                "value": {
+                                    "fixedColor": "red",
+                                    "mode": "fixed"
+                                }
+                            }
+                        ]
+                    },
+                    {
+                        "matcher": {
+                            "id": "byName",
+                            "options": "FREQ_MEASURE_HZ"
+                        },
+                        "properties": [
+                            {
+                                "id": "color",
+                                "value": {
+                                    "fixedColor": "purple",
+                                    "mode": "fixed"
+                                }
+                            }
+                        ]
+                    },
+                    {
+                        "matcher": {
+                            "id": "byName",
+                            "options": "deviation_mw"
+                        },
+                        "properties": [
+                            {
+                                "id": "color",
+                                "value": {
+                                    "fixedColor": "blue",
+                                    "mode": "fixed"
+                                }
+                            }
+                        ]
                     }
                 ]
             },
@@ -621,7 +700,7 @@
                 "legend": {
                     "calcs": [],
                     "displayMode": "list",
-                    "placement": "bottom",
+                    "placement": "right",
                     "showLegend": true
                 },
                 "tooltip": {
@@ -640,8 +719,37 @@
                     "editorMode": "code",
                     "format": 0,
                     "rawQuery": true,
-                    "rawSql": "SELECT\r\nts, p_lower, p_raise, freq_measure_hz, deviation_mw\r\nFROM read_parquet('/data/output/05_unit_performance_proof.parquet', \r\n                  hive_partitioning=true, \r\n                  union_by_name=true)\r\nwhere duid='ARWF1' ",
-                    "refId": "A",
+                    "rawSql": "SELECT\r\nts, p_lower, p_raise, freq_measure_hz, deviation_mw\r\nFROM read_parquet('/data/output/05_actual_performance.parquet', \r\n                  hive_partitioning=true, \r\n                  union_by_name=true)\r\nwhere duid='ARWF1' ",
+                    "refId": "Actual",
+                    "sql": {
+                        "columns": [
+                            {
+                                "parameters": [],
+                                "type": "function"
+                            }
+                        ],
+                        "groupBy": [
+                            {
+                                "property": {
+                                    "type": "string"
+                                },
+                                "type": "groupBy"
+                            }
+                        ],
+                        "limit": 50
+                    }
+                },
+                {
+                    "datasource": {
+                        "type": "motherduck-duckdb-datasource",
+                        "uid": "P18CE15CC9D3BAB28"
+                    },
+                    "editorMode": "code",
+                    "format": 0,
+                    "hide": false,
+                    "rawQuery": true,
+                    "rawSql": "SELECT\r\nts, p_lower, p_raise, freq_measure_hz, deviation_mw\r\nFROM read_parquet('/data/output/04_hypothetical_performance.parquet', \r\n                  hive_partitioning=true, \r\n                  union_by_name=true)\r\nwhere duid='ARWF1' ",
+                    "refId": "Hypothetical",
                     "sql": {
                         "columns": [
                             {
@@ -751,14 +859,31 @@
                         ]
                     },
                     {
+                        "matcher": {
+                            "id": "byName",
+                            "options": "p_lower_5m_sum"
+                        },
+                        "properties": [
+                            {
+                                "id": "color",
+                                "value": {
+                                    "fixedColor": "red",
+                                    "mode": "fixed"
+                                }
+                            }
+                        ]
+                    },
+                    {
                         "__systemRef": "hideSeriesFrom",
                         "matcher": {
                             "id": "byNames",
                             "options": {
                                 "mode": "exclude",
                                 "names": [
-                                    "Calculated p_raise_5m_sum",
-                                    "Actual RAISE_PERFORMANCE"
+                                    "Calculated Actual p_lower_5m_sum",
+                                    "Calculated Actual p_raise_5m_sum",
+                                    "Calculated Hypothetical p_lower_5m_sum",
+                                    "Calculated Hypothetical p_raise_5m_sum"
                                 ],
                                 "prefix": "All except:",
                                 "readOnly": true
@@ -771,6 +896,81 @@
                                     "legend": false,
                                     "tooltip": false,
                                     "viz": true
+                                }
+                            }
+                        ]
+                    },
+                    {
+                        "matcher": {
+                            "id": "byName",
+                            "options": "p_raise_5m_sum"
+                        },
+                        "properties": [
+                            {
+                                "id": "color",
+                                "value": {
+                                    "fixedColor": "green",
+                                    "mode": "fixed"
+                                }
+                            }
+                        ]
+                    },
+                    {
+                        "matcher": {
+                            "id": "byName",
+                            "options": "Calculated Hypothetical p_raise_5m_sum"
+                        },
+                        "properties": [
+                            {
+                                "id": "color",
+                                "value": {
+                                    "fixedColor": "dark-green",
+                                    "mode": "fixed"
+                                }
+                            }
+                        ]
+                    },
+                    {
+                        "matcher": {
+                            "id": "byName",
+                            "options": "Calculated Actual p_raise_5m_sum"
+                        },
+                        "properties": [
+                            {
+                                "id": "color",
+                                "value": {
+                                    "fixedColor": "super-light-green",
+                                    "mode": "fixed"
+                                }
+                            }
+                        ]
+                    },
+                    {
+                        "matcher": {
+                            "id": "byName",
+                            "options": "Calculated Hypothetical p_lower_5m_sum"
+                        },
+                        "properties": [
+                            {
+                                "id": "color",
+                                "value": {
+                                    "fixedColor": "dark-red",
+                                    "mode": "fixed"
+                                }
+                            }
+                        ]
+                    },
+                    {
+                        "matcher": {
+                            "id": "byName",
+                            "options": "Calculated Actual p_lower_5m_sum"
+                        },
+                        "properties": [
+                            {
+                                "id": "color",
+                                "value": {
+                                    "fixedColor": "super-light-red",
+                                    "mode": "fixed"
                                 }
                             }
                         ]
@@ -788,7 +988,7 @@
                 "legend": {
                     "calcs": [],
                     "displayMode": "list",
-                    "placement": "bottom",
+                    "placement": "right",
                     "showLegend": true
                 },
                 "tooltip": {
@@ -807,8 +1007,8 @@
                     "editorMode": "code",
                     "format": 0,
                     "rawQuery": true,
-                    "rawSql": "SELECT\r\n    -- Group timestamps into 5-minute intervals\r\n    -- note this is the starting at this time, not ending, so will be 5 minutes off i believe.\r\n    time_bucket(INTERVAL '5 minutes', ts) + INTERVAL '5 minutes' AS five_minute_interval,\r\n    \r\n    -- Sum the p_lower and p_raise values within each 5-minute interval\r\n    SUM(p_lower) AS p_lower_5m_sum,\r\n    SUM(p_raise) AS p_raise_5m_sum,\r\n\r\nFROM \r\n    read_parquet('/data/output/05_unit_performance_proof.parquet', \r\n                 hive_partitioning=true, \r\n                 union_by_name=true)\r\nWHERE \r\n    duid = 'ARWF1'\r\nGROUP BY\r\n    five_minute_interval\r\nORDER BY\r\n    five_minute_interval;",
-                    "refId": "Calculated",
+                    "rawSql": "SELECT\r\n    -- Group timestamps into 5-minute intervals\r\n    -- note this is the starting at this time, not ending, so will be 5 minutes off i believe.\r\n    time_bucket(INTERVAL '5 minutes', ts) + INTERVAL '5 minutes' AS five_minute_interval,\r\n    \r\n    -- Sum the p_lower and p_raise values within each 5-minute interval\r\n    SUM(p_lower) AS p_lower_5m_sum,\r\n    SUM(p_raise) AS p_raise_5m_sum,\r\n\r\nFROM \r\n    read_parquet('/data/output/05_actual_performance.parquet', \r\n                 hive_partitioning=true, \r\n                 union_by_name=true)\r\nWHERE \r\n    duid = 'ARWF1'\r\nGROUP BY\r\n    five_minute_interval\r\nORDER BY\r\n    five_minute_interval;",
+                    "refId": "Calculated Actual",
                     "sql": {
                         "columns": [
                             {
@@ -855,9 +1055,38 @@
                         ],
                         "limit": 50
                     }
+                },
+                {
+                    "datasource": {
+                        "type": "motherduck-duckdb-datasource",
+                        "uid": "P18CE15CC9D3BAB28"
+                    },
+                    "editorMode": "code",
+                    "format": 1,
+                    "hide": false,
+                    "rawQuery": true,
+                    "rawSql": "SELECT\r\n    -- Group timestamps into 5-minute intervals\r\n    -- note this is the starting at this time, not ending, so will be 5 minutes off i believe.\r\n    time_bucket(INTERVAL '5 minutes', ts) + INTERVAL '5 minutes' AS five_minute_interval,\r\n    \r\n    -- Sum the p_lower and p_raise values within each 5-minute interval\r\n    SUM(p_lower) AS p_lower_5m_sum,\r\n    SUM(p_raise) AS p_raise_5m_sum,\r\n\r\nFROM \r\n    read_parquet('/data/output/04_hypothetical_performance.parquet', \r\n                 hive_partitioning=true, \r\n                 union_by_name=true)\r\nWHERE \r\n    duid = 'ARWF1'\r\nGROUP BY\r\n    five_minute_interval\r\nORDER BY\r\n    five_minute_interval;",
+                    "refId": "Calculated Hypothetical",
+                    "sql": {
+                        "columns": [
+                            {
+                                "parameters": [],
+                                "type": "function"
+                            }
+                        ],
+                        "groupBy": [
+                            {
+                                "property": {
+                                    "type": "string"
+                                },
+                                "type": "groupBy"
+                            }
+                        ],
+                        "limit": 50
+                    }
                 }
             ],
-            "title": "Performance Actual",
+            "title": "Performance Sums",
             "type": "timeseries"
         }
     ],
