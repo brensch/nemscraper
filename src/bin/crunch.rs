@@ -51,6 +51,9 @@ fn main() -> Result<()> {
     let performance_path = PathBuf::from(&args.output).join("04_unit_performance.parquet");
     run_step_4_performance(&fm_path, &deviation_path, &performance_path)?;
 
+    let performance_path2 = PathBuf::from(&args.output).join("05_unit_performance_proof.parquet");
+    run_fpp_performance_calculation(&args.input, &args.date, &performance_path2)?;
+
     info!("Running Step 5: Final Charge Calculation (Placeholder)");
     let mut final_charges = run_step_5_final_charges(&performance_path)?;
     let final_path = PathBuf::from(&args.output).join("05_final_charges.parquet");
@@ -472,6 +475,128 @@ fn run_step_3_unit_deviations(
         info!("Successfully completed Step 3.");
     } else {
         info!("Join resulted in an empty DataFrame. No file written.");
+    }
+
+    Ok(())
+}
+
+/// Calculates FPP raise/lower performance components using pre-calculated deviations.
+///
+/// This function reads AEMO's official data for unit deviation and frequency measure,
+/// then for each 4-second interval, calculates:
+/// - `p_raise = max(0, FREQ_MEASURE_HZ) * DEVIATION_MW`
+/// - `p_lower = min(0, FREQ_MEASURE_HZ) * DEVIATION_MW`
+///
+/// The results are saved to the specified output path.
+fn run_fpp_performance_calculation(
+    input_dir: &str,
+    date: &str,
+    output_path: &PathBuf,
+) -> Result<()> {
+    info!("Running FPP Raise/Lower Performance Calculation");
+
+    // 1. Define the date window.
+    let current_date =
+        NaiveDate::parse_from_str(date, "%Y-%m-%d").context("Failed to parse date string")?;
+    let prev_date = current_date - chrono::Duration::days(1);
+    let next_date = current_date + chrono::Duration::days(1);
+
+    // 2. Scan the 4-second FPP Unit MW data to get DEVIATION_MW.
+    info!(
+        "Scanning FPP Unit MW data from partitions: {}, {}, {}",
+        prev_date, date, next_date
+    );
+    let unit_mw_paths: Vec<PathBuf> = [prev_date, current_date, next_date]
+        .iter()
+        .map(|d| {
+            PathBuf::from(format!(
+                "{}/FPP---UNIT_MW---1/date={}/*.parquet",
+                input_dir,
+                d.format("%Y-%m-%d")
+            ))
+        })
+        .collect();
+
+    let unit_mw_lf = LazyFrame::scan_parquet_files(unit_mw_paths.into(), Default::default())?
+        .select([
+            col("MEASUREMENT_DATETIME").alias("ts"),
+            col("FPP_UNITID").alias("DUID"),
+            col("DEVIATION_MW"),
+            col("MEASURED_MW"),
+        ]);
+
+    // 3. Scan the 4-second frequency measure data.
+    info!(
+        "Scanning Frequency Measure data from partitions: {}, {}, {}",
+        prev_date, date, next_date
+    );
+    let fm_paths: Vec<PathBuf> = [prev_date, current_date, next_date]
+        .iter()
+        .map(|d| {
+            PathBuf::from(format!(
+                "{}/FPP---REGION_FREQ_MEASURE---1/date={}/*.parquet",
+                input_dir,
+                d.format("%Y-%m-%d")
+            ))
+        })
+        .collect();
+
+    let fm_lf = LazyFrame::scan_parquet_files(fm_paths.into(), Default::default())?
+        .filter(col("REGIONID").eq(lit("NSW1")))
+        .select([
+            col("MEASUREMENT_DATETIME").alias("ts"),
+            col("FREQ_MEASURE_HZ"),
+        ]);
+
+    // 4. Join unit data with frequency measure.
+    info!("Performing LEFT join to align Frequency Measure to unit data...");
+    let performance_lf = unit_mw_lf
+        .join(
+            fm_lf,
+            [col("ts")],
+            [col("ts")],
+            JoinArgs::new(JoinType::Left),
+        )
+        // --- CHANGE START: Calculate p_lower and p_raise ---
+        .with_columns([
+            // Calculate p_lower = min(0, FM) * Dev
+            (col("FREQ_MEASURE_HZ")
+                .fill_null(0.0)
+                .clip_max(lit(0.0)) // This performs min(0, FM)
+                * col("DEVIATION_MW"))
+            .alias("p_lower"),
+            // Calculate p_raise = max(0, FM) * Dev
+            (col("FREQ_MEASURE_HZ")
+                .fill_null(0.0)
+                .clip_min(lit(0.0)) // This performs max(0, FM)
+                * col("DEVIATION_MW"))
+            .alias("p_raise"),
+        ])
+        .select([
+            col("ts"),
+            col("DUID"),
+            col("MEASURED_MW"),
+            col("DEVIATION_MW"),
+            col("FREQ_MEASURE_HZ"), // Keep original FM for context
+            col("p_lower"),
+            col("p_raise"),
+        ])
+        // --- CHANGE END ---
+        .sort(["ts", "DUID"], Default::default());
+
+    // 5. Collect and write the final result.
+    info!("Collecting final performance DataFrame...");
+    let mut final_df = performance_lf.collect()?;
+    info!("Final performance shape: {:?}", final_df.shape());
+
+    if !final_df.is_empty() {
+        info!("Writing final performance data to: {:?}", output_path);
+        ParquetWriter::new(&mut File::create(output_path)?)
+            .with_compression(ParquetCompression::Snappy)
+            .finish(&mut final_df)?;
+        info!("Successfully completed FPP Performance Calculation.");
+    } else {
+        info!("Join resulted in an empty DataFrame. No performance file written.");
     }
 
     Ok(())

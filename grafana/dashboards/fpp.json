@@ -328,7 +328,7 @@
                     "hide": false,
                     "rawQuery": true,
                     "rawSql": "SELECT\r\nmeasurement_datetime, participantid, fpp_unitid, deviation_mw\r\n FROM read_parquet('/data/compacted/FPP---UNIT_MW---1/**/*.parquet', \r\n                  hive_partitioning=true, \r\n                  union_by_name=true)\r\nwhere FPP_UNITID='ARWF1'\r\nand $__timeFilter(measurement_datetime)\r\norder by measurement_datetime",
-                    "refId": "Supplied",
+                    "refId": "FPP---UNIT_MW",
                     "sql": {
                         "columns": [
                             {
@@ -357,7 +357,7 @@
                     "hide": false,
                     "rawQuery": true,
                     "rawSql": "SELECT\r\n*\r\nFROM read_parquet('/data/output/03_unit_deviations.parquet', \r\n                  hive_partitioning=true, \r\n                  union_by_name=true)\r\nwhere duid='ARWF1' \r\n",
-                    "refId": "Calculated",
+                    "refId": "Calculated AWEFS deviation",
                     "sql": {
                         "columns": [
                             {
@@ -437,35 +437,7 @@
                         ]
                     }
                 },
-                "overrides": [
-                    {
-                        "__systemRef": "hideSeriesFrom",
-                        "matcher": {
-                            "id": "byNames",
-                            "options": {
-                                "mode": "exclude",
-                                "names": [
-                                    "Provided FREQ_DEVIATION_HZ QLD1",
-                                    "Calculated aemo_freq_measure QLD1",
-                                    "Calculated freq_measure QLD1",
-                                    "Calculated freq_dev QLD1"
-                                ],
-                                "prefix": "All except:",
-                                "readOnly": true
-                            }
-                        },
-                        "properties": [
-                            {
-                                "id": "custom.hideFrom",
-                                "value": {
-                                    "legend": false,
-                                    "tooltip": false,
-                                    "viz": true
-                                }
-                            }
-                        ]
-                    }
-                ]
+                "overrides": []
             },
             "gridPos": {
                 "h": 11,
@@ -548,6 +520,148 @@
                 }
             ],
             "title": "Frequency Measure",
+            "type": "timeseries"
+        },
+        {
+            "datasource": {
+                "type": "motherduck-duckdb-datasource",
+                "uid": "P18CE15CC9D3BAB28"
+            },
+            "fieldConfig": {
+                "defaults": {
+                    "color": {
+                        "mode": "palette-classic"
+                    },
+                    "custom": {
+                        "axisBorderShow": false,
+                        "axisCenteredZero": true,
+                        "axisColorMode": "text",
+                        "axisLabel": "",
+                        "axisPlacement": "auto",
+                        "barAlignment": 0,
+                        "barWidthFactor": 0.6,
+                        "drawStyle": "line",
+                        "fillOpacity": 0,
+                        "gradientMode": "none",
+                        "hideFrom": {
+                            "legend": false,
+                            "tooltip": false,
+                            "viz": false
+                        },
+                        "insertNulls": false,
+                        "lineInterpolation": "linear",
+                        "lineWidth": 1,
+                        "pointSize": 5,
+                        "scaleDistribution": {
+                            "type": "linear"
+                        },
+                        "showPoints": "auto",
+                        "spanNulls": false,
+                        "stacking": {
+                            "group": "A",
+                            "mode": "none"
+                        },
+                        "thresholdsStyle": {
+                            "mode": "off"
+                        }
+                    },
+                    "mappings": [],
+                    "thresholds": {
+                        "mode": "absolute",
+                        "steps": [
+                            {
+                                "color": "green"
+                            },
+                            {
+                                "color": "red",
+                                "value": 80
+                            }
+                        ]
+                    }
+                },
+                "overrides": [
+                    {
+                        "matcher": {
+                            "id": "byName",
+                            "options": "performance"
+                        },
+                        "properties": [
+                            {
+                                "id": "custom.axisPlacement",
+                                "value": "right"
+                            },
+                            {
+                                "id": "custom.axisCenteredZero",
+                                "value": true
+                            }
+                        ]
+                    },
+                    {
+                        "matcher": {
+                            "id": "byName",
+                            "options": "DEVIATION_MW"
+                        },
+                        "properties": [
+                            {
+                                "id": "custom.axisPlacement",
+                                "value": "right"
+                            }
+                        ]
+                    }
+                ]
+            },
+            "gridPos": {
+                "h": 9,
+                "w": 24,
+                "x": 0,
+                "y": 33
+            },
+            "id": 5,
+            "options": {
+                "legend": {
+                    "calcs": [],
+                    "displayMode": "list",
+                    "placement": "bottom",
+                    "showLegend": true
+                },
+                "tooltip": {
+                    "hideZeros": false,
+                    "mode": "single",
+                    "sort": "none"
+                }
+            },
+            "pluginVersion": "12.0.1",
+            "targets": [
+                {
+                    "datasource": {
+                        "type": "motherduck-duckdb-datasource",
+                        "uid": "P18CE15CC9D3BAB28"
+                    },
+                    "editorMode": "code",
+                    "format": 0,
+                    "rawQuery": true,
+                    "rawSql": "SELECT\r\nts, p_lower, p_raise, freq_measure_hz, deviation_mw\r\nFROM read_parquet('/data/output/05_unit_performance_proof.parquet', \r\n                  hive_partitioning=true, \r\n                  union_by_name=true)\r\nwhere duid='ARWF1' ",
+                    "refId": "A",
+                    "sql": {
+                        "columns": [
+                            {
+                                "parameters": [],
+                                "type": "function"
+                            }
+                        ],
+                        "groupBy": [
+                            {
+                                "property": {
+                                    "type": "string"
+                                },
+                                "type": "groupBy"
+                            }
+                        ],
+                        "limit": 50
+                    }
+                }
+            ],
+            "title": "Performance Actual",
             "type": "timeseries"
         }
     ],
