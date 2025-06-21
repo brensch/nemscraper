@@ -48,16 +48,8 @@ fn main() -> Result<()> {
     let deviation_path = PathBuf::from(&args.output).join("03_unit_deviations.parquet");
     run_step_3_unit_deviations(&args.input, &args.date, &deviation_path, &trajectory_path)?;
 
-    let performance_path = PathBuf::from(&args.output).join("04_unit_performance.parquet");
-    run_step_4_performance(&fm_path, &deviation_path, &performance_path)?;
-
-    let performance_path2 = PathBuf::from(&args.output).join("05_unit_performance_proof.parquet");
-    run_fpp_performance_calculation(&args.input, &args.date, &performance_path2)?;
-
-    info!("Running Step 5: Final Charge Calculation (Placeholder)");
-    let mut final_charges = run_step_5_final_charges(&performance_path)?;
-    let final_path = PathBuf::from(&args.output).join("05_final_charges.parquet");
-    ParquetWriter::new(&mut File::create(final_path)?).finish(&mut final_charges)?;
+    let performance_path = PathBuf::from(&args.output).join("05_unit_performance_proof.parquet");
+    run_fpp_performance_calculation(&args.input, &args.date, &performance_path)?;
 
     info!("Pipeline finished successfully.");
     Ok(())
@@ -600,77 +592,4 @@ fn run_fpp_performance_calculation(
     }
 
     Ok(())
-}
-
-fn run_step_4_performance(
-    fm_path: &PathBuf,
-    deviation_path: &PathBuf,
-    output_path: &PathBuf,
-) -> Result<()> {
-    info!("Running Step 4: Unit Performance Calculation");
-
-    // Read frequency measure data
-    let fm_df = ParquetReader::new(&mut File::open(fm_path).context(format!(
-        "Failed to open frequency measure file: {:?}",
-        fm_path
-    ))?)
-    .finish()
-    .context(format!(
-        "Failed to read frequency measure parquet: {:?}",
-        fm_path
-    ))?;
-
-    // Read deviation data
-    let deviation_df = ParquetReader::new(&mut File::open(deviation_path).context(format!(
-        "Failed to open deviation file: {:?}",
-        deviation_path
-    ))?)
-    .finish()
-    .context(format!(
-        "Failed to read deviation parquet: {:?}",
-        deviation_path
-    ))?;
-
-    // Join and calculate performance
-    let mut final_perf_df = fm_df
-        .lazy()
-        .join(
-            deviation_df.lazy(),
-            [col("ts")],
-            [col("ts")],
-            JoinArgs::new(JoinType::Inner),
-        )
-        .with_columns([
-            when(col("freq_measure").gt(lit(0.0)))
-                .then(col("freq_measure") * col("deviation_mw"))
-                .otherwise(lit(0.0))
-                .alias("raise_perf"),
-            when(col("freq_measure").lt(lit(0.0)))
-                .then(col("freq_measure") * col("deviation_mw"))
-                .otherwise(lit(0.0))
-                .alias("lower_perf"),
-        ])
-        .select([col("ts"), col("DUID"), col("raise_perf"), col("lower_perf")])
-        .collect()?;
-
-    ParquetWriter::new(&mut File::create(output_path)?).finish(&mut final_perf_df)?;
-    info!("Successfully saved to {:?}", output_path);
-    Ok(())
-}
-
-fn run_step_5_final_charges(performance_path: &PathBuf) -> Result<DataFrame> {
-    info!("Running Step 5: Final Charge Calculation (Placeholder)");
-
-    // Read performance data
-    let performance_df = ParquetReader::new(&mut File::open(performance_path).context(format!(
-        "Failed to open performance file: {:?}",
-        performance_path
-    ))?)
-    .finish()
-    .context(format!(
-        "Failed to read performance parquet: {:?}",
-        performance_path
-    ))?;
-
-    Ok(performance_df)
 }

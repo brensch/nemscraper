@@ -663,6 +663,202 @@
             ],
             "title": "Performance Actual",
             "type": "timeseries"
+        },
+        {
+            "datasource": {
+                "type": "motherduck-duckdb-datasource",
+                "uid": "P18CE15CC9D3BAB28"
+            },
+            "fieldConfig": {
+                "defaults": {
+                    "color": {
+                        "mode": "palette-classic"
+                    },
+                    "custom": {
+                        "axisBorderShow": false,
+                        "axisCenteredZero": true,
+                        "axisColorMode": "text",
+                        "axisLabel": "",
+                        "axisPlacement": "auto",
+                        "barAlignment": 0,
+                        "barWidthFactor": 0.6,
+                        "drawStyle": "line",
+                        "fillOpacity": 0,
+                        "gradientMode": "none",
+                        "hideFrom": {
+                            "legend": false,
+                            "tooltip": false,
+                            "viz": false
+                        },
+                        "insertNulls": false,
+                        "lineInterpolation": "linear",
+                        "lineWidth": 1,
+                        "pointSize": 5,
+                        "scaleDistribution": {
+                            "type": "linear"
+                        },
+                        "showPoints": "auto",
+                        "spanNulls": false,
+                        "stacking": {
+                            "group": "A",
+                            "mode": "none"
+                        },
+                        "thresholdsStyle": {
+                            "mode": "off"
+                        }
+                    },
+                    "mappings": [],
+                    "thresholds": {
+                        "mode": "absolute",
+                        "steps": [
+                            {
+                                "color": "green"
+                            },
+                            {
+                                "color": "red",
+                                "value": 80
+                            }
+                        ]
+                    }
+                },
+                "overrides": [
+                    {
+                        "matcher": {
+                            "id": "byName",
+                            "options": "performance"
+                        },
+                        "properties": [
+                            {
+                                "id": "custom.axisPlacement",
+                                "value": "right"
+                            },
+                            {
+                                "id": "custom.axisCenteredZero",
+                                "value": true
+                            }
+                        ]
+                    },
+                    {
+                        "matcher": {
+                            "id": "byName",
+                            "options": "DEVIATION_MW"
+                        },
+                        "properties": [
+                            {
+                                "id": "custom.axisPlacement",
+                                "value": "right"
+                            }
+                        ]
+                    },
+                    {
+                        "__systemRef": "hideSeriesFrom",
+                        "matcher": {
+                            "id": "byNames",
+                            "options": {
+                                "mode": "exclude",
+                                "names": [
+                                    "Calculated p_raise_5m_sum",
+                                    "Actual RAISE_PERFORMANCE"
+                                ],
+                                "prefix": "All except:",
+                                "readOnly": true
+                            }
+                        },
+                        "properties": [
+                            {
+                                "id": "custom.hideFrom",
+                                "value": {
+                                    "legend": false,
+                                    "tooltip": false,
+                                    "viz": true
+                                }
+                            }
+                        ]
+                    }
+                ]
+            },
+            "gridPos": {
+                "h": 9,
+                "w": 24,
+                "x": 0,
+                "y": 42
+            },
+            "id": 6,
+            "options": {
+                "legend": {
+                    "calcs": [],
+                    "displayMode": "list",
+                    "placement": "bottom",
+                    "showLegend": true
+                },
+                "tooltip": {
+                    "hideZeros": false,
+                    "mode": "single",
+                    "sort": "none"
+                }
+            },
+            "pluginVersion": "12.0.1",
+            "targets": [
+                {
+                    "datasource": {
+                        "type": "motherduck-duckdb-datasource",
+                        "uid": "P18CE15CC9D3BAB28"
+                    },
+                    "editorMode": "code",
+                    "format": 0,
+                    "rawQuery": true,
+                    "rawSql": "SELECT\r\n    -- Group timestamps into 5-minute intervals\r\n    -- note this is the starting at this time, not ending, so will be 5 minutes off i believe.\r\n    time_bucket(INTERVAL '5 minutes', ts) + INTERVAL '5 minutes' AS five_minute_interval,\r\n    \r\n    -- Sum the p_lower and p_raise values within each 5-minute interval\r\n    SUM(p_lower) AS p_lower_5m_sum,\r\n    SUM(p_raise) AS p_raise_5m_sum,\r\n\r\nFROM \r\n    read_parquet('/data/output/05_unit_performance_proof.parquet', \r\n                 hive_partitioning=true, \r\n                 union_by_name=true)\r\nWHERE \r\n    duid = 'ARWF1'\r\nGROUP BY\r\n    five_minute_interval\r\nORDER BY\r\n    five_minute_interval;",
+                    "refId": "Calculated",
+                    "sql": {
+                        "columns": [
+                            {
+                                "parameters": [],
+                                "type": "function"
+                            }
+                        ],
+                        "groupBy": [
+                            {
+                                "property": {
+                                    "type": "string"
+                                },
+                                "type": "groupBy"
+                            }
+                        ],
+                        "limit": 50
+                    }
+                },
+                {
+                    "datasource": {
+                        "type": "motherduck-duckdb-datasource",
+                        "uid": "P18CE15CC9D3BAB28"
+                    },
+                    "editorMode": "code",
+                    "format": 0,
+                    "hide": false,
+                    "rawQuery": true,
+                    "rawSql": "SELECT\r\ninterval_datetime, raise_performance, lower_performance\r\n FROM read_parquet('/data/compacted/FPP---FPP_PERFORMANCE---1/**/*.parquet', \r\n                  hive_partitioning=true, \r\n                  union_by_name=true)\r\nwhere FPP_UNITID='ARWF1'\r\nand $__timeFilter(interval_datetime)\r\norder by interval_datetime",
+                    "refId": "Provided",
+                    "sql": {
+                        "columns": [
+                            {
+                                "parameters": [],
+                                "type": "function"
+                            }
+                        ],
+                        "groupBy": [
+                            {
+                                "property": {
+                                    "type": "string"
+                                },
+                                "type": "groupBy"
+                            }
+                        ],
+                        "limit": 50
+                    }
+                }
+            ],
+            "title": "Performance Actual",
+            "type": "timeseries"
         }
     ],
     "preload": false,
