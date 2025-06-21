@@ -234,7 +234,7 @@
                     }
                 }
             ],
-            "title": "Performance vs Trajectory",
+            "title": "Measured Output vs Prediction Trajectory",
             "type": "timeseries"
         },
         {
@@ -1104,5 +1104,5 @@
     "timezone": "browser",
     "title": "FPP",
     "uid": "8d9eeecb-bd78-47df-b34a-bf1ccb39c78b",
-    "version": 2
+    "version": 4
 }
