@@ -78,7 +78,23 @@
                         ]
                     }
                 },
-                "overrides": []
+                "overrides": [
+                    {
+                        "matcher": {
+                            "id": "byName",
+                            "options": "trajectories reference_mw {DUID=\"ARWF1\", ORIGIN=\"AWEFS_ASEFS\"}"
+                        },
+                        "properties": [
+                            {
+                                "id": "color",
+                                "value": {
+                                    "fixedColor": "dark-purple",
+                                    "mode": "fixed"
+                                }
+                            }
+                        ]
+                    }
+                ]
             },
             "gridPos": {
                 "h": 11,
@@ -111,36 +127,7 @@
                     "format": 0,
                     "rawQuery": true,
                     "rawSql": "SELECT\r\n*\r\nFROM read_parquet('/data/output/02_reference_trajectories.parquet', \r\n                  hive_partitioning=true, \r\n                  union_by_name=true)\r\nwhere duid='ARWF1' \r\n",
-                    "refId": "trajectories",
-                    "sql": {
-                        "columns": [
-                            {
-                                "parameters": [],
-                                "type": "function"
-                            }
-                        ],
-                        "groupBy": [
-                            {
-                                "property": {
-                                    "type": "string"
-                                },
-                                "type": "groupBy"
-                            }
-                        ],
-                        "limit": 50
-                    }
-                },
-                {
-                    "datasource": {
-                        "type": "motherduck-duckdb-datasource",
-                        "uid": "P18CE15CC9D3BAB28"
-                    },
-                    "editorMode": "code",
-                    "format": 1,
-                    "hide": false,
-                    "rawQuery": true,
-                    "rawSql": "SELECT\r\nmeasurement_datetime, measured_mw, scheduled_mw, participantid, fpp_unitid\r\n FROM read_parquet('/data/compacted/FPP---UNIT_MW---1/**/*.parquet', \r\n                  hive_partitioning=true, \r\n                  union_by_name=true)\r\nwhere FPP_UNITID='ARWF1'\r\nand $__timeFilter(measurement_datetime)\r\norder by measurement_datetime",
-                    "refId": "Supplied",
+                    "refId": "DEMAND---INTERMITTENT_DS_PRED",
                     "sql": {
                         "columns": [
                             {
@@ -168,8 +155,66 @@
                     "format": 0,
                     "hide": false,
                     "rawQuery": true,
+                    "rawSql": "SELECT\r\nmeasurement_datetime, measured_mw, scheduled_mw, participantid, fpp_unitid as DUID\r\n FROM read_parquet('/data/compacted/FPP---UNIT_MW---1/**/*.parquet', \r\n                  hive_partitioning=true, \r\n                  union_by_name=true)\r\nwhere FPP_UNITID='ARWF1'\r\nand $__timeFilter(measurement_datetime)\r\norder by measurement_datetime",
+                    "refId": "FPP---UNIT_MW",
+                    "sql": {
+                        "columns": [
+                            {
+                                "parameters": [],
+                                "type": "function"
+                            }
+                        ],
+                        "groupBy": [
+                            {
+                                "property": {
+                                    "type": "string"
+                                },
+                                "type": "groupBy"
+                            }
+                        ],
+                        "limit": 50
+                    }
+                },
+                {
+                    "datasource": {
+                        "type": "motherduck-duckdb-datasource",
+                        "uid": "P18CE15CC9D3BAB28"
+                    },
+                    "editorMode": "code",
+                    "format": 0,
+                    "hide": true,
+                    "rawQuery": true,
                     "rawSql": "WITH ranked AS (\r\n  SELECT\r\n    *,\r\n    ROW_NUMBER() OVER (\r\n      PARTITION BY run_datetime, duid, origin\r\n      ORDER BY forecast_priority    DESC,\r\n               offerdatetime        DESC\r\n    ) AS rn\r\n  FROM read_parquet(\r\n         '/data/compacted/DEMAND---INTERMITTENT_DS_PRED---1/**/*.parquet',\r\n         hive_partitioning => true,\r\n         union_by_name     => true\r\n       )\r\n  WHERE duid = 'ARWF1'\r\n)\r\nSELECT\r\n  FORECAST_POE50, DUID, ORIGIN, interval_datetime\r\nFROM ranked\r\nWHERE rn = 1\r\norder by interval_datetime\r\n",
                     "refId": "Dispatch",
+                    "sql": {
+                        "columns": [
+                            {
+                                "parameters": [],
+                                "type": "function"
+                            }
+                        ],
+                        "groupBy": [
+                            {
+                                "property": {
+                                    "type": "string"
+                                },
+                                "type": "groupBy"
+                            }
+                        ],
+                        "limit": 50
+                    }
+                },
+                {
+                    "datasource": {
+                        "type": "motherduck-duckdb-datasource",
+                        "uid": "P18CE15CC9D3BAB28"
+                    },
+                    "editorMode": "code",
+                    "format": 0,
+                    "hide": false,
+                    "rawQuery": true,
+                    "rawSql": "SELECT\r\n    SETTLEMENTDATE AS \"Timestamp\",\r\n    DUID AS \"DUID\",\r\n    TOTALCLEARED \r\nFROM read_parquet('/data/compacted/DISPATCH---UNIT_SOLUTION---5/**/*.parquet', \r\n                  hive_partitioning=true, \r\n                  union_by_name=true)\r\nwhere duid='ARWF1'\r\nORDER BY\r\n    \"Timestamp\",\r\n    \"DUID\";",
+                    "refId": "DISPATCH---UNIT_SOLUTION",
                     "sql": {
                         "columns": [
                             {
@@ -433,7 +478,7 @@
                 "legend": {
                     "calcs": [],
                     "displayMode": "list",
-                    "placement": "bottom",
+                    "placement": "right",
                     "showLegend": true
                 },
                 "tooltip": {
@@ -452,7 +497,7 @@
                     "editorMode": "code",
                     "format": 0,
                     "rawQuery": true,
-                    "rawSql": "SELECT\r\n*\r\nFROM read_parquet('/data/output/01_frequency_measure.parquet', \r\n                  hive_partitioning=true, \r\n                  union_by_name=true)\r\n",
+                    "rawSql": "SELECT\r\n*\r\nFROM read_parquet('/data/output/01_frequency_measure.parquet', \r\n                  hive_partitioning=true, \r\n                  union_by_name=true)\r\norder by ts",
                     "refId": "Calculated",
                     "sql": {
                         "columns": [
@@ -504,92 +549,6 @@
             ],
             "title": "Frequency Measure",
             "type": "timeseries"
-        },
-        {
-            "datasource": {
-                "type": "motherduck-duckdb-datasource",
-                "uid": "P18CE15CC9D3BAB28"
-            },
-            "fieldConfig": {
-                "defaults": {
-                    "color": {
-                        "mode": "thresholds"
-                    },
-                    "custom": {
-                        "align": "auto",
-                        "cellOptions": {
-                            "type": "auto"
-                        },
-                        "inspect": false
-                    },
-                    "mappings": [],
-                    "thresholds": {
-                        "mode": "absolute",
-                        "steps": [
-                            {
-                                "color": "green"
-                            },
-                            {
-                                "color": "red",
-                                "value": 80
-                            }
-                        ]
-                    }
-                },
-                "overrides": []
-            },
-            "gridPos": {
-                "h": 13,
-                "w": 24,
-                "x": 0,
-                "y": 33
-            },
-            "id": 2,
-            "options": {
-                "cellHeight": "sm",
-                "footer": {
-                    "countRows": false,
-                    "fields": "",
-                    "reducer": [
-                        "sum"
-                    ],
-                    "show": false
-                },
-                "showHeader": true
-            },
-            "pluginVersion": "12.0.1",
-            "targets": [
-                {
-                    "datasource": {
-                        "type": "motherduck-duckdb-datasource",
-                        "uid": "P18CE15CC9D3BAB28"
-                    },
-                    "editorMode": "code",
-                    "format": 1,
-                    "rawQuery": true,
-                    "rawSql": "SELECT\r\n*\r\nFROM read_parquet('/data/output/02_reference_trajectories.parquet', \r\n                  hive_partitioning=true, \r\n                  union_by_name=true)\r\nwhere duid='ARWF1' \r\n",
-                    "refId": "A",
-                    "sql": {
-                        "columns": [
-                            {
-                                "parameters": [],
-                                "type": "function"
-                            }
-                        ],
-                        "groupBy": [
-                            {
-                                "property": {
-                                    "type": "string"
-                                },
-                                "type": "groupBy"
-                            }
-                        ],
-                        "limit": 50
-                    }
-                }
-            ],
-            "title": "New panel",
-            "type": "table"
         }
     ],
     "preload": false,
@@ -606,5 +565,5 @@
     "timezone": "browser",
     "title": "FPP",
     "uid": "8d9eeecb-bd78-47df-b34a-bf1ccb39c78b",
-    "version": 1
+    "version": 2
 }

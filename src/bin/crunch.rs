@@ -225,6 +225,7 @@ fn run_step_2_reference_trajectory(
 
     // 1) Scan and filter the dataset once to get the latest, highest-priority forecasts.
     let latest_forecasts_lf = LazyFrame::scan_parquet(&pred_path, ScanArgsParquet::default())?
+        .filter(col("ORIGIN").eq(lit("AWEFS_ASEFS")))
         .sort_by_exprs(
             vec![col("FORECAST_PRIORITY"), col("OFFERDATETIME")],
             SortMultipleOptions {
