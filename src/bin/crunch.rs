@@ -112,8 +112,13 @@ fn read_parquet_files(pattern: &str) -> Result<DataFrame> {
     }
 }
 
+// note i'm just recomputing for the sake of it here. i actually don't think we need to do this since it doesn't change
+// whether we submitted or awefs.
+// FPP computed values are in:
+// FPP---REGION_FREQ_MEASURE---1
+// Columns: FREQ_MEASURE_HZ, FREQ_DEVIATION_HZ
 fn run_step_1_frequency_measure(input_dir: &str, date: &str, output_path: &PathBuf) -> Result<()> {
-    info!("Running Step 1: Region‐level Frequency Measure with EWMA");
+    info!("Running Step 1: Region‐level Frequency Measure with explicit EWMA");
 
     // glob over the FPP regional freq‐measure files for this date
     let scada_pattern = format!(
@@ -137,18 +142,48 @@ fn run_step_1_frequency_measure(input_dir: &str, date: &str, output_path: &PathB
             col("FREQ_DEVIATION_HZ").alias("freq_dev"),
             col("FREQ_MEASURE_HZ").alias("aemo_freq_measure"),
         ])
-        // this is not working. i think we can just use the FREQ_MEASURE_HZ value though.
-        .with_column(
-            col("freq_dev")
-                .neg()
-                .ewm_mean(EWMOptions {
-                    alpha,
-                    adjust: false,
-                    ..Default::default()
-                })
-                .alias("freq_measure"),
-        )
-        // final layout: timestamp, region, raw deviation, AEMO’s measure, your EWMA
+        .collect()
+        .context("Failed to collect regional frequency‐measure DataFrame")?;
+
+    // Sort by region and timestamp to ensure proper order for EWMA calculation
+    df = df.sort(["region", "ts"], SortMultipleOptions::default())?;
+
+    // Apply explicit EWMA formula: FM_t = (1 - α) * FM_{t-1} + α * (-FD_t)
+    let freq_dev_series = df.column("freq_dev")?.f64()?;
+    let region_series = df.column("region")?.str()?;
+
+    let mut freq_measure_values = Vec::with_capacity(df.height());
+    let mut current_region: Option<&str> = None;
+    let mut fm_prev = 0.0; // Initialize FM_{t-1} to 0 for first value in each region
+
+    for i in 0..df.height() {
+        let region = region_series.get(i).unwrap();
+        let freq_dev = freq_dev_series.get(i);
+
+        // Reset accumulator when we encounter a new region
+        if current_region != Some(region) {
+            current_region = Some(region);
+            fm_prev = 0.0;
+        }
+
+        if let Some(fd) = freq_dev {
+            // Apply the explicit EWMA formula: FM_t = (1 - α) * FM_{t-1} + α * (-FD_t)
+            let fm_current = (1.0 - alpha) * fm_prev + alpha * (-fd);
+            freq_measure_values.push(Some(fm_current));
+            fm_prev = fm_current;
+        } else {
+            // Handle null values
+            freq_measure_values.push(None);
+        }
+    }
+
+    // Add the calculated frequency measure column to the dataframe
+    let freq_measure_series = Series::new("freq_measure".into(), freq_measure_values);
+    df.with_column(freq_measure_series)?;
+
+    // Select final layout: timestamp, region, raw deviation, AEMO's measure, explicit EWMA
+    let mut df = df
+        .lazy()
         .select([
             col("ts"),
             col("region"),
@@ -157,7 +192,7 @@ fn run_step_1_frequency_measure(input_dir: &str, date: &str, output_path: &PathB
             col("freq_measure"),
         ])
         .collect()
-        .context("Failed to collect regional frequency‐measure DataFrame")?;
+        .context("Failed to collect final DataFrame")?;
 
     // write to Parquet
     let mut out =
@@ -173,6 +208,9 @@ fn run_step_1_frequency_measure(input_dir: &str, date: &str, output_path: &PathB
     Ok(())
 }
 
+/// Builds a combined reference trajectory for all units in the NEM.
+/// Reference trajectories are the points between 5-minute forecasts, interpolated to 4-second resolution.
+/// Note these currently don't match up, which is concerning.
 fn run_step_2_reference_trajectory(
     input_dir: &str,
     date: &str,
@@ -347,7 +385,6 @@ fn run_step_2_reference_trajectory(
 ///
 /// It performs an inner join on timestamp and DUID, calculates the deviation, and saves
 /// the result to the specified output path.
-/// Calculates the deviation between the reference trajectory and actual unit power measurements.
 /// Calculates the deviation between the reference trajectory and actual unit power measurements.
 fn run_step_3_unit_deviations(
     input_dir: &str,
